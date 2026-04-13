@@ -79,7 +79,7 @@ class IMMImageOverlayNode(Node):
         self.declare_parameter('target_name', 'uav3')
         self.declare_parameter('world_frame_suffix', 'world_origin')
         self.declare_parameter('tf_timeout_sec', 0.1)
-        self.declare_parameter('processing_rate_hz', 10.0)
+        self.declare_parameter('processing_rate_hz', 100.0)
         self.declare_parameter('trajectory_color_start', [0, 255, 255])   # cyan (BGR)
         self.declare_parameter('trajectory_color_end', [0, 0, 255])       # red (BGR)
         self.declare_parameter('estimate_color', [255, 165, 0])           # orange (BGR)

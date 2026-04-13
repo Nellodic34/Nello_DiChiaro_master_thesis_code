@@ -385,7 +385,7 @@ class Yolov8MainTriangulationNode(Node):
         self.declare_parameter('triangulation_min_baseline_m', 0.25)
         self.declare_parameter('max_triangulation_error_m', 2.0)
         self.declare_parameter('max_target_gt_age_sec', 0.75)
-        self.declare_parameter('processing_rate_hz', 10.0)
+        self.declare_parameter('processing_rate_hz', 100.0)
         self.declare_parameter('tf_timeout_sec', 0.1)
         self.declare_parameter('world_frame_suffix', 'world_origin')
         self.declare_parameter('kf_process_noise_acc', 1.5)

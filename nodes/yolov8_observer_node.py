@@ -88,7 +88,7 @@ class Yolov8ObserverNode(Node):
         self.declare_parameter('device', _default_device)
         self.declare_parameter('line_width', 2)
         self.declare_parameter('target_class_id', -1)
-        self.declare_parameter('processing_rate_hz', 10.0)
+        self.declare_parameter('processing_rate_hz', 100.0)
         self.declare_parameter('tf_timeout_sec', 0.1)
         self.declare_parameter('world_frame_suffix', 'world_origin')
         self.declare_parameter('publish_annotated_image', True)
