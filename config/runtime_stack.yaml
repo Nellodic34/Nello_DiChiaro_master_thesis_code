@@ -1,0 +1,26 @@
+launcher:
+  drone_run_mode: "decentralized_evaluation"  # one of: simple_detection, decentralized, decentralized_evaluation
+  auto_start_node: triangulation  # one of: none, detection, triangulation
+
+vision:
+  publish_annotated_image: false  # set to true only for debug (saves bandwidth on real drone)
+  device: "cuda"  # inference device: "cpu" for Intel drone, "cuda" for GPU
+  observer_image_topic: ""  # override observer camera topic, e.g. /uav2/rgbd/color/image_raw/compressed (empty = auto)
+  main_image_topic: ""      # override main camera topic, e.g. /uav1/rgbd/color/image_raw/compressed (empty = auto)
+
+uav_roles:
+  observer1: uav1   # MAIN drone name — edit to match your real drone
+  observer2: uav2   # OBSERVER drone name — edit to match your real drone
+  target: uav3      # TARGET drone name — edit to match your real drone
+
+ekf:
+  kf_process_noise_acc: 1.25
+  kf_process_noise_vel: 1.2
+  imm_transition_prob: 0.90
+  kf_measurement_noise: 0.05
+  kf_adaptive_cov_max_multiplier: 50.0
+  kf_initial_covariance: 2.0
+  kf_mahalanobis_threshold: 7.0
+
+evaluation:
+  odom_topic_suffix: "hw_api/ground_truth"  # simulation ground truth — change to odometry/odom_main for real drone
