@@ -1,0 +1,14 @@
+# Virtual environment
+.venv/
+
+# Debug / evaluation output
+debug/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
