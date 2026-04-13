@@ -126,7 +126,7 @@ class Yolov8ObserverNode(Node):
                 raise FileNotFoundError(f'Model not found: {self.model_path} (fallback {_fallback} also missing)')
 
         self.bridge = CvBridge()
-        self.model = YOLO(self.model_path)
+        self.model = YOLO(self.model_path, task='detect')
         if self.model_path.endswith('.pt'):
             self.model.fuse()
 
