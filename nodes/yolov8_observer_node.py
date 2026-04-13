@@ -83,7 +83,7 @@ class Yolov8ObserverNode(Node):
         )
         self.declare_parameter('confidence_threshold', 0.25)
         self.declare_parameter('iou_threshold', 0.45)
-        self.declare_parameter('imgsz', 960)
+        self.declare_parameter('imgsz', 896)
         self.declare_parameter('max_detections', 100)
         self.declare_parameter('device', _default_device)
         self.declare_parameter('line_width', 2)

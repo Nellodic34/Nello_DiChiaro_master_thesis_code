@@ -49,4 +49,5 @@ python3 "$SCRIPT_DIR/nodes/yolov8_observer_node.py" \
     --ros-args \
     -p uav_name:="$OBSERVER2" \
     -p target_name:="$TARGET" \
-    -p model_path:="$MODEL_PATH"
+    -p model_path:="$MODEL_PATH" \
+    -p imgsz:=896
