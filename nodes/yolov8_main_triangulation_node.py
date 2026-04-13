@@ -349,6 +349,7 @@ class Yolov8MainTriangulationNode(Node):
         _config_path = FsPath(__file__).resolve().parent.parent / 'config' / 'runtime_stack.yaml'
         _default_device = 'cuda'
         _override_image_topic = ''
+        _default_publish_annotated = True
         if _config_path.exists():
             import yaml
             try:
@@ -357,6 +358,7 @@ class Yolov8MainTriangulationNode(Node):
                     if _cfg and 'vision' in _cfg:
                         _default_device = _cfg['vision'].get('device', _default_device)
                         _override_image_topic = _cfg['vision'].get('main_image_topic', '') or ''
+                        _default_publish_annotated = bool(_cfg['vision'].get('publish_annotated_image', _default_publish_annotated))
             except Exception:
                 pass
 
@@ -397,7 +399,7 @@ class Yolov8MainTriangulationNode(Node):
         self.declare_parameter('kf_mahalanobis_threshold', 9.0)
         self.declare_parameter('kf_prediction_horizon_sec', 1.0)
         self.declare_parameter('kf_prediction_steps', 25)
-        self.declare_parameter('publish_annotated_image', True)
+        self.declare_parameter('publish_annotated_image', _default_publish_annotated)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.observer1_name = str(self.get_parameter('observer1_name').value)

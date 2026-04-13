@@ -63,6 +63,7 @@ class Yolov8ObserverNode(Node):
         _config_path = FsPath(__file__).resolve().parent.parent / 'config' / 'runtime_stack.yaml'
         _default_device = 'cuda'
         _override_image_topic = ''
+        _default_publish_annotated = True
         if _config_path.exists():
             import yaml
             try:
@@ -71,6 +72,7 @@ class Yolov8ObserverNode(Node):
                     if _cfg and 'vision' in _cfg:
                         _default_device = _cfg['vision'].get('device', _default_device)
                         _override_image_topic = _cfg['vision'].get('observer_image_topic', '') or ''
+                        _default_publish_annotated = bool(_cfg['vision'].get('publish_annotated_image', _default_publish_annotated))
             except Exception:
                 pass
 
@@ -91,7 +93,7 @@ class Yolov8ObserverNode(Node):
         self.declare_parameter('processing_rate_hz', 100.0)
         self.declare_parameter('tf_timeout_sec', 0.1)
         self.declare_parameter('world_frame_suffix', 'world_origin')
-        self.declare_parameter('publish_annotated_image', True)
+        self.declare_parameter('publish_annotated_image', _default_publish_annotated)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.model_path = os.path.expanduser(str(self.get_parameter('model_path').value))
