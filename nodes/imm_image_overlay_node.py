@@ -108,7 +108,8 @@ class IMMImageOverlayNode(Node):
         # ── Topic names ──────────────────────────────────────────────────
         self.image_topic = _override_image_topic or f'/{self.uav_name}/rgb/image_raw'
         self._use_compressed = self.image_topic.endswith('/compressed')
-        self.camera_info_topic = f'/{self.uav_name}/rgb/camera_info'
+        _img_base = self.image_topic.replace('/compressed', '').rsplit('/image_raw', 1)[0]
+        self.camera_info_topic = f'{_img_base}/camera_info'
         self.predicted_path_topic = '/target/predicted_trajectory'
         self.estimate_odom_topic = '/target/odometry_estimate'
         self.raw_tri_topic = '/target/triangulation_raw'

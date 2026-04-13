@@ -109,7 +109,8 @@ class Yolov8ObserverNode(Node):
 
         self.image_topic = _override_image_topic or f'/{self.uav_name}/rgb/image_raw'
         self._use_compressed = self.image_topic.endswith('/compressed')
-        self.camera_info_topic = f'/{self.uav_name}/rgb/camera_info'
+        _img_base = self.image_topic.replace('/compressed', '').rsplit('/image_raw', 1)[0]
+        self.camera_info_topic = f'{_img_base}/camera_info'
         self.detection_topic = f'/{self.uav_name}/detection'
         self.camera_origin_topic = f'/{self.uav_name}/camera_origin'
         self.ray_topic = f'/{self.uav_name}/ray'
