@@ -1,203 +1,213 @@
 # Vision Stack Deploy
 
-Deployment package for the drone-hunters vision stack. It contains the ROS 2 launch scripts, the Python nodes for detection, triangulation, monitoring, evaluation, and the model weights used on the drone.
+Deployment package for the **drone-hunters** vision stack — a two-drone system that detects, triangulates, and predicts the trajectory of a target drone in real time, using only onboard cameras and CPU inference.
 
-## What this repo does
+## Architecture overview
 
-The stack is split across two flying nodes and one monitoring node:
+Two hunter drones fly simultaneously.  Each runs a YOLOv8/v11n detector on its camera feed.  The **observer drone** publishes the detected ray and camera origin in the world frame.  The **main drone** detects locally, receives the remote ray over Wi-Fi, triangulates the 3D target position from the two rays, and feeds it into an IMM (Interacting Multiple-Model) Kalman filter that estimates position, velocity and acceleration.  A predicted trajectory is published so that an interceptor can plan ahead.
 
-- `launch_observer_drone.sh` starts the observer drone pipeline.
-- `launch_main_drone.sh` starts the main triangulation pipeline and, optionally, the evaluator.
-- `launch_live_monitor.sh` starts a PC-side matplotlib monitor.
-
-At runtime, the observer drone detects the target and publishes:
-
-- the camera origin in world coordinates
-- the detected ray in world coordinates
-
-The main drone receives its own detections plus the remote ray from the observer drone, triangulates the target position, and then runs the IMM-based tracker to smooth and predict the target motion.
+```
+Observer drone                          Main drone
+┌──────────────────────┐       Wi-Fi    ┌──────────────────────────────────┐
+│  Camera → YOLO → Ray ├──────────────► │  Camera → YOLO → Ray (local)     │
+│  (ego_state)         │                │  + Remote ray  → Triangulation   │
+└──────────────────────┘                │  → IMM Filter → Trajectory pred  │
+                                        └──────────────────────────────────┘
+```
 
 ## Repository layout
 
-- `config/runtime_stack.yaml`: central configuration for drone names, device selection, run mode, EKF/IMM tuning, and evaluation topic suffix.
-- `nodes/yolov8_observer_node.py`: YOLOv8 detector on the observer drone.
-- `nodes/yolov8_main_triangulation_node.py`: main detector + triangulation + tracking node.
-- `nodes/evaluate_prediction_node.py`: trajectory evaluator used in `decentralized_evaluation` mode.
-- `nodes/live_monitor.py`: local visualization of ground truth, estimate, prediction, and error.
-- `launch_*.sh`: convenience launch scripts.
-- `weights/`: local inference weights.
+| Path | Purpose |
+|------|---------|
+| `config/runtime_stack.yaml` | Central configuration: drone names, device, ROI tuning, EKF/IMM params, evaluation |
+| `nodes/yolov8_observer_node.py` | Observer drone: YOLO detection → ray + origin publishing |
+| `nodes/yolov8_main_triangulation_node.py` | Main drone: YOLO detection + two-ray triangulation + IMM filter + trajectory prediction |
+| `nodes/imm_image_overlay_node.py` | Overlay node: projects IMM predicted trajectory onto the observer camera image |
+| `nodes/evaluate_prediction_node.py` | Trajectory evaluator: compares predictions to ground truth |
+| `nodes/live_monitor.py` | PC-side matplotlib real-time visualization |
+| `nodes/test_yolov8_realtime_node.py` | Minimal detection test node |
+| `launch_observer_drone.sh` | Launch script for the observer pipeline |
+| `launch_main_drone.sh` | Launch script for the main pipeline (+ evaluator in eval mode) |
+| `launch_live_monitor.sh` | Launch script for the PC monitor |
+| `weights/` | Model weights: OpenVINO IR, ONNX, PyTorch (.pt) |
+| `debug/evaluation/` | Evaluation run outputs (JSON, CSV, markdown reports) |
 
-## How it works
+## Key techniques
 
-### Observer drone
+### 1. Adaptive ROI crop
 
-The observer node:
+After the first detection, YOLO inference switches from full-image (896 px) to a small crop (320 px) centered on the predicted target position.  This cuts inference time by ~70 % on CPU.
 
-- subscribes to the observer camera image topic
-- runs YOLO inference
-- selects the best detection according to confidence and `target_class_id`
-- computes a ray in the world frame using camera intrinsics and TF
-- publishes:
-  - `/<observer2>/camera_origin`
-  - `/<observer2>/ray`
-  - `/<observer2>/detection/compressed` when annotated output is enabled
+**ROI center prediction** uses two strategies in priority order:
 
-### Main drone
+- **IMM 3D→2D projection** — the main node projects the IMM-filtered 3D position through TF and camera intrinsics onto the image plane.  The observer node subscribes to `/target/odometry_estimate` and does the same projection, giving it access to the main node's IMM estimate.
+- **2D pixel velocity tracker** — exponentially-smoothed pixel velocity from previous detections (fallback when IMM data is unavailable or the TF lookup fails).
 
-The main node:
+**ROI escalation** prevents hard lock-on/lock-off behavior.  On consecutive misses the crop region gradually expands:
 
-- subscribes to the main camera image topic
-- runs YOLO inference locally
-- computes the local ray for the best detection
-- matches local and remote observations by timestamp
-- triangulates the target position from the two rays
-- feeds the measurement to an IMM filter with constant-velocity and constant-acceleration models
-- publishes:
-  - `/target/pose_estimate`
-  - `/target/odometry_estimate`
-  - `/target/position_estimate`
-  - `/target/triangulation_raw`
-  - `/target/predicted_trajectory`
-  - marker topics for visualization
+| Consecutive misses | ROI multiplier |
+|--------------------|----------------|
+| 0 | ×1.0 (base size) |
+| 1–2 | ×1.5 |
+| 3–5 | ×2.0 |
+| ≥ 6 | full-image scan |
 
-If no new measurement arrives, the main node can coast forward using the last filtered state.
+A detection at any stage resets the miss counter to zero.
 
-### Evaluation and monitoring
+**M-of-N init gate** blocks false positives from triggering the ROI lock.  When there is no active track, detections are buffered.  ROI tracking only starts when at least M of the last N detection centers cluster within a pixel spread threshold (defaults: 3-of-5 within 80 px).
 
-When `launcher.drone_run_mode` is set to `decentralized_evaluation`, the main script also starts the evaluator node. The evaluator compares the predicted trajectory against ground truth and writes reports under `debug/evaluation/<timestamp>/`.
+**Prediction-gated detection selection** — when the ROI track is active, the best detection is chosen not by confidence alone but by a combined score `conf − λ × (d/d_max)`, where d is the pixel distance from the predicted ROI center and λ (default 0.3) controls the proximity bias.  This reduces the chance of jumping to a spurious high-confidence detection far from the target.
 
-The live monitor is a separate PC-side tool that subscribes to the target odometry, estimate, prediction, and observer odometry topics and plots them in real time.
+**Periodic full scan** — every N frames (default 10) a full-image scan is forced regardless of ROI state, as a safety net for reacquisition.
+
+### 2. Two-ray triangulation
+
+Each drone computes a 3D ray from its detection using camera intrinsics and the TF-derived camera-to-world transform.  The main node matches local and remote observations by timestamp (within `max_pair_age_sec`) and triangulates via closest-point-on-two-lines (midpoint formulation).
+
+**Adaptive measurement covariance** — the triangulation error is anisotropic: it grows along the bisector of the two rays when the intersection angle is shallow.  The measurement covariance matrix R is constructed from the eigendecomposition of the ray geometry, with the depth variance scaled by `1/sin(angle)`, clamped at `kf_adaptive_cov_max_multiplier`.
+
+**Kinematic ray shifting** — if the local and remote observations have a non-zero timestamp gap (asynchronous cameras or Wi-Fi jitter), the remote ray origin is shifted by `velocity × Δt` using the current IMM velocity estimate, effectively projecting it to the local timestamp before triangulation.
+
+### 3. IMM filter (CV + CA)
+
+An Interacting Multiple-Model filter runs two parallel Kalman filters:
+
+- **Constant Velocity (CV)** — state `[x, y, z, vx, vy, vz]`, 6-D
+- **Constant Acceleration (CA)** — state `[x, y, z, vx, vy, vz, ax, ay, az]`, 9-D
+
+At each measurement step the filters are mixed, predicted, corrected, and re-weighted by their measurement likelihood.  The combined output (position, velocity, acceleration, covariance) is published as an `Odometry` message.
+
+**Mahalanobis gating** rejects outlier measurements that are statistically too far from both filter predictions, causing the filter to coast on its own kinematic model instead of incorporating a corrupt measurement.
+
+**Covariance reset** — if the covariance trace exceeds a threshold, the filter is re-initialized at the current measurement to recover from divergence.
+
+**Coast prediction** — when no new triangulation arrives (e.g. Wi-Fi dropout), the filter extrapolates forward using the last kinematic state.
+
+### 4. OpenVINO inference
+
+For Intel-CPU drones the model is exported to OpenVINO IR format.  The default model path is `weights/best_openvino_model` (fixed input shape 896).  Fallback is `weights/best.pt` (PyTorch).  On GPU-equipped machines, set `vision.device: cuda`.
+
+### 5. Annotated image publishing
+
+When `vision.publish_annotated_image` is `true`, each node publishes `/<uav>/detection/compressed` with:
+
+- Bounding boxes for all detections (green) with the best detection highlighted (orange, marked `*`)
+- A **green ROI rectangle** showing the exact crop region used for inference, labeled "ROI"
+
+Keep this disabled in production to save Wi-Fi bandwidth.
 
 ## Installation
-
-Run the environment bootstrap script from this repo:
 
 ```bash
 bash setup_env.sh
 ```
 
-This creates a local `.venv` and installs the Python dependencies from `requirements.txt`.
+Creates a local `.venv` and installs Python dependencies from `requirements.txt` (including `numpy<2` for cv_bridge compatibility).
 
 ## Running
 
 ### Observer drone
 
 ```bash
-bash launch_observer_drone.sh
-```
-
-Optional argument:
-
-```bash
-bash launch_observer_drone.sh /path/to/model
+bash launch_observer_drone.sh [/path/to/model]
 ```
 
 ### Main drone
 
 ```bash
-bash launch_main_drone.sh
+bash launch_main_drone.sh [/path/to/model]
 ```
 
-Optional argument:
+In `decentralized_evaluation` mode this also starts the evaluator node.
 
-```bash
-bash launch_main_drone.sh /path/to/model
-```
-
-If `launcher.drone_run_mode` is `decentralized_evaluation`, this script also launches the evaluator node.
-
-### Live monitor
+### Live monitor (PC side)
 
 ```bash
 bash launch_live_monitor.sh
 ```
 
+## Configuration — `config/runtime_stack.yaml`
+
+### Drone names
+
+```yaml
+uav_roles:
+  observer1: uav1   # main drone (runs triangulation)
+  observer2: uav2   # remote observer (publishes ray)
+  target: uav3      # drone being tracked
+```
+
+### Image topics
+
+Leave empty for auto-discovery, or override:
+
+```yaml
+vision:
+  main_image_topic: "/uav1/rgbd/color/image_raw/compressed"
+  observer_image_topic: "/uav2/rgbd/color/image_raw/compressed"
+```
+
+### Inference device
+
+```yaml
+vision:
+  device: "cpu"    # "cpu" for Intel drone, "cuda" for GPU
+```
+
+### ROI crop tuning
+
+```yaml
+vision:
+  roi_crop_enabled: true
+  roi_crop_imgsz: 320
+  roi_margin_multiplier: 3.0
+  roi_min_size_px: 200
+  roi_track_timeout_sec: 0.5
+  roi_full_scan_interval: 10
+  roi_init_m: 3
+  roi_init_n: 5
+  roi_init_max_spread_px: 80
+  roi_selection_lambda: 0.3
+```
+
+### IMM filter tuning
+
+```yaml
+ekf:
+  kf_process_noise_acc: 1.25
+  kf_process_noise_vel: 1.2
+  imm_transition_prob: 0.90
+  kf_measurement_noise: 0.05
+  kf_adaptive_cov_max_multiplier: 50.0
+  kf_initial_covariance: 2.0
+  kf_mahalanobis_threshold: 7.0
+```
+
+### Ground truth / evaluation
+
+```yaml
+evaluation:
+  odom_topic_suffix: "hw_api/ground_truth"   # simulation
+  # odom_topic_suffix: "odometry/odom_main"  # real drone
+```
+
+### Sim vs real quick reference
+
+| Setting | Simulation | Real drone |
+|---------|-----------|------------|
+| `vision.device` | `cuda` | `cpu` |
+| `vision.publish_annotated_image` | `true` | `false` (save bandwidth) |
+| `evaluation.odom_topic_suffix` | `hw_api/ground_truth` | `odometry/odom_main` |
+| `launcher.drone_run_mode` | `decentralized_evaluation` | `decentralized` |
+
 ## Default model selection
 
-The default model path is now local to the repo:
+Both nodes auto-select the model in this order:
 
-- first choice: `weights/best_openvino_model`
-- fallback: `weights/best.pt`
+1. `weights/best_openvino_model` (OpenVINO IR, fastest on Intel CPU)
+2. `weights/best.pt` (PyTorch fallback)
 
-This applies to the triangulation and observer nodes, so the stack can run directly from the repo without pointing to a home-directory training path.
-
-## Configuration: sim vs real drone
-
-Most of the deployment differences are handled in `config/runtime_stack.yaml`.
-
-### 1. Drone names
-
-Update `uav_roles` to match your actual vehicle names:
-
-- `observer1`: the main drone that runs the triangulation node
-- `observer2`: the remote observer drone that publishes the ray
-- `target`: the drone being tracked
-
-These names are used to build the ROS topic prefixes.
-
-### 2. Image topics
-
-By default the nodes auto-discover the standard image topic names. If your setup uses a different camera topic, override:
-
-- `vision.main_image_topic`
-- `vision.observer_image_topic`
-
-Use the compressed image topic if that is what your camera driver publishes, for example:
-
-- `/uav1/rgb/image_raw/compressed`
-- `/uav2/rgbd/color/image_raw/compressed`
-
-### 3. Inference device
-
-Set `vision.device` according to the platform:
-
-- `cuda` for GPU-backed inference
-- `cpu` for an Intel drone or any CPU-only deployment
-
-### 4. Ground truth topic suffix
-
-The evaluator and live monitor build the target odometry topic from:
-
-- `/<target>/<evaluation.odom_topic_suffix>`
-
-In simulation, the default is:
-
-- `hw_api/ground_truth`
-
-For the real drone, change it to the odometry topic suffix used by your flight stack, for example:
-
-- `odometry/odom_main`
-
-### 5. Annotated image publishing
-
-For real deployment, keep this disabled unless you need debugging:
-
-- `vision.publish_annotated_image: false`
-
-Publishing annotated images increases bandwidth and can make the Wi-Fi link noisier.
-
-### 6. Tracking and filter tuning
-
-The `ekf` section controls the IMM and triangulation filter behavior:
-
-- `kf_process_noise_acc`
-- `kf_process_noise_vel`
-- `imm_transition_prob`
-- `kf_measurement_noise`
-- `kf_adaptive_cov_max_multiplier`
-- `kf_initial_covariance`
-- `kf_mahalanobis_threshold`
-
-The defaults are tuned for the current workflow, but you may need to adjust them if the camera baseline, target speed, or latency changes.
-
-## Suggested setup for simulation
-
-In simulation, you usually keep:
-
-- `vision.device: cuda` if you have GPU acceleration
-- `vision.publish_annotated_image: true` only if you want debug overlays
-- `evaluation.odom_topic_suffix: hw_api/ground_truth`
-- `launcher.drone_run_mode: decentralized_evaluation`
+Override via the launch script argument or the `model_path` ROS parameter.
 
 That gives you tracking plus automatic evaluation outputs.
 

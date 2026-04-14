@@ -3,10 +3,21 @@ launcher:
   auto_start_node: triangulation  # one of: none, detection, triangulation
 
 vision:
-  publish_annotated_image: false  # set to true only for debug (saves bandwidth on real drone)
-  device: "cuda"  # inference device: "cpu" for Intel drone, "cuda" for GPU
+  publish_annotated_image: true  # set to true only for debug (saves bandwidth on real drone)
+  device: "cpu"  # inference device: "cpu" for Intel drone, "cuda" for GPU, "GPU" for Intel iGPU via OpenVINO
   observer_image_topic: ""  # override observer camera topic, e.g. /uav2/rgbd/color/image_raw/compressed (empty = auto)
   main_image_topic: ""      # override main camera topic, e.g. /uav1/rgbd/color/image_raw/compressed (empty = auto)
+  roi_crop_enabled: true    # adaptive ROI crop: run YOLO on small crop around predicted target position
+  roi_crop_imgsz: 320       # YOLO input size for ROI crop inference (smaller = faster, 320 recommended)
+  roi_margin_multiplier: 3.0  # ROI size = bbox_size * this multiplier (larger = safer but slower)
+  roi_min_size_px: 200      # minimum ROI crop side in pixels
+  roi_track_timeout_sec: 0.5  # seconds without detection before falling back to full scan
+  roi_full_scan_interval: 10  # force full-image scan every N frames (reacquisition safety net)
+  roi_init_m: 3               # M-of-N init gate: require M consistent detections ...
+  roi_init_n: 5               # ... out of the last N detections ...
+  roi_init_max_spread_px: 80  # ... within this pixel spread to start ROI tracking
+  roi_selection_lambda: 0.3   # prediction-gated selection: proximity weight (0 = pure confidence)
+  publish_rviz_markers: false  # predicted trajectory & position markers to RViz (disable to save CPU)
 
 uav_roles:
   observer1: uav1   # MAIN drone name — edit to match your real drone
@@ -17,7 +28,7 @@ ekf:
   kf_process_noise_acc: 1.25
   kf_process_noise_vel: 1.2
   imm_transition_prob: 0.90
-  kf_measurement_noise: 0.05
+  kf_measurement_noise: 0.10
   kf_adaptive_cov_max_multiplier: 50.0
   kf_initial_covariance: 2.0
   kf_mahalanobis_threshold: 7.0

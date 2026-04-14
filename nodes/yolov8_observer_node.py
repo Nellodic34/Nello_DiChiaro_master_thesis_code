@@ -2,6 +2,7 @@
 
 import os
 import time
+import collections
 from dataclasses import dataclass
 from pathlib import Path as FsPath
 from typing import Dict, List, Optional, Tuple
@@ -11,6 +12,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, Vector3Stamped
+from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time
@@ -64,15 +66,36 @@ class Yolov8ObserverNode(Node):
         _default_device = 'cuda'
         _override_image_topic = ''
         _default_publish_annotated = True
+        _default_roi_enabled = False
+        _default_roi_crop_imgsz = 320
+        _default_roi_margin = 3.0
+        _default_roi_min_size = 200
+        _default_roi_timeout = 0.5
+        _default_roi_full_interval = 10
+        _default_roi_init_m = 3
+        _default_roi_init_n = 5
+        _default_roi_init_spread = 80
+        _default_roi_sel_lambda = 0.3
         if _config_path.exists():
             import yaml
             try:
                 with open(_config_path, 'r', encoding='utf-8') as _f:
                     _cfg = yaml.safe_load(_f)
                     if _cfg and 'vision' in _cfg:
-                        _default_device = _cfg['vision'].get('device', _default_device)
-                        _override_image_topic = _cfg['vision'].get('observer_image_topic', '') or ''
-                        _default_publish_annotated = bool(_cfg['vision'].get('publish_annotated_image', _default_publish_annotated))
+                        _v = _cfg['vision']
+                        _default_device = _v.get('device', _default_device)
+                        _override_image_topic = _v.get('observer_image_topic', '') or ''
+                        _default_publish_annotated = bool(_v.get('publish_annotated_image', _default_publish_annotated))
+                        _default_roi_enabled = bool(_v.get('roi_crop_enabled', _default_roi_enabled))
+                        _default_roi_crop_imgsz = int(_v.get('roi_crop_imgsz', _default_roi_crop_imgsz))
+                        _default_roi_margin = float(_v.get('roi_margin_multiplier', _default_roi_margin))
+                        _default_roi_min_size = int(_v.get('roi_min_size_px', _default_roi_min_size))
+                        _default_roi_timeout = float(_v.get('roi_track_timeout_sec', _default_roi_timeout))
+                        _default_roi_full_interval = int(_v.get('roi_full_scan_interval', _default_roi_full_interval))
+                        _default_roi_init_m = int(_v.get('roi_init_m', _default_roi_init_m))
+                        _default_roi_init_n = int(_v.get('roi_init_n', _default_roi_init_n))
+                        _default_roi_init_spread = int(_v.get('roi_init_max_spread_px', _default_roi_init_spread))
+                        _default_roi_sel_lambda = float(_v.get('roi_selection_lambda', _default_roi_sel_lambda))
             except Exception:
                 pass
 
@@ -91,9 +114,19 @@ class Yolov8ObserverNode(Node):
         self.declare_parameter('line_width', 2)
         self.declare_parameter('target_class_id', -1)
         self.declare_parameter('processing_rate_hz', 100.0)
-        self.declare_parameter('tf_timeout_sec', 0.1)
+        self.declare_parameter('tf_timeout_sec', 0.05)
         self.declare_parameter('world_frame_suffix', 'world_origin')
         self.declare_parameter('publish_annotated_image', _default_publish_annotated)
+        self.declare_parameter('roi_crop_enabled', _default_roi_enabled)
+        self.declare_parameter('roi_crop_imgsz', _default_roi_crop_imgsz)
+        self.declare_parameter('roi_margin_multiplier', _default_roi_margin)
+        self.declare_parameter('roi_min_size_px', _default_roi_min_size)
+        self.declare_parameter('roi_track_timeout_sec', _default_roi_timeout)
+        self.declare_parameter('roi_full_scan_interval', _default_roi_full_interval)
+        self.declare_parameter('roi_init_m', _default_roi_init_m)
+        self.declare_parameter('roi_init_n', _default_roi_init_n)
+        self.declare_parameter('roi_init_max_spread_px', _default_roi_init_spread)
+        self.declare_parameter('roi_selection_lambda', _default_roi_sel_lambda)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.model_path = os.path.expanduser(str(self.get_parameter('model_path').value))
@@ -108,6 +141,16 @@ class Yolov8ObserverNode(Node):
         self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
         self.world_frame_suffix = str(self.get_parameter('world_frame_suffix').value)
         self.publish_annotated_image = bool(self.get_parameter('publish_annotated_image').value)
+        self.roi_crop_enabled = bool(self.get_parameter('roi_crop_enabled').value)
+        self.roi_crop_imgsz = int(self.get_parameter('roi_crop_imgsz').value)
+        self.roi_margin = float(self.get_parameter('roi_margin_multiplier').value)
+        self.roi_min_size = int(self.get_parameter('roi_min_size_px').value)
+        self.roi_timeout_ns = int(float(self.get_parameter('roi_track_timeout_sec').value) * 1_000_000_000)
+        self.roi_full_scan_interval = max(1, int(self.get_parameter('roi_full_scan_interval').value))
+        self.roi_init_m = max(1, int(self.get_parameter('roi_init_m').value))
+        self.roi_init_n = max(self.roi_init_m, int(self.get_parameter('roi_init_n').value))
+        self.roi_init_spread = float(self.get_parameter('roi_init_max_spread_px').value)
+        self.roi_sel_lambda = float(self.get_parameter('roi_selection_lambda').value)
 
         self.image_topic = _override_image_topic or f'/{self.uav_name}/rgb/image_raw'
         self._use_compressed = self.image_topic.endswith('/compressed')
@@ -142,6 +185,20 @@ class Yolov8ObserverNode(Node):
         self.last_log_time = time.time()
         self._last_image_time = time.time()
 
+        # ROI tracker state (2D pixel-space)
+        self._roi_last_bbox: Optional[Tuple[float, float, float, float]] = None  # x1,y1,x2,y2
+        self._roi_last_center: Optional[Tuple[float, float]] = None  # u,v
+        self._roi_last_stamp_ns: int = 0
+        self._roi_frame_counter: int = 0  # counts since last full scan
+        self._roi_vel_u: float = 0.0  # pixel velocity estimate
+        self._roi_vel_v: float = 0.0
+        self._roi_consecutive_misses: int = 0  # ROI escalation counter
+        self._init_gate_buffer: collections.deque = collections.deque(maxlen=self.roi_init_n)  # M-of-N init gate
+
+        # IMM odometry from main node (for ROI center prediction)
+        self._target_odom: Optional[Odometry] = None
+        self._target_odom_stamp_ns: int = 0
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -158,7 +215,8 @@ class Yolov8ObserverNode(Node):
         else:
             self.create_subscription(Image, self.image_topic, self.image_callback, _sensor_qos)
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
-        
+        self.create_subscription(Odometry, '/target/odometry_estimate', self._target_odom_callback, 10)
+
         # Timer
         self.create_timer(1.0 / self.processing_rate_hz, self.processing_timer_callback)
 
@@ -169,6 +227,75 @@ class Yolov8ObserverNode(Node):
 
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
+
+    def _target_odom_callback(self, msg: Odometry) -> None:
+        self._target_odom = msg
+        self._target_odom_stamp_ns = stamp_to_ns(msg.header.stamp)
+
+    def _get_roi_center(self, stamp_ns: int, img_w: int, img_h: int) -> Optional[Tuple[float, float]]:
+        """Get ROI center: IMM 3D→2D projection (from main node odometry), fallback to 2D pixel velocity."""
+        # Strategy 1: project IMM 3D position from /target/odometry_estimate into image plane
+        if self._target_odom is not None and self.camera_info is not None:
+            odom_age_ns = abs(stamp_ns - self._target_odom_stamp_ns)
+            if odom_age_ns < 2_000_000_000:  # odometry not older than 2 s
+                camera_frame = self.camera_info.header.frame_id
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        camera_frame, self._target_odom.header.frame_id, Time(), Duration(seconds=0)
+                    )
+                    t = transform.transform.translation
+                    q = transform.transform.rotation
+                    r_cw = quat_to_rotmat(q.x, q.y, q.z, q.w)
+                    t_cw = np.array([t.x, t.y, t.z], dtype=np.float64)
+
+                    pos_3d = np.array([
+                        self._target_odom.pose.pose.position.x,
+                        self._target_odom.pose.pose.position.y,
+                        self._target_odom.pose.pose.position.z,
+                    ], dtype=np.float64)
+                    vel_3d = np.array([
+                        self._target_odom.twist.twist.linear.x,
+                        self._target_odom.twist.twist.linear.y,
+                        self._target_odom.twist.twist.linear.z,
+                    ], dtype=np.float64)
+                    dt = (stamp_ns - self._target_odom_stamp_ns) / 1_000_000_000.0
+                    pred_3d = pos_3d + vel_3d * dt
+
+                    p_cam = r_cw @ pred_3d + t_cw
+                    if p_cam[2] > 0.1:
+                        fx = float(self.camera_info.k[0])
+                        fy = float(self.camera_info.k[4])
+                        cx = float(self.camera_info.k[2])
+                        cy = float(self.camera_info.k[5])
+                        u = fx * p_cam[0] / p_cam[2] + cx
+                        v = fy * p_cam[1] / p_cam[2] + cy
+                        if 0 <= u < img_w and 0 <= v < img_h:
+                            return (u, v)
+                except Exception:
+                    pass
+
+        # Strategy 2: 2D pixel velocity tracker
+        if self._roi_last_center is not None and (stamp_ns - self._roi_last_stamp_ns) < self.roi_timeout_ns:
+            dt_sec = (stamp_ns - self._roi_last_stamp_ns) / 1_000_000_000.0
+            pred_u = self._roi_last_center[0] + self._roi_vel_u * dt_sec
+            pred_v = self._roi_last_center[1] + self._roi_vel_v * dt_sec
+            return (pred_u, pred_v)
+
+        return None
+
+    def _check_init_gate(self, center_u: float, center_v: float, stamp_ns: int) -> bool:
+        """M-of-N init gate: require M consistent detections out of N before starting track."""
+        self._init_gate_buffer.append((center_u, center_v, stamp_ns))
+        if len(self._init_gate_buffer) < self.roi_init_m:
+            return False
+        centers = [(u, v) for u, v, _ in self._init_gate_buffer]
+        # Check if at least M of the last N centers cluster within roi_init_spread
+        for i in range(len(centers)):
+            ref_u, ref_v = centers[i]
+            close = sum(1 for u, v in centers if abs(u - ref_u) < self.roi_init_spread and abs(v - ref_v) < self.roi_init_spread)
+            if close >= self.roi_init_m:
+                return True
+        return False
 
     def image_callback(self, msg) -> None:
         if self.latest_image is not None:
@@ -200,22 +327,96 @@ class Yolov8ObserverNode(Node):
             self.get_logger().error(f'[{self.uav_name}] Failed to convert input image: {exc}')
             return
 
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        img_h, img_w = bgr_image.shape[:2]
+
+        # Decide: ROI crop or full scan
+        use_roi = False
+        roi_x1 = roi_y1 = roi_x2 = roi_y2 = 0
+        infer_image = bgr_image
+        infer_imgsz = self.imgsz
+
+        if self.roi_crop_enabled and self._roi_last_bbox is not None:
+            force_full = (self._roi_frame_counter % self.roi_full_scan_interval == 0)
+
+            roi_center = self._get_roi_center(stamp_ns, img_w, img_h)
+            has_track = roi_center is not None
+
+            if has_track and not force_full:
+                pred_u, pred_v = roi_center
+
+                # ROI size from last bbox with escalation multiplier
+                bx1, by1, bx2, by2 = self._roi_last_bbox
+                bbox_w = bx2 - bx1
+                bbox_h = by2 - by1
+                roi_side = max(bbox_w, bbox_h) * self.roi_margin
+                roi_side = max(roi_side, float(self.roi_min_size))
+
+                # Escalation: expand ROI on consecutive misses
+                if self._roi_consecutive_misses >= 3:
+                    roi_side *= 2.0
+                elif self._roi_consecutive_misses >= 1:
+                    roi_side *= 1.5
+
+                half = roi_side * 0.5
+                roi_x1 = int(max(0.0, pred_u - half))
+                roi_y1 = int(max(0.0, pred_v - half))
+                roi_x2 = int(min(float(img_w), pred_u + half))
+                roi_y2 = int(min(float(img_h), pred_v + half))
+
+                if (roi_x2 - roi_x1) >= self.roi_min_size and (roi_y2 - roi_y1) >= self.roi_min_size:
+                    infer_image = bgr_image[roi_y1:roi_y2, roi_x1:roi_x2]
+                    infer_imgsz = self.roi_crop_imgsz
+                    use_roi = True
+
+        self._roi_frame_counter += 1
+
         start_time = time.time()
         results = self.model.predict(
-            source=bgr_image,
+            source=infer_image,
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
-            imgsz=self.imgsz,
+            imgsz=infer_imgsz,
             max_det=self.max_detections,
             device=self.device,
             verbose=False,
         )
         infer_ms = (time.time() - start_time) * 1000.0
 
-        best_detection = self.extract_best_detection(results, msg)
-        
+        # Pass ROI center for prediction-gated selection
+        roi_pred_center = None
+        if use_roi and self._roi_last_center is not None:
+            roi_pred_center = self._roi_last_center
+        best_detection = self.extract_best_detection(results, msg, roi_pred_center, roi_x1, roi_y1,
+                                                      roi_x2 - roi_x1 if use_roi else img_w)
+
+        # Remap detection coordinates from crop to full image
+        if best_detection is not None and use_roi:
+            best_detection.center_u += roi_x1
+            best_detection.center_v += roi_y1
+
+        # Update ROI tracker
+        if best_detection is not None:
+            if self._roi_last_bbox is not None:
+                # Active track — update tracker, reset misses
+                self._update_roi_tracker(best_detection, results, stamp_ns, roi_x1, roi_y1)
+                self._roi_consecutive_misses = 0
+            else:
+                # No active track — apply M-of-N init gate
+                if self._check_init_gate(best_detection.center_u, best_detection.center_v, stamp_ns):
+                    self._update_roi_tracker(best_detection, results, stamp_ns, roi_x1, roi_y1)
+                    self._roi_consecutive_misses = 0
+                    self._init_gate_buffer.clear()
+                    self.get_logger().info('ROI track initialized via M-of-N gate')
+        elif self.roi_crop_enabled and self._roi_last_bbox is not None:
+            self._roi_consecutive_misses += 1
+            if (stamp_ns - self._roi_last_stamp_ns) >= self.roi_timeout_ns:
+                self._roi_last_bbox = None
+                self._roi_last_center = None
+                self._roi_consecutive_misses = 0
+
         if self.publish_annotated_image:
-            annotated_image = self.draw_predictions(bgr_image, results, best_detection)
+            annotated_image = self.draw_predictions(bgr_image, results, best_detection, use_roi, roi_x1, roi_y1, roi_x2, roi_y2)
             comp_msg = CompressedImage()
             comp_msg.header = msg.header
             comp_msg.format = 'jpeg'
@@ -229,12 +430,44 @@ class Yolov8ObserverNode(Node):
         now = time.time()
         if now - self.last_log_time >= 2.0:
             fps = self.frame_counter / (now - self.last_log_time)
-            self.get_logger().info(f'Observer node: FPS={fps:.2f}, inference={infer_ms:.1f}ms, dropped={self._dropped_frames}')
+            mode = 'ROI' if use_roi else 'FULL'
+            esc = f' esc={self._roi_consecutive_misses}' if self._roi_consecutive_misses > 0 else ''
+            self.get_logger().info(f'Observer node: FPS={fps:.2f}, inference={infer_ms:.1f}ms, mode={mode}{esc}, dropped={self._dropped_frames}')
             self.frame_counter = 0
             self._dropped_frames = 0
             self.last_log_time = now
 
-    def extract_best_detection(self, results, msg: Image) -> Optional[DetectionObservation]:
+    def _update_roi_tracker(self, det: 'DetectionObservation', results, stamp_ns: int, roi_x1: int, roi_y1: int) -> None:
+        """Update 2D ROI tracker from detection + bbox."""
+        # Extract bbox for the best detection from results
+        result = results[0]
+        boxes_xyxy = result.boxes.xyxy.tolist()
+        confs = result.boxes.conf.tolist()
+        best_idx = int(np.argmax(confs))
+        bx1, by1, bx2, by2 = boxes_xyxy[best_idx]
+        # Remap bbox to full image coords
+        bx1 += roi_x1; by1 += roi_y1
+        bx2 += roi_x1; by2 += roi_y1
+
+        new_u = det.center_u
+        new_v = det.center_v
+
+        # Estimate pixel velocity (simple exponential smoothing)
+        if self._roi_last_center is not None and self._roi_last_stamp_ns > 0:
+            dt = (stamp_ns - self._roi_last_stamp_ns) / 1_000_000_000.0
+            if dt > 0.001:
+                alpha = 0.6  # smoothing factor
+                raw_vel_u = (new_u - self._roi_last_center[0]) / dt
+                raw_vel_v = (new_v - self._roi_last_center[1]) / dt
+                self._roi_vel_u = alpha * raw_vel_u + (1.0 - alpha) * self._roi_vel_u
+                self._roi_vel_v = alpha * raw_vel_v + (1.0 - alpha) * self._roi_vel_v
+
+        self._roi_last_bbox = (bx1, by1, bx2, by2)
+        self._roi_last_center = (new_u, new_v)
+        self._roi_last_stamp_ns = stamp_ns
+
+    def extract_best_detection(self, results, msg: Image, roi_pred_center: Optional[Tuple[float, float]] = None,
+                               roi_x1: int = 0, roi_y1: int = 0, roi_half_side: float = 1.0) -> Optional[DetectionObservation]:
         if not results:
             return None
 
@@ -271,9 +504,19 @@ class Yolov8ObserverNode(Node):
         if not candidates:
             return None
 
+        # Prediction-gated selection: when ROI track is active, prefer detections near prediction
+        if roi_pred_center is not None and self.roi_sel_lambda > 0.0:
+            pred_u, pred_v = roi_pred_center
+            d_max = max(roi_half_side * 0.5, 1.0)
+            def score(det):
+                # Coordinates are still in crop space here — offset by roi_x1/y1 for comparison
+                d_pixel = ((det.center_u + roi_x1 - pred_u) ** 2 + (det.center_v + roi_y1 - pred_v) ** 2) ** 0.5
+                return det.confidence - self.roi_sel_lambda * min(d_pixel / d_max, 1.0)
+            return max(candidates, key=score)
+
         return max(candidates, key=lambda item: item.confidence)
 
-    def draw_predictions(self, image: np.ndarray, results, best_detection: Optional[DetectionObservation]) -> np.ndarray:
+    def draw_predictions(self, image: np.ndarray, results, best_detection: Optional[DetectionObservation], use_roi: bool = False, roi_x1: int = 0, roi_y1: int = 0, roi_x2: int = 0, roi_y2: int = 0) -> np.ndarray:
         annotated = image.copy()
 
         if not results:
@@ -281,6 +524,10 @@ class Yolov8ObserverNode(Node):
 
         result = results[0]
         if result.boxes is None or len(result.boxes) == 0:
+            # Still draw ROI region even if no detections
+            if use_roi and roi_x2 > roi_x1 and roi_y2 > roi_y1:
+                cv2.rectangle(annotated, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 220, 0), 2)
+                cv2.putText(annotated, 'ROI', (roi_x1, roi_y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1, cv2.LINE_AA)
             return annotated
 
         names = result.names if result.names is not None else {}
@@ -289,31 +536,31 @@ class Yolov8ObserverNode(Node):
         classes: List[float] = result.boxes.cls.tolist()
 
         for box, conf, cls_idx in zip(boxes_xyxy, confidences, classes):
-            x1, y1, x2, y2 = [int(v) for v in box]
+            # Remap from crop to full image
+            x1 = int(box[0]) + roi_x1
+            y1 = int(box[1]) + roi_y1
+            x2 = int(box[2]) + roi_x1
+            y2 = int(box[3]) + roi_y1
             class_id = int(cls_idx)
             class_name = names.get(class_id, str(class_id)) if isinstance(names, dict) else str(class_id)
             label = f'{class_name} {conf:.2f}'
 
             color = (0, 255, 0)
             if best_detection is not None:
-                center_u = 0.5 * (box[0] + box[2])
-                center_v = 0.5 * (box[1] + box[3])
+                center_u = 0.5 * (box[0] + box[2]) + roi_x1
+                center_v = 0.5 * (box[1] + box[3]) + roi_y1
                 if abs(center_u - best_detection.center_u) < 1.0 and abs(center_v - best_detection.center_v) < 1.0:
                     color = (0, 165, 255)
                     label += ' *'
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, self.line_width)
             y_text = y1 - 10 if y1 > 20 else y1 + 20
-            cv2.putText(
-                annotated,
-                label,
-                (x1, y_text),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
+            cv2.putText(annotated, label, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+        # Draw actual ROI crop region (green rectangle with label)
+        if use_roi and roi_x2 > roi_x1 and roi_y2 > roi_y1:
+            cv2.rectangle(annotated, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 220, 0), 2)
+            cv2.putText(annotated, 'ROI', (roi_x1, roi_y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1, cv2.LINE_AA)
 
         return annotated
 
@@ -335,16 +582,21 @@ class Yolov8ObserverNode(Node):
             sec = obs.stamp_ns // 1_000_000_000
             nanosec = obs.stamp_ns % 1_000_000_000
             lookup_time = Time(seconds=sec, nanoseconds=nanosec)
-            timeout = Duration(seconds=self.tf_timeout_sec)
             transform = self.tf_buffer.lookup_transform(
-                self.world_frame_id, camera_frame, lookup_time, timeout
+                self.world_frame_id, camera_frame, lookup_time, Duration(seconds=0),
             )
-        except Exception as exc:
-            self.get_logger().warn(
-                f'TF lookup {self.world_frame_id} <- {camera_frame} failed: {exc}',
-                throttle_duration_sec=2.0,
-            )
-            return
+        except Exception:
+            # Exact timestamp not available yet — use latest TF (small pose error, never blocks)
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.world_frame_id, camera_frame, Time(), Duration(seconds=0),
+                )
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'TF lookup {self.world_frame_id} <- {camera_frame} failed: {exc}',
+                    throttle_duration_sec=2.0,
+                )
+                return
 
         t = transform.transform.translation
         q = transform.transform.rotation
@@ -352,7 +604,9 @@ class Yolov8ObserverNode(Node):
         r_wc = quat_to_rotmat(q.x, q.y, q.z, q.w)
         ray_world = normalize(r_wc @ ray_optical)
 
-        # Build and publish origin
+        # Build and publish origin (use observation timestamp for message sync)
+        sec = obs.stamp_ns // 1_000_000_000
+        nanosec = obs.stamp_ns % 1_000_000_000
         origin_msg = PointStamped()
         origin_msg.header.frame_id = self.world_frame_id
         origin_msg.header.stamp.sec = sec

@@ -87,14 +87,17 @@ class LiveMonitorNode(Node):
 
         # ── Data buffers (thread-safe via GIL for simple appends) ────────
         self.gt_xy = deque(maxlen=MAX_TRAIL)
+        self.gt_t = deque(maxlen=MAX_TRAIL)
         self.est_xy = deque(maxlen=MAX_TRAIL)
+        self.est_t = deque(maxlen=MAX_TRAIL)
         self.err_buf = deque(maxlen=MAX_TRAIL)
+        self.err_t = deque(maxlen=MAX_TRAIL)
         self.pred_xy: Optional[np.ndarray] = None   # latest predicted path
         self.obs1_pos: Optional[np.ndarray] = None
         self.obs2_pos: Optional[np.ndarray] = None
         self._gt_count = 0
         self._est_count = 0
-        self._t0 = _time.monotonic()
+        self._t0: Optional[float] = None  # first GT timestamp (reference)
 
         # ── Subscribers ──────────────────────────────────────────────────
         self.create_subscription(Odometry, self.target_odom_topic, self._gt_cb, 20)
@@ -108,15 +111,28 @@ class LiveMonitorNode(Node):
         p = msg.pose.pose.position
         return np.array([p.x, p.y, p.z])
 
+    def _stamp_sec(self, msg) -> float:
+        return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+
     def _gt_cb(self, msg: Odometry):
         pos = self._pos(msg)
+        t = self._stamp_sec(msg)
+        if self._t0 is None:
+            self._t0 = t
         self.gt_xy.append(pos)
+        self.gt_t.append(t - self._t0)
         self._gt_count += 1
         if self.est_xy:
-            self.err_buf.append(float(np.linalg.norm(pos - self.est_xy[-1])))
+            err = float(np.linalg.norm(pos - self.est_xy[-1]))
+            self.err_buf.append(err)
+            self.err_t.append(t - self._t0)
 
     def _est_cb(self, msg: Odometry):
+        t = self._stamp_sec(msg)
+        if self._t0 is None:
+            self._t0 = t
         self.est_xy.append(self._pos(msg))
+        self.est_t.append(t - self._t0)
         self._est_count += 1
 
     def _pred_cb(self, msg: Path):
@@ -188,13 +204,13 @@ def main():
                  labelcolor=_TEXT, framealpha=0.9, ncol=2)
 
     # ── Panel 2: Z altitude ──
-    _style_ax(ax_z, 'Altitude Over Time (ENU Z\u2191)', 'Sample', 'Z [m]')
+    _style_ax(ax_z, 'Altitude Over Time (ENU Z\u2191)', 'Time [s]', 'Z [m]')
     ln_gt_z,  = ax_z.plot([], [], color=_GT,  linewidth=1.4, label='GT Z')
     ln_est_z, = ax_z.plot([], [], color=_EST, linewidth=1.1, linestyle='--', label='Estimate Z')
     ax_z.legend(loc='upper left', fontsize=7, facecolor=_PANEL, edgecolor=_GRID, labelcolor=_TEXT)
 
     # ── Panel 3: Position error ──
-    _style_ax(ax_err, 'Position Error (3D)', 'Sample', 'Error [m]')
+    _style_ax(ax_err, 'Position Error (3D)', 'Time [s]', 'Error [m]')
     ln_err, = ax_err.plot([], [], color=_ERR, linewidth=1.2, label='\u2016GT \u2212 Est\u2016')
     ln_avg, = ax_err.plot([], [], color=_ACCENT, linewidth=1.0, linestyle=':', label='Running Avg')
     ax_err.legend(loc='upper left', fontsize=7, facecolor=_PANEL, edgecolor=_GRID, labelcolor=_TEXT)
@@ -227,28 +243,31 @@ def main():
         ax_xy.relim()
         ax_xy.autoscale_view()
 
-        # --- Z panel ---
-        if node.gt_xy:
+        # --- Z panel (time-aligned) ---
+        if node.gt_t:
+            t_gt = list(node.gt_t)
             z_gt = [p[2] for p in node.gt_xy]
-            ln_gt_z.set_data(range(len(z_gt)), z_gt)
-        if node.est_xy:
+            ln_gt_z.set_data(t_gt, z_gt)
+        if node.est_t:
+            t_est = list(node.est_t)
             z_est = [p[2] for p in node.est_xy]
-            ln_est_z.set_data(range(len(z_est)), z_est)
+            ln_est_z.set_data(t_est, z_est)
         ax_z.relim()
         ax_z.autoscale_view()
 
-        # --- Error panel ---
+        # --- Error panel (time-aligned) ---
         if node.err_buf:
             errs = list(node.err_buf)
-            ln_err.set_data(range(len(errs)), errs)
+            t_err = list(node.err_t)
+            ln_err.set_data(t_err, errs)
             w = min(30, len(errs))
             avg = np.convolve(errs, np.ones(w) / w, mode='valid')
-            ln_avg.set_data(range(w - 1, w - 1 + len(avg)), avg)
+            ln_avg.set_data(t_err[w - 1:], avg)
             ax_err.relim()
             ax_err.autoscale_view()
 
         # --- Status bar ---
-        elapsed = _time.monotonic() - node._t0
+        elapsed = (list(node.gt_t)[-1] if node.gt_t else 0.0) or 1e-9
         cur_err = node.err_buf[-1] if node.err_buf else 0.0
         avg_err = float(np.mean(list(node.err_buf))) if node.err_buf else 0.0
         gt_hz  = node._gt_count  / max(elapsed, 1)
