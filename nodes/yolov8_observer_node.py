@@ -345,24 +345,26 @@ class Yolov8ObserverNode(Node):
             if has_track and not force_full:
                 pred_u, pred_v = roi_center
 
-                # ROI size from last bbox with escalation multiplier
+                # ROI size from last bbox — landscape (match image aspect ratio)
                 bx1, by1, bx2, by2 = self._roi_last_bbox
                 bbox_w = bx2 - bx1
                 bbox_h = by2 - by1
-                roi_side = max(bbox_w, bbox_h) * self.roi_margin
-                roi_side = max(roi_side, float(self.roi_min_size))
+                roi_h = max(bbox_w, bbox_h) * self.roi_margin
+                roi_h = max(roi_h, float(self.roi_min_size))
 
                 # Escalation: expand ROI on consecutive misses
                 if self._roi_consecutive_misses >= 3:
-                    roi_side *= 2.0
+                    roi_h *= 2.0
                 elif self._roi_consecutive_misses >= 1:
-                    roi_side *= 1.5
+                    roi_h *= 1.5
 
-                half = roi_side * 0.5
-                roi_x1 = int(max(0.0, pred_u - half))
-                roi_y1 = int(max(0.0, pred_v - half))
-                roi_x2 = int(min(float(img_w), pred_u + half))
-                roi_y2 = int(min(float(img_h), pred_v + half))
+                aspect = img_w / img_h  # e.g. 1920/1080 ≈ 1.778
+                roi_w = roi_h * aspect
+
+                roi_x1 = int(max(0.0, pred_u - roi_w * 0.5))
+                roi_y1 = int(max(0.0, pred_v - roi_h * 0.5))
+                roi_x2 = int(min(float(img_w), pred_u + roi_w * 0.5))
+                roi_y2 = int(min(float(img_h), pred_v + roi_h * 0.5))
 
                 if (roi_x2 - roi_x1) >= self.roi_min_size and (roi_y2 - roi_y1) >= self.roi_min_size:
                     infer_image = bgr_image[roi_y1:roi_y2, roi_x1:roi_x2]
