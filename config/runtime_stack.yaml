@@ -17,7 +17,27 @@ vision:
   roi_init_n: 5               # ... out of the last N detections ...
   roi_init_max_spread_px: 80  # ... within this pixel spread to start ROI tracking
   roi_selection_lambda: 0.3   # prediction-gated selection: proximity weight (0 = pure confidence)
+  camera_frame_override: ""  # override camera frame_id from CameraInfo for TF lookups (e.g. {uav_name}/rgbd_front/color_optical)
   publish_rviz_markers: false  # predicted trajectory & position markers to RViz (disable to save CPU)
+
+# Static TF: {uav_name}/fcu → rgbd_link (camera mount on each drone)
+# Measure x/y/z offset in metres from FCU center to camera center (body FLU: x=fwd, y=left, z=up)
+camera_tf:
+  observer1:  # main drone camera mount
+    x: 0.085
+    y: 0.0
+    z: -0.06
+    roll: 0.0    # radians
+    pitch: 0.0
+    yaw: 0.0
+  observer2:  # observer drone camera mount
+    x: 0.085
+    y: 0.0
+    z: -0.075
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  child_frame: "rgbd_link"  # camera driver frame name (same on all drones)
 
 uav_roles:
   observer1: uav1   # MAIN drone name — edit to match your real drone

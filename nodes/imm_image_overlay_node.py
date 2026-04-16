@@ -64,6 +64,7 @@ class IMMImageOverlayNode(Node):
         # ── Load config ──────────────────────────────────────────────────
         _config_path = FsPath(__file__).resolve().parent.parent / 'config' / 'runtime_stack.yaml'
         _override_image_topic = ''
+        _default_camera_frame_override = ''
         if _config_path.exists():
             import yaml
             try:
@@ -71,6 +72,7 @@ class IMMImageOverlayNode(Node):
                     _cfg = yaml.safe_load(_f)
                     if _cfg and 'vision' in _cfg:
                         _override_image_topic = _cfg['vision'].get('observer_image_topic', '') or ''
+                        _default_camera_frame_override = _cfg['vision'].get('camera_frame_override', '') or ''
             except Exception:
                 pass
 
@@ -89,6 +91,7 @@ class IMMImageOverlayNode(Node):
         self.declare_parameter('jpeg_quality', 75)
         self.declare_parameter('draw_raw_triangulation', True)
         self.declare_parameter('draw_velocity_arrow', True)
+        self.declare_parameter('camera_frame_override', _default_camera_frame_override)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.target_name = str(self.get_parameter('target_name').value)
@@ -104,6 +107,7 @@ class IMMImageOverlayNode(Node):
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.draw_raw_triangulation = bool(self.get_parameter('draw_raw_triangulation').value)
         self.draw_velocity_arrow = bool(self.get_parameter('draw_velocity_arrow').value)
+        self._camera_frame_override = str(self.get_parameter('camera_frame_override').value) or ''
 
         # ── Topic names ──────────────────────────────────────────────────
         self.image_topic = _override_image_topic or f'/{self.uav_name}/rgb/image_raw'
@@ -194,7 +198,7 @@ class IMMImageOverlayNode(Node):
 
         # Get camera intrinsics
         K = np.array(self.camera_info.k, dtype=np.float64).reshape(3, 3)
-        camera_frame = self.camera_info.header.frame_id
+        camera_frame = self._camera_frame_override or self.camera_info.header.frame_id
 
         # Get world → camera transform
         try:

@@ -18,7 +18,9 @@ from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformListener, StaticTransformBroadcaster
+from geometry_msgs.msg import TransformStamped
+import math
 from ultralytics import YOLO
 
 
@@ -76,6 +78,7 @@ class Yolov8ObserverNode(Node):
         _default_roi_init_n = 5
         _default_roi_init_spread = 80
         _default_roi_sel_lambda = 0.3
+        _default_camera_frame_override = ''
         if _config_path.exists():
             import yaml
             try:
@@ -96,6 +99,7 @@ class Yolov8ObserverNode(Node):
                         _default_roi_init_n = int(_v.get('roi_init_n', _default_roi_init_n))
                         _default_roi_init_spread = int(_v.get('roi_init_max_spread_px', _default_roi_init_spread))
                         _default_roi_sel_lambda = float(_v.get('roi_selection_lambda', _default_roi_sel_lambda))
+                        _default_camera_frame_override = _v.get('camera_frame_override', '') or ''
             except Exception:
                 pass
 
@@ -127,6 +131,7 @@ class Yolov8ObserverNode(Node):
         self.declare_parameter('roi_init_n', _default_roi_init_n)
         self.declare_parameter('roi_init_max_spread_px', _default_roi_init_spread)
         self.declare_parameter('roi_selection_lambda', _default_roi_sel_lambda)
+        self.declare_parameter('camera_frame_override', _default_camera_frame_override)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.model_path = os.path.expanduser(str(self.get_parameter('model_path').value))
@@ -151,6 +156,7 @@ class Yolov8ObserverNode(Node):
         self.roi_init_n = max(self.roi_init_m, int(self.get_parameter('roi_init_n').value))
         self.roi_init_spread = float(self.get_parameter('roi_init_max_spread_px').value)
         self.roi_sel_lambda = float(self.get_parameter('roi_selection_lambda').value)
+        self._camera_frame_override = str(self.get_parameter('camera_frame_override').value) or ''
 
         self.image_topic = _override_image_topic or f'/{self.uav_name}/rgb/image_raw'
         self._use_compressed = self.image_topic.endswith('/compressed')
@@ -201,6 +207,7 @@ class Yolov8ObserverNode(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._publish_camera_static_tf(_config_path)
 
         # Publishers
         _det_type = CompressedImage if self.publish_annotated_image else Image
@@ -225,6 +232,44 @@ class Yolov8ObserverNode(Node):
         self.get_logger().info(f'Publishing spatial info to: {self.camera_origin_topic} and {self.ray_topic}')
         self.get_logger().info(f'Processing rate: {self.processing_rate_hz:.1f} Hz')
 
+    def _publish_camera_static_tf(self, config_path: FsPath) -> None:
+        """Publish static TF {uav_name}/fcu → rgbd_link from config."""
+        try:
+            import yaml
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f)
+            ct = cfg.get('camera_tf', {})
+            role_tf = ct.get('observer2', {})
+            child = ct.get('child_frame', 'rgbd_link')
+        except Exception:
+            self.get_logger().warn('No camera_tf config found, skipping static TF')
+            return
+
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = f'{self.uav_name}/fcu'
+        t.child_frame_id = child
+        t.transform.translation.x = float(role_tf.get('x', 0.0))
+        t.transform.translation.y = float(role_tf.get('y', 0.0))
+        t.transform.translation.z = float(role_tf.get('z', 0.0))
+        r = role_tf.get('roll', 0.0)
+        p = role_tf.get('pitch', 0.0)
+        y = role_tf.get('yaw', 0.0)
+        cy, sy = math.cos(y * 0.5), math.sin(y * 0.5)
+        cp, sp = math.cos(p * 0.5), math.sin(p * 0.5)
+        cr, sr = math.cos(r * 0.5), math.sin(r * 0.5)
+        t.transform.rotation.w = cr * cp * cy + sr * sp * sy
+        t.transform.rotation.x = sr * cp * cy - cr * sp * sy
+        t.transform.rotation.y = cr * sp * cy + sr * cp * sy
+        t.transform.rotation.z = cr * cp * sy - sr * sp * cy
+
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._static_tf_broadcaster.sendTransform(t)
+        self.get_logger().info(
+            f'Static TF: {t.header.frame_id} -> {t.child_frame_id} '
+            f'(xyz={t.transform.translation.x:.3f},{t.transform.translation.y:.3f},{t.transform.translation.z:.3f})'
+        )
+
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
 
@@ -238,7 +283,7 @@ class Yolov8ObserverNode(Node):
         if self._target_odom is not None and self.camera_info is not None:
             odom_age_ns = abs(stamp_ns - self._target_odom_stamp_ns)
             if odom_age_ns < 2_000_000_000:  # odometry not older than 2 s
-                camera_frame = self.camera_info.header.frame_id
+                camera_frame = self._camera_frame_override or self.camera_info.header.frame_id
                 try:
                     transform = self.tf_buffer.lookup_transform(
                         camera_frame, self._target_odom.header.frame_id, Time(), Duration(seconds=0)
@@ -577,7 +622,7 @@ class Yolov8ObserverNode(Node):
 
         ray_optical = normalize(np.array([(obs.center_u - cx) / fx, (obs.center_v - cy) / fy, 1.0], dtype=np.float64))
 
-        camera_frame = self.camera_info.header.frame_id
+        camera_frame = self._camera_frame_override or self.camera_info.header.frame_id
         # The world_frame_id handles the prefix internally since we formed it as {uav_name}/{suffix}
 
         try:

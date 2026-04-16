@@ -20,7 +20,9 @@ from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformListener, StaticTransformBroadcaster
+from geometry_msgs.msg import TransformStamped
+import math
 from ultralytics import YOLO
 
 
@@ -361,6 +363,7 @@ class Yolov8MainTriangulationNode(Node):
         _default_roi_init_spread = 80
         _default_roi_sel_lambda = 0.3
         _default_publish_markers = True
+        _default_camera_frame_override = ''
         if _config_path.exists():
             import yaml
             try:
@@ -382,6 +385,7 @@ class Yolov8MainTriangulationNode(Node):
                         _default_roi_init_spread = int(_v.get('roi_init_max_spread_px', _default_roi_init_spread))
                         _default_roi_sel_lambda = float(_v.get('roi_selection_lambda', _default_roi_sel_lambda))
                         _default_publish_markers = bool(_v.get('publish_rviz_markers', _default_publish_markers))
+                        _default_camera_frame_override = _v.get('camera_frame_override', '') or ''
             except Exception:
                 pass
 
@@ -434,6 +438,7 @@ class Yolov8MainTriangulationNode(Node):
         self.declare_parameter('roi_init_max_spread_px', _default_roi_init_spread)
         self.declare_parameter('roi_selection_lambda', _default_roi_sel_lambda)
         self.declare_parameter('publish_rviz_markers', _default_publish_markers)
+        self.declare_parameter('camera_frame_override', _default_camera_frame_override)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.observer1_name = str(self.get_parameter('observer1_name').value)
@@ -492,6 +497,7 @@ class Yolov8MainTriangulationNode(Node):
         self.roi_init_spread = float(self.get_parameter('roi_init_max_spread_px').value)
         self.roi_sel_lambda = float(self.get_parameter('roi_selection_lambda').value)
         self.publish_rviz_markers = bool(self.get_parameter('publish_rviz_markers').value)
+        self._camera_frame_override = str(self.get_parameter('camera_frame_override').value) or ''
 
         if self.target_frame_id == 'world':
             self.target_frame_id = f'{self.uav_name}/{self.world_frame_suffix}'
@@ -552,6 +558,7 @@ class Yolov8MainTriangulationNode(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._publish_camera_static_tf(_config_path)
 
         # Publishers
         self.detection_pub = self.create_publisher(CompressedImage, self.detection_topic + '/compressed', 10)
@@ -586,6 +593,44 @@ class Yolov8MainTriangulationNode(Node):
         self.get_logger().info(f'Main Triangulation Node initialization complete.')
         self.get_logger().info(f'Listening to local: {self.image_topic}')
         self.get_logger().info(f'Listening to remote: {self.remote_origin_topic}')
+
+    def _publish_camera_static_tf(self, config_path: FsPath) -> None:
+        """Publish static TF {uav_name}/fcu → rgbd_link from config."""
+        try:
+            import yaml
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f)
+            ct = cfg.get('camera_tf', {})
+            role_tf = ct.get('observer1', {})
+            child = ct.get('child_frame', 'rgbd_link')
+        except Exception:
+            self.get_logger().warn('No camera_tf config found, skipping static TF')
+            return
+
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = f'{self.uav_name}/fcu'
+        t.child_frame_id = child
+        t.transform.translation.x = float(role_tf.get('x', 0.0))
+        t.transform.translation.y = float(role_tf.get('y', 0.0))
+        t.transform.translation.z = float(role_tf.get('z', 0.0))
+        r = role_tf.get('roll', 0.0)
+        p = role_tf.get('pitch', 0.0)
+        y = role_tf.get('yaw', 0.0)
+        cy, sy = math.cos(y * 0.5), math.sin(y * 0.5)
+        cp, sp = math.cos(p * 0.5), math.sin(p * 0.5)
+        cr, sr = math.cos(r * 0.5), math.sin(r * 0.5)
+        t.transform.rotation.w = cr * cp * cy + sr * sp * sy
+        t.transform.rotation.x = sr * cp * cy - cr * sp * sy
+        t.transform.rotation.y = cr * sp * cy + sr * cp * sy
+        t.transform.rotation.z = cr * cp * sy - sr * sp * cy
+
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._static_tf_broadcaster.sendTransform(t)
+        self.get_logger().info(
+            f'Static TF: {t.header.frame_id} -> {t.child_frame_id} '
+            f'(xyz={t.transform.translation.x:.3f},{t.transform.translation.y:.3f},{t.transform.translation.z:.3f})'
+        )
 
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
@@ -757,7 +802,7 @@ class Yolov8MainTriangulationNode(Node):
         """Get ROI center by projecting IMM 3D prediction to 2D, falling back to 2D bbox tracker."""
         # Strategy 1: Use IMM 3D position → project to image plane
         if self.imm_initialized and self.camera_info is not None:
-            camera_frame = self.camera_info.header.frame_id
+            camera_frame = self._camera_frame_override or self.camera_info.header.frame_id
             try:
                 transform = self.tf_buffer.lookup_transform(
                     camera_frame, self.target_frame_id, Time(), Duration(seconds=0)
@@ -917,7 +962,7 @@ class Yolov8MainTriangulationNode(Node):
         cy = float(self.camera_info.k[5])
 
         ray_optical = normalize(np.array([(obs.center_u - cx) / fx, (obs.center_v - cy) / fy, 1.0], dtype=np.float64))
-        camera_frame = self.camera_info.header.frame_id
+        camera_frame = self._camera_frame_override or self.camera_info.header.frame_id
 
         try:
             sec = obs.stamp_ns // 1_000_000_000
