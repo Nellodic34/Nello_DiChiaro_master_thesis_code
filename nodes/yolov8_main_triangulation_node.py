@@ -631,6 +631,9 @@ class Yolov8MainTriangulationNode(Node):
             f'Static TF: {t.header.frame_id} -> {t.child_frame_id} '
             f'(xyz={t.transform.translation.x:.3f},{t.transform.translation.y:.3f},{t.transform.translation.z:.3f})'
         )
+        self.get_logger().warn(
+            '[DEBUG] TF camera->fcu pubblicata: il pacchetto vision_stack_deploy in esecuzione è quello GIUSTO.'
+        )
 
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
