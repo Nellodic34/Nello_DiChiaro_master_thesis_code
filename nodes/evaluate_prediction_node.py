@@ -111,7 +111,7 @@ class PredictionEvaluatorNode(Node):
         self.declare_parameter('estimate_odom_topic', '/target/odometry_estimate')
         self.declare_parameter('raw_triangulation_topic', '/target/triangulation_raw')
 
-        self.declare_parameter('enable_known_trajectory_model', True)
+        self.declare_parameter('enable_known_trajectory_model', False)
         self.declare_parameter('model_initial_offset_x', 3.0)
         self.declare_parameter('model_initial_offset_z', 1.0)
         self.declare_parameter('model_pre_circle_climb_z', 0.5)

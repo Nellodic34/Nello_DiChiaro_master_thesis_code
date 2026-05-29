@@ -1,26 +1,38 @@
 launcher:
   drone_run_mode: "decentralized_evaluation"  # one of: simple_detection, decentralized, decentralized_evaluation
   auto_start_node: triangulation  # one of: none, detection, triangulation
+  use_sim_time: true  # true for bag/simulation/clock playback, false for real drones
 
 vision:
-  publish_annotated_image: true  # set to true only for debug (saves bandwidth on real drone)
-  device: "cpu"  # inference device: "cpu" for Intel drone, "cuda" for GPU, "GPU" for Intel iGPU via OpenVINO
-  observer_image_topic: ""  # override observer camera topic, e.g. /uav2/rgbd/color/image_raw/compressed (empty = auto)
-  main_image_topic: ""      # override main camera topic, e.g. /uav1/rgbd/color/image_raw/compressed (empty = auto)
-  roi_crop_enabled: true    # adaptive ROI crop: run YOLO on small crop around predicted target position
-  roi_crop_imgsz: 320       # YOLO input size for ROI crop inference (smaller = faster, 320 recommended)
-  roi_margin_multiplier: 3.0  # ROI size = bbox_size * this multiplier (larger = safer but slower)
-  roi_min_size_px: 200      # minimum ROI crop side in pixels
-  roi_track_timeout_sec: 0.5  # seconds without detection before falling back to full scan
-  roi_full_scan_interval: 10  # force full-image scan every N frames (reacquisition safety net)
-  roi_init_m: 3               # M-of-N init gate: require M consistent detections ...
-  roi_init_n: 5               # ... out of the last N detections ...
-  roi_init_max_spread_px: 80  # ... within this pixel spread to start ROI tracking
-  roi_selection_lambda: 0.3   # prediction-gated selection: proximity weight (0 = pure confidence)
+  publish_annotated_image: true  # detection boxes image on /detection... ; useful for debug, costs bandwidth
+  publish_debug_annotated_image: false  # publish observer debug overlays and triangulation-side ray overlays on separate topics
+  publish_detector_evaluation_packets: false  # when false the observer skips all evaluator telemetry and adds no extra evaluation workload
+  publish_camera_static_tf: false  # publish camera static TF locally from this node; normally false in sim/real, useful for bag replay/debug only
+  model_path: "dataset_tools/weights/best_openvino_model"  # YOLO/OpenVINO weights for observer_node; relative paths are resolved from the repo root
+  device: "cuda"  # inference device: "cpu" for Intel drone, "cuda" for GPU, "GPU" for Intel iGPU via OpenVINO
+  observation_topic_name: "target_observation"  # per-observer frozen 3D measurement topic suffix, e.g. /uav1/target_observation
+  allow_tf_fallback: true  # if true, observer publishes a measurement using latest TF when exact frame-time TF is unavailable
+  max_tf_delta_ms: 40.0  # local image/TF skew budget in ms; observer drops stale ray-freeze TFs and triangulation rejects packets exceeding it
+  observer_image_topic: "" #"/uav16/rgbd/color/image_raw/compressed"  # role-specific override used when the generic observer node runs as observer2
+  main_image_topic: "" #"/uav13/rgbd/color/image_raw/compressed"      # role-specific override used when the generic observer node runs as observer1
+  # ROI logic: at margin=1.0 the node chooses a base crop whose resize to roi_reference_imgsz
+  # matches the full-frame target scale seen at imgsz. After margin growth, miss escalation,
+  # and edge clamping, the node recomputes the actual YOLO imgsz from the real crop size.
+  roi_crop_enabled: true    # use ROI mode when a valid predicted center exists; false = always full-frame
+  roi_reference_imgsz: 256  # reference ROI-side imgsz used to define the base scale-preserving crop at margin=1; not the final per-frame YOLO imgsz
+  roi_crop_imgsz: 320       # legacy alias for older nodes; keep equal to roi_reference_imgsz until all nodes are migrated
+  roi_margin_multiplier: 1.40  # expands search area around the predicted center; should change coverage, not nominal target scale
+  roi_min_size_px: 200      # reject ROI mode if the real crop becomes smaller than this in source-image pixels
+  roi_track_timeout_sec: 0.5  # after this time without updates, drop the ROI track and reacquire globally
+  roi_full_scan_interval: 20  # every N frames force one full-frame scan to recover from drift or missed target
+  roi_init_m: 3               # start an ROI track only if at least M detections are mutually consistent ...
+  roi_init_n: 5               # ... within the last N candidate detections
+  roi_init_max_spread_px: 80  # the M detections above must lie within this pixel spread to arm the ROI tracker
+  roi_selection_lambda: 0.3   # when ROI is active, penalize detections far from the predicted center during candidate selection
   camera_frame_override: ""  # override camera frame_id from CameraInfo for TF lookups (e.g. {uav_name}/rgbd_front/color_optical)
   publish_rviz_markers: false  # predicted trajectory & position markers to RViz (disable to save CPU)
 
-# Static TF: {uav_name}/fcu → rgbd_link (camera mount on each drone)
+# Static TF: {uav_name}/fcu rgbd_link (camera mount on each drone)
 # Measure x/y/z offset in metres from FCU center to camera center (body FLU: x=fwd, y=left, z=up)
 camera_tf:
   observer1:  # main drone camera mount
@@ -30,6 +42,7 @@ camera_tf:
     roll: 0.0    # radians
     pitch: 0.0
     yaw: 0.0
+    yaw_offset: 0.0  # [GENERAL] Align world-origin headings (radians)
   observer2:  # observer drone camera mount
     x: 0.085
     y: 0.0
@@ -37,21 +50,62 @@ camera_tf:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
+    yaw_offset: 0.0 # [V2 CALIBRATION] Matches the 13.32 degree bias discovered in logs
+
+#ros2 run tf2_ros tf2_echo uav28/world_origin uav28/fcu
+
+
   child_frame: "rgbd_link"  # camera driver frame name (same on all drones)
 
+simulation:
+  drone_count: 3  # allowed values: 1, 2, 3
+
 uav_roles:
-  observer1: uav1   # MAIN drone name — edit to match your real drone
-  observer2: uav2   # OBSERVER drone name — edit to match your real drone
-  target: uav3      # TARGET drone name — edit to match your real drone
+  observer1: uav1  # generic observer role binding for the main drone
+  observer2: uav2 # generic observer role binding for the secondary drone
+  target: uav3      # TARGET drone name edit to match your real drone
 
 ekf:
-  kf_process_noise_acc: 1.25
-  kf_process_noise_vel: 1.2
-  imm_transition_prob: 0.90
-  kf_measurement_noise: 0.10
+  kf_process_noise_acc: 3.0   # CA jerk std-dev (m/s³); lowered to smooth acceleration estimates
+  kf_process_noise_vel: 1.0   # CV acceleration std-dev (m/s²); strict straight flight model
+  imm_transition_prob: 0.90   # legacy; Markov matrix is now defined in code
+  kf_measurement_noise: 0.02  # Cartesian angular variance seed (m²); reduced to trust inliers more
   kf_adaptive_cov_max_multiplier: 50.0
   kf_initial_covariance: 2.0
-  kf_mahalanobis_threshold: 7.0
+  kf_mahalanobis_threshold: 9.0  # Tightened from 50.0. Rejects high-frequency bounding box jitter (98% conf for 3DOF)
+
+triangulation:
+  max_pair_age_sec: 0.20  # maximum timestamp separation accepted for one observer1/observer2 pair
+  observation_buffer_sec: 1.0  # keep this much recent observation history available for pairing and debug overlays
+  triangulation_min_baseline_m: 0.25  # reject pairs whose camera centers are too close for stable geometry
+  max_triangulation_error_m: 2.0  # reject midpoint solutions when the two rays remain too far apart
+  processing_rate_hz: 100.0  # node timer rate for pruning buffers, coast prediction, and debug housekeeping
+
+# Image-space Kalman filter — false positive rejection layer inside each ObserverNode.
+# Operates on pixel centroids (u, v) before any 3D ray is published.
+# Based on DeepSORT Mahalanobis gating + TAKF ego-motion/distance-adaptive mechanisms.
+kalman_filter:
+  kf_enabled: true                   # master switch for the image-space KF; false = original unfiltered path
+  kf_sigma_a: 300.0                   # pixel acceleration std dev for DWNA process noise (px/s^2)
+  kf_sigma_px: 10.0                    # base measurement noise std dev (px)
+  kf_conf_beta: 1.0                   # confidence scaling exponent for R and gate [1.0–2.0]
+  kf_conf_min: 0.20                   # minimum YOLO confidence to enter gating at all
+  kf_n_confirm: 3                     # consecutive hits to transition TENTATIVE → CONFIRMED
+  kf_max_age: 5                       # consecutive misses to transition CONFIRMED → LOST
+  kf_p_max: 800.0                    # diagonal covariance cap (px^2), prevents unbounded gate growth
+  kf_nis_window: 15                   # sliding window length for NIS consistency monitor
+  kf_nis_threshold: 8.0               # mean NIS above which track is flagged as inconsistent
+  kf_ghost_timeout_sec: 0.5           # keep ghost memory short so stale image-space anchors expire quickly
+  kf_ghost_reentry_m: 2               # require brief temporal evidence before trusting re-entry after LOST
+  kf_ghost_reentry_n: 3               # re-entry evidence window; keep short to avoid delayed recovery
+  kf_ghost_reentry_conf_min: 0.35     # slightly below the default to let motion-blurred true detections count
+  kf_ghost_reentry_spread_px: 100.0   # dedicated re-entry slack; widens recovery without relaxing normal ROI init
+  kf_ego_motion_enabled: true         # compensate KF prediction for camera rotation between frames
+  kf_bbox_area_ref: 3600.0            # reference bbox area at nominal distance (60x60 px); calibrate per setup
+  kf_dist_gamma: 0.2                  # exponent for distance-based R scaling
+  kf_cam_aware_gating_enabled: true   # perspective-corrected gate threshold for image edges
 
 evaluation:
-  odom_topic_suffix: "hw_api/ground_truth"  # simulation ground truth — change to odometry/odom_main for real drone
+  auto_start_with_launch_sim: true  # when false ./launch_sim.sh skips the prediction evaluator and keeps only the live monitor window pane
+  odom_topic_suffix: "estimation_manager/odom_main" #hw_api/ground_truth" #"estimation_manager/odom_main"  # simulation ground truth — change to odometry/odom_main for real drone
+  world_frame_suffix: "world_origin"  # real drone RTK origin, V2 uses f9p_origin

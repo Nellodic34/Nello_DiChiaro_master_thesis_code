@@ -308,8 +308,9 @@ class IMMFilter:
             exponent = -0.5 * y.T @ invS @ y
             return float(np.exp(max(-50.0, min(50.0, exponent))))
             
-        Lambda = np.array([mv_normal_pdf_fixed(y_cv, R), mv_normal_pdf_fixed(y_ca, R)])
-        
+        #Lambda = np.array([mv_normal_pdf_fixed(y_cv, R), mv_normal_pdf_fixed(y_ca, R)])
+        Lambda = np.array([mv_normal_pdf_fixed(y_cv, S_cv), mv_normal_pdf_fixed(y_ca, S_ca)])
+
         self.sc_cv = self.kf_cv.correct(sc_pred_cv, z, R)
         self.sc_ca = self.kf_ca.correct(sc_pred_ca, z, R)
         

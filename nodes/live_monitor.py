@@ -28,7 +28,7 @@ from nav_msgs.msg import Odometry, Path
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-MAX_TRAIL = 3000         # max points kept in rolling buffers
+MAX_TRAIL = 15000         # max points kept in rolling buffers
 UPDATE_INTERVAL_MS = 150  # plot refresh rate (~7 Hz)
 
 # ── Theme ────────────────────────────────────────────────────────────────────
@@ -86,18 +86,17 @@ class LiveMonitorNode(Node):
         self.get_logger().info(f'Observer 2 odom:   {self.obs2_odom_topic}')
 
         # ── Data buffers (thread-safe via GIL for simple appends) ────────
-        self.gt_xy = deque(maxlen=MAX_TRAIL)
-        self.gt_t = deque(maxlen=MAX_TRAIL)
-        self.est_xy = deque(maxlen=MAX_TRAIL)
-        self.est_t = deque(maxlen=MAX_TRAIL)
-        self.err_buf = deque(maxlen=MAX_TRAIL)
-        self.err_t = deque(maxlen=MAX_TRAIL)
+        self.gt_data = deque(maxlen=MAX_TRAIL)
+        self.est_data = deque(maxlen=MAX_TRAIL)
+        self.err_data = deque(maxlen=MAX_TRAIL)
         self.pred_xy: Optional[np.ndarray] = None   # latest predicted path
         self.obs1_pos: Optional[np.ndarray] = None
         self.obs2_pos: Optional[np.ndarray] = None
         self._gt_count = 0
         self._est_count = 0
-        self._t0: Optional[float] = None  # first GT timestamp (reference)
+        self._t0 = _time.monotonic()
+        self._first_ros_time = None
+        self.lock = threading.Lock()
 
         # ── Subscribers ──────────────────────────────────────────────────
         self.create_subscription(Odometry, self.target_odom_topic, self._gt_cb, 20)
@@ -107,46 +106,46 @@ class LiveMonitorNode(Node):
         self.create_subscription(Odometry, self.obs2_odom_topic, self._obs2_cb, 10)
 
     # ── Callbacks ────────────────────────────────────────────────────────
+    def _time_from_msg(self, msg) -> float:
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self._first_ros_time is None:
+            self._first_ros_time = t
+        return t - self._first_ros_time
+
     def _pos(self, msg: Odometry) -> np.ndarray:
         p = msg.pose.pose.position
         return np.array([p.x, p.y, p.z])
 
-    def _stamp_sec(self, msg) -> float:
-        return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
-
     def _gt_cb(self, msg: Odometry):
         pos = self._pos(msg)
-        t = self._stamp_sec(msg)
-        if self._t0 is None:
-            self._t0 = t
-        self.gt_xy.append(pos)
-        self.gt_t.append(t - self._t0)
-        self._gt_count += 1
-        if self.est_xy:
-            err = float(np.linalg.norm(pos - self.est_xy[-1]))
-            self.err_buf.append(err)
-            self.err_t.append(t - self._t0)
+        t = self._time_from_msg(msg)
+        with self.lock:
+            self.gt_data.append((t, pos))
+            self._gt_count += 1
+            if self.est_data:
+                self.err_data.append((t, float(np.linalg.norm(pos - self.est_data[-1][1]))))
 
     def _est_cb(self, msg: Odometry):
-        t = self._stamp_sec(msg)
-        if self._t0 is None:
-            self._t0 = t
-        self.est_xy.append(self._pos(msg))
-        self.est_t.append(t - self._t0)
-        self._est_count += 1
+        t = self._time_from_msg(msg)
+        with self.lock:
+            self.est_data.append((t, self._pos(msg)))
+            self._est_count += 1
 
     def _pred_cb(self, msg: Path):
         if msg.poses:
-            self.pred_xy = np.array([
-                [p.pose.position.x, p.pose.position.y, p.pose.position.z]
-                for p in msg.poses
-            ])
+            with self.lock:
+                self.pred_xy = np.array([
+                    [p.pose.position.x, p.pose.position.y, p.pose.position.z]
+                    for p in msg.poses
+                ])
 
     def _obs1_cb(self, msg: Odometry):
-        self.obs1_pos = self._pos(msg)
+        with self.lock:
+            self.obs1_pos = self._pos(msg)
 
     def _obs2_cb(self, msg: Odometry):
-        self.obs2_pos = self._pos(msg)
+        with self.lock:
+            self.obs2_pos = self._pos(msg)
 
 
 def main():
@@ -225,40 +224,85 @@ def main():
                              fontfamily='monospace', color=_TEXT)
 
     def update(_frame):
+        # Fetch thread-safe copies of data
+        with node.lock:
+            gt_data = list(node.gt_data)
+            est_data = list(node.est_data)
+            err_data = list(node.err_data)
+            pred_xy = node.pred_xy.copy() if node.pred_xy is not None else None
+            obs1_pos = node.obs1_pos.copy() if node.obs1_pos is not None else None
+            obs2_pos = node.obs2_pos.copy() if node.obs2_pos is not None else None
+
         # --- XY panel ---
-        if node.gt_xy:
-            arr = np.array(node.gt_xy)
+        all_x, all_y = [], []
+
+        if gt_data:
+            arr = np.array([item[1] for item in gt_data])
             ln_gt.set_data(arr[:, 1], arr[:, 0])
             mk_tgt.set_offsets([[arr[-1, 1], arr[-1, 0]]])
-        if node.est_xy:
-            arr = np.array(node.est_xy)
+            all_x.extend(arr[:, 1])
+            all_y.extend(arr[:, 0])
+            
+        if est_data:
+            arr = np.array([item[1] for item in est_data])
             ln_est.set_data(arr[:, 1], arr[:, 0])
             mk_est.set_offsets([[arr[-1, 1], arr[-1, 0]]])
-        if node.pred_xy is not None and len(node.pred_xy) > 0:
-            ln_pred.set_data(node.pred_xy[:, 1], node.pred_xy[:, 0])
-        if node.obs1_pos is not None:
-            mk_obs1.set_offsets([[node.obs1_pos[1], node.obs1_pos[0]]])
-        if node.obs2_pos is not None:
-            mk_obs2.set_offsets([[node.obs2_pos[1], node.obs2_pos[0]]])
-        ax_xy.relim()
-        ax_xy.autoscale_view()
+            all_x.extend(arr[:, 1])
+            all_y.extend(arr[:, 0])
+            
+        if pred_xy is not None and len(pred_xy) > 0:
+            ln_pred.set_data(pred_xy[:, 1], pred_xy[:, 0])
+            
+        if obs1_pos is not None:
+            mk_obs1.set_offsets([[obs1_pos[1], obs1_pos[0]]])
+            
+        if obs2_pos is not None:
+            mk_obs2.set_offsets([[obs2_pos[1], obs2_pos[0]]])
+        
+        if all_x and all_y:
+            if pred_xy is not None and len(pred_xy) > 0:
+                all_x.extend(pred_xy[:, 1])
+                all_y.extend(pred_xy[:, 0])
 
-        # --- Z panel (time-aligned) ---
-        if node.gt_t:
-            t_gt = list(node.gt_t)
-            z_gt = [p[2] for p in node.gt_xy]
+            if obs1_pos is not None:
+                all_x.append(obs1_pos[1])
+                all_y.append(obs1_pos[0])
+                
+            if obs2_pos is not None:
+                all_x.append(obs2_pos[1])
+                all_y.append(obs2_pos[0])
+
+            min_x, max_x = min(all_x), max(all_x)
+            min_y, max_y = min(all_y), max(all_y)
+            
+            cx, cy = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+            rx = max(max_x - min_x, 2.0)  # enforce minimum 2m window
+            ry = max(max_y - min_y, 2.0)
+            
+            # Keep equal aspect ratio conceptually by using the largest span
+            span = max(rx, ry) * 1.25  # 25% margin so points don't clip at edges
+            ax_xy.set_xlim(cx - span / 2.0, cx + span / 2.0)
+            ax_xy.set_ylim(cy - span / 2.0, cy + span / 2.0)
+        else:
+            ax_xy.relim()
+            ax_xy.autoscale_view()
+
+        # --- Z panel ---
+        if gt_data:
+            t_gt = [item[0] for item in gt_data]
+            z_gt = [item[1][2] for item in gt_data]
             ln_gt_z.set_data(t_gt, z_gt)
-        if node.est_t:
-            t_est = list(node.est_t)
-            z_est = [p[2] for p in node.est_xy]
+        if est_data:
+            t_est = [item[0] for item in est_data]
+            z_est = [item[1][2] for item in est_data]
             ln_est_z.set_data(t_est, z_est)
         ax_z.relim()
         ax_z.autoscale_view()
 
-        # --- Error panel (time-aligned) ---
-        if node.err_buf:
-            errs = list(node.err_buf)
-            t_err = list(node.err_t)
+        # --- Error panel ---
+        if err_data:
+            t_err = [item[0] for item in err_data]
+            errs = [item[1] for item in err_data]
             ln_err.set_data(t_err, errs)
             w = min(30, len(errs))
             avg = np.convolve(errs, np.ones(w) / w, mode='valid')
@@ -267,17 +311,23 @@ def main():
             ax_err.autoscale_view()
 
         # --- Status bar ---
-        elapsed = (list(node.gt_t)[-1] if node.gt_t else 0.0) or 1e-9
-        cur_err = node.err_buf[-1] if node.err_buf else 0.0
-        avg_err = float(np.mean(list(node.err_buf))) if node.err_buf else 0.0
-        gt_hz  = node._gt_count  / max(elapsed, 1)
-        est_hz = node._est_count / max(elapsed, 1)
+        elapsed = _time.monotonic() - node._t0
+        with node.lock:
+            cur_err = node.err_data[-1][1] if node.err_data else 0.0
+            err_vals = [item[1] for item in node.err_data]
+            gt_count = node._gt_count
+            est_count = node._est_count
+            gt_len = len(node.gt_data)
+        
+        avg_err = float(np.mean(err_vals)) if err_vals else 0.0
+        gt_hz  = gt_count / max(elapsed, 1)
+        est_hz = est_count / max(elapsed, 1)
         status_txt.set_text(
-            f'GT: {node._gt_count} ({gt_hz:.1f} Hz)  \u2502  '
-            f'Est: {node._est_count} ({est_hz:.1f} Hz)  \u2502  '
+            f'GT: {gt_count} ({gt_hz:.1f} Hz)  \u2502  '
+            f'Est: {est_count} ({est_hz:.1f} Hz)  \u2502  '
             f'Err: {cur_err:.3f} m  \u2502  '
             f'Avg Err: {avg_err:.3f} m  \u2502  '
-            f'Buffer: {len(node.gt_xy)}/{MAX_TRAIL}'
+            f'Buffer: {gt_len}/{MAX_TRAIL}'
         )
 
         return (ln_gt, ln_est, ln_pred, ln_gt_z, ln_est_z, ln_err, ln_avg)

@@ -18,8 +18,8 @@ class TestYolov8RealtimeNode(Node):
     def __init__(self) -> None:
         super().__init__('test_yolov8_realtime_node')
 
-        _weights_dir = str(Path(__file__).resolve().parent.parent / 'weights')
-        default_model_path = f'{_weights_dir}/best_openvino_model'
+        default_weights_dir = '~/runs/detect/fine_tune_label6/weights'
+        default_model_path = f'{default_weights_dir}/best_openvino_model'
 
         # Load observer name from runtime_stack.yaml
         script_dir = Path(__file__).resolve().parent
@@ -49,7 +49,7 @@ class TestYolov8RealtimeNode(Node):
         )
         self.declare_parameter('confidence_threshold', 0.25)
         self.declare_parameter('iou_threshold', 0.45)
-        self.declare_parameter('imgsz', 896)
+        self.declare_parameter('imgsz', 960)
         self.declare_parameter('max_detections', 100)
         self.declare_parameter('device', default_device)
         self.declare_parameter('line_width', 2)
@@ -69,8 +69,8 @@ class TestYolov8RealtimeNode(Node):
             if self.model_path == default_model_path_expanded:
                 fallback_candidates = [
                     default_model_path_expanded,
-                    os.path.expanduser(f'{_weights_dir}/best.onnx'),
-                    os.path.expanduser(f'{_weights_dir}/best.pt'),
+                    os.path.expanduser(f'{default_weights_dir}/best.onnx'),
+                    os.path.expanduser(f'{default_weights_dir}/best.pt'),
                 ]
                 for candidate in fallback_candidates:
                     if os.path.exists(candidate):
