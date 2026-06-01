@@ -92,6 +92,8 @@ vision:
   device: "cpu"
   main_image_topic: "..."
   observer_image_topic: "..."
+  main_camera_info_topic: "..."
+  observer_camera_info_topic: "..."
 
 evaluation:
   odom_topic_suffix: "odometry/odom_main"

@@ -188,6 +188,11 @@ class Yolov8ObserverNode(Node):
 
         self.frame_counter = 0
         self._dropped_frames = 0
+        self._log_infer_total_ms = 0.0
+        self._log_infer_max_ms = 0.0
+        self._log_roi_frames = 0
+        self._log_full_frames = 0
+        self._log_annotated_publish_count = 0
         self.last_log_time = time.time()
         self._last_image_time = time.time()
 
@@ -432,6 +437,7 @@ class Yolov8ObserverNode(Node):
             verbose=False,
         )
         infer_ms = (time.time() - start_time) * 1000.0
+        self._record_log_window_frame(infer_ms, use_roi)
 
         # Pass ROI center for prediction-gated selection
         roi_pred_center = None
@@ -472,6 +478,7 @@ class Yolov8ObserverNode(Node):
             comp_msg.format = 'jpeg'
             comp_msg.data = bytes(cv2.imencode('.jpg', annotated_image, [cv2.IMWRITE_JPEG_QUALITY, 75])[1])
             self.detection_pub.publish(comp_msg)
+            self._log_annotated_publish_count += 1
 
         if best_detection is not None:
             self.compute_and_publish_ray(best_detection)
@@ -480,12 +487,15 @@ class Yolov8ObserverNode(Node):
         now = time.time()
         if now - self.last_log_time >= 2.0:
             fps = self.frame_counter / (now - self.last_log_time)
-            mode = 'ROI' if use_roi else 'FULL'
+            avg_infer_ms = self._log_infer_total_ms / max(1, self.frame_counter)
+            mode_summary = self._format_log_window_modes()
             esc = f' esc={self._roi_consecutive_misses}' if self._roi_consecutive_misses > 0 else ''
-            self.get_logger().info(f'Observer node: FPS={fps:.2f}, inference={infer_ms:.1f}ms, mode={mode}{esc}, dropped={self._dropped_frames}')
-            self.frame_counter = 0
-            self._dropped_frames = 0
-            self.last_log_time = now
+            self.get_logger().info(
+                f'Observer node: FPS={fps:.2f}, inference_avg={avg_infer_ms:.1f}ms, '
+                f'inference_max={self._log_infer_max_ms:.1f}ms, {mode_summary}{esc}, '
+                f'dropped={self._dropped_frames}, annotated_pub={self._log_annotated_publish_count}'
+            )
+            self._reset_log_window(now)
 
     def _update_roi_tracker(self, det: 'DetectionObservation', results, stamp_ns: int, roi_x1: int, roi_y1: int) -> None:
         """Update 2D ROI tracker from detection + bbox."""
@@ -515,6 +525,27 @@ class Yolov8ObserverNode(Node):
         self._roi_last_bbox = (bx1, by1, bx2, by2)
         self._roi_last_center = (new_u, new_v)
         self._roi_last_stamp_ns = stamp_ns
+
+    def _record_log_window_frame(self, infer_ms: float, use_roi: bool) -> None:
+        self._log_infer_total_ms += infer_ms
+        self._log_infer_max_ms = max(self._log_infer_max_ms, infer_ms)
+        if use_roi:
+            self._log_roi_frames += 1
+        else:
+            self._log_full_frames += 1
+
+    def _format_log_window_modes(self) -> str:
+        return f'modes=ROI:{self._log_roi_frames}/FULL:{self._log_full_frames}'
+
+    def _reset_log_window(self, now: float) -> None:
+        self.frame_counter = 0
+        self._dropped_frames = 0
+        self._log_infer_total_ms = 0.0
+        self._log_infer_max_ms = 0.0
+        self._log_roi_frames = 0
+        self._log_full_frames = 0
+        self._log_annotated_publish_count = 0
+        self.last_log_time = now
 
     def extract_best_detection(self, results, msg: Image, roi_pred_center: Optional[Tuple[float, float]] = None,
                                roi_x1: int = 0, roi_y1: int = 0, roi_half_side: float = 1.0) -> Optional[DetectionObservation]:

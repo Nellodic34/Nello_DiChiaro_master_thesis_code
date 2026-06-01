@@ -7,14 +7,16 @@ vision:
   publish_annotated_image: true  # detection boxes image on /detection... ; useful for debug, costs bandwidth
   publish_debug_annotated_image: false  # publish observer debug overlays and triangulation-side ray overlays on separate topics
   publish_detector_evaluation_packets: false  # when false the observer skips all evaluator telemetry and adds no extra evaluation workload
-  publish_camera_static_tf: false  # publish camera static TF locally from this node; normally false in sim/real, useful for bag replay/debug only
-  model_path: "dataset_tools/weights/best_openvino_model"  # YOLO/OpenVINO weights for observer_node; relative paths are resolved from the repo root
+  publish_camera_static_tf: true  # publish camera static TF locally from this node; normally false in sim/real, useful for bag replay/debug only
+  model_path: "dataset_tools/weights2/best_openvino_model"  # YOLO/OpenVINO weights for observer_node; relative paths are resolved from the repo root
   device: "cuda"  # inference device: "cpu" for Intel drone, "cuda" for GPU, "GPU" for Intel iGPU via OpenVINO
   observation_topic_name: "target_observation"  # per-observer frozen 3D measurement topic suffix, e.g. /uav1/target_observation
   allow_tf_fallback: true  # if true, observer publishes a measurement using latest TF when exact frame-time TF is unavailable
   max_tf_delta_ms: 40.0  # local image/TF skew budget in ms; observer drops stale ray-freeze TFs and triangulation rejects packets exceeding it
-  observer_image_topic: "" #"/uav16/rgbd/color/image_raw/compressed"  # role-specific override used when the generic observer node runs as observer2
-  main_image_topic: "" #"/uav13/rgbd/color/image_raw/compressed"      # role-specific override used when the generic observer node runs as observer1
+  observer_image_topic: "/uav16/rgbd/color/image_raw/compressed"  # role-specific override used when the generic observer node runs as observer2
+  main_image_topic: "/uav13/rgbd/color/image_raw/compressed"      # role-specific override used when the generic observer node runs as observer1
+  observer_camera_info_topic: ""  # role-specific CameraInfo override for observer2; empty = derive from observer_image_topic
+  main_camera_info_topic: ""  # role-specific CameraInfo override for observer1/main; empty = derive from main_image_topic
   # ROI logic: at margin=1.0 the node chooses a base crop whose resize to roi_reference_imgsz
   # matches the full-frame target scale seen at imgsz. After margin growth, miss escalation,
   # and edge clamping, the node recomputes the actual YOLO imgsz from the real crop size.
@@ -61,9 +63,9 @@ simulation:
   drone_count: 3  # allowed values: 1, 2, 3
 
 uav_roles:
-  observer1: uav1  # generic observer role binding for the main drone
-  observer2: uav2 # generic observer role binding for the secondary drone
-  target: uav3      # TARGET drone name edit to match your real drone
+  observer1: uav13  # generic observer role binding for the main drone
+  observer2: uav16 # generic observer role binding for the secondary drone
+  target: uav28      # TARGET drone name edit to match your real drone
 
 ekf:
   kf_process_noise_acc: 3.0   # CA jerk std-dev (m/s³); lowered to smooth acceleration estimates

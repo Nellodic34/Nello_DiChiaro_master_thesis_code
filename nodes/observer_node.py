@@ -839,6 +839,7 @@ class ObserverNode(Node):
         _default_kf_cam_aware_gating_enabled = False
         _configured_uav_roles: Dict[str, str] = {}
         _image_topic_by_role: Dict[str, str] = {}
+        _camera_info_topic_by_role: Dict[str, str] = {}
         _uav_name = 'uav1'
         _world_frame_suffix = 'world_origin'
         _weights_dir = FsPath(__file__).resolve().parent / 'weights'
@@ -866,6 +867,10 @@ class ObserverNode(Node):
                             _image_topic_by_role = {
                                 'observer1': _v.get('main_image_topic', '') or '',
                                 'observer2': _v.get('observer_image_topic', '') or '',
+                            }
+                            _camera_info_topic_by_role = {
+                                'observer1': _v.get('main_camera_info_topic', '') or '',
+                                'observer2': _v.get('observer_camera_info_topic', '') or '',
                             }
                             _override_image_topic = _image_topic_by_role.get('observer2', '') or ''
                             _default_publish_annotated = bool(_v.get('publish_annotated_image', _default_publish_annotated))
@@ -967,6 +972,7 @@ class ObserverNode(Node):
         self.declare_parameter('roi_init_max_spread_px', _default_roi_init_spread)
         self.declare_parameter('roi_selection_lambda', _default_roi_sel_lambda)
         self.declare_parameter('camera_frame_override', _default_camera_frame_override)
+        self.declare_parameter('camera_info_topic', '')
         self.declare_parameter('observation_topic_name', _default_observation_topic_name)
         self.declare_parameter('allow_tf_fallback', _default_allow_tf_fallback)
         self.declare_parameter('max_tf_delta_ms', _default_max_tf_delta_ms)
@@ -1081,7 +1087,12 @@ class ObserverNode(Node):
         )
         self._use_compressed = self.image_topic.endswith('/compressed')
         _img_base = self.image_topic.replace('/compressed', '').rsplit('/image_raw', 1)[0]
-        self.camera_info_topic = f'{_img_base}/camera_info'
+        _camera_info_topic_override = str(self.get_parameter('camera_info_topic').value).strip()
+        self.camera_info_topic = (
+            _camera_info_topic_override
+            or _camera_info_topic_by_role.get(self.observer_role, '')
+            or f'{_img_base}/camera_info'
+        )
         self.detection_topic = f'/{self.uav_name}/detection3'
         self.detector_evaluation_topic = f'/{self.uav_name}/detector_evaluation'
         self.observation_topic = f'/{self.uav_name}/{self.observation_topic_name}'
@@ -1105,6 +1116,11 @@ class ObserverNode(Node):
         self.last_processed_image_stamp_ns: int = -1
         self.frame_counter = 0
         self._dropped_frames = 0
+        self._log_infer_total_ms = 0.0
+        self._log_infer_max_ms = 0.0
+        self._log_roi_frames = 0
+        self._log_full_frames = 0
+        self._log_annotated_publish_count = 0
         self.last_log_time = time.time()
         self._last_image_time = time.time()
 
@@ -1176,6 +1192,7 @@ class ObserverNode(Node):
         self.get_logger().info(f'YOLO model path: {self.model_path}')
         self.get_logger().info(f'Observer config role: {self.observer_role}')
         self.get_logger().info(f'Observer ({self.uav_name}): {self.image_topic} -> {self.detection_topic}')
+        self.get_logger().info(f'Camera info topic: {self.camera_info_topic}')
         self.get_logger().info(f'Publishing frozen observations to: {self.observation_topic}')
         if self.publish_debug_annotated_image:
             self.get_logger().info(f'Publishing debug overlay to: /{self.uav_name}/debug_annotated/compressed')
@@ -1717,6 +1734,7 @@ class ObserverNode(Node):
             verbose=False,
         )
         infer_ms = (time.time() - start_time) * 1000.0
+        self._record_log_window_frame(infer_ms, use_roi)
 
         roi_pred_center = None
         if use_roi and self._roi_last_center is not None:
@@ -1783,6 +1801,7 @@ class ObserverNode(Node):
                 comp_msg.format = 'jpeg'
                 comp_msg.data = bytes(cv2.imencode('.jpg', annotated_image, [cv2.IMWRITE_JPEG_QUALITY, 75])[1])
                 self.detection_pub.publish(comp_msg)
+                self._log_annotated_publish_count += 1
 
             if best_detection is not None:
                 local_ray_data = self.compute_and_publish_ray(best_detection)
@@ -1815,15 +1834,16 @@ class ObserverNode(Node):
             now = time.time()
             if now - self.last_log_time >= 2.0:
                 fps = self.frame_counter / (now - self.last_log_time)
-                mode = 'ROI' if use_roi else 'FULL'
+                avg_infer_ms = self._log_infer_total_ms / max(1, self.frame_counter)
+                mode_summary = self._format_log_window_modes()
                 esc = f' esc={self._roi_consecutive_misses}' if self._roi_consecutive_misses > 0 else ''
                 self.get_logger().info(
-                    f'Observer node: FPS={fps:.2f}, inference={infer_ms:.1f}ms, mode={mode}{esc}, dropped={self._dropped_frames}'
+                    f'Observer node: FPS={fps:.2f}, inference_avg={avg_infer_ms:.1f}ms, '
+                    f'inference_max={self._log_infer_max_ms:.1f}ms, {mode_summary}{esc}, '
+                    f'dropped={self._dropped_frames}, annotated_pub={self._log_annotated_publish_count}'
                     f'{roi_debug_details}'
                 )
-                self.frame_counter = 0
-                self._dropped_frames = 0
-                self.last_log_time = now
+                self._reset_log_window(now)
             return
 
         # ── KF-enabled path ──────────────────────────────────────────
@@ -1970,6 +1990,7 @@ class ObserverNode(Node):
             comp_msg.format = 'jpeg'
             comp_msg.data = bytes(cv2.imencode('.jpg', annotated_image, [cv2.IMWRITE_JPEG_QUALITY, 75])[1])
             self.detection_pub.publish(comp_msg)
+            self._log_annotated_publish_count += 1
 
         if self.publish_debug_annotated_image and self.camera_info is not None:
             self.publish_ray_debug_image(bgr_image, self.camera_info, local_ray_data, msg.header)
@@ -1997,17 +2018,17 @@ class ObserverNode(Node):
         now = time.time()
         if now - self.last_log_time >= 2.0:
             fps = self.frame_counter / (now - self.last_log_time)
-            mode = 'ROI' if use_roi else 'FULL'
+            avg_infer_ms = self._log_infer_total_ms / max(1, self.frame_counter)
+            mode_summary = self._format_log_window_modes()
             kf_state = self._kf_tracker.state
             esc = f' esc={self._roi_consecutive_misses}' if self._roi_consecutive_misses > 0 else ''
             self.get_logger().info(
-                f'Observer node: FPS={fps:.2f}, inference={infer_ms:.1f}ms, mode={mode}{esc}, '
-                f'kf={kf_state}, dropped={self._dropped_frames}'
+                f'Observer node: FPS={fps:.2f}, inference_avg={avg_infer_ms:.1f}ms, '
+                f'inference_max={self._log_infer_max_ms:.1f}ms, {mode_summary}{esc}, '
+                f'kf={kf_state}, dropped={self._dropped_frames}, annotated_pub={self._log_annotated_publish_count}'
                 f'{roi_debug_details}'
             )
-            self.frame_counter = 0
-            self._dropped_frames = 0
-            self.last_log_time = now
+            self._reset_log_window(now)
 
     def _update_roi_tracker(self, det: DetectionObservation, results, stamp_ns: int, roi_x1: int, roi_y1: int) -> None:
         """Update ROI position, box, and smoothed image-plane velocity from the chosen detection."""
@@ -2044,6 +2065,27 @@ class ObserverNode(Node):
         self._roi_last_center = (new_u, new_v)
         self._roi_last_bbox = (bx1, by1, bx2, by2)
         self._roi_last_stamp_ns = stamp_ns
+
+    def _record_log_window_frame(self, infer_ms: float, use_roi: bool) -> None:
+        self._log_infer_total_ms += infer_ms
+        self._log_infer_max_ms = max(self._log_infer_max_ms, infer_ms)
+        if use_roi:
+            self._log_roi_frames += 1
+        else:
+            self._log_full_frames += 1
+
+    def _format_log_window_modes(self) -> str:
+        return f'modes=ROI:{self._log_roi_frames}/FULL:{self._log_full_frames}'
+
+    def _reset_log_window(self, now: float) -> None:
+        self.frame_counter = 0
+        self._dropped_frames = 0
+        self._log_infer_total_ms = 0.0
+        self._log_infer_max_ms = 0.0
+        self._log_roi_frames = 0
+        self._log_full_frames = 0
+        self._log_annotated_publish_count = 0
+        self.last_log_time = now
 
     def extract_best_detection(
         self,

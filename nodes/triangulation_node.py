@@ -453,6 +453,7 @@ class TriangulationNode(Node):
         _default_publish_debug_annotated = False
         _observer1_image_topic = ''
         _observer2_image_topic = ''
+        _observer1_camera_info_topic = ''
         _default_observation_topic_name = 'target_observation'
         _default_max_tf_delta_ms = 30.0
         _default_process_noise_acc = 1.5
@@ -487,6 +488,7 @@ class TriangulationNode(Node):
                             )
                             _observer1_image_topic = _vision.get('main_image_topic', '') or ''
                             _observer2_image_topic = _vision.get('observer_image_topic', '') or ''
+                            _observer1_camera_info_topic = _vision.get('main_camera_info_topic', '') or ''
                             _default_observation_topic_name = (
                                 _vision.get('observation_topic_name', _default_observation_topic_name)
                                 or _default_observation_topic_name
@@ -553,6 +555,7 @@ class TriangulationNode(Node):
         self.declare_parameter('publish_debug_annotated_image', _default_publish_debug_annotated)
         self.declare_parameter('observer1_image_topic', _observer1_image_topic)
         self.declare_parameter('observer2_image_topic', _observer2_image_topic)
+        self.declare_parameter('observer1_camera_info_topic', _observer1_camera_info_topic)
         self.declare_parameter('observation_topic_name', _default_observation_topic_name)
         self.declare_parameter('max_tf_delta_ms', _default_max_tf_delta_ms)
 
@@ -597,9 +600,12 @@ class TriangulationNode(Node):
         self.observer2_observation_topic = f'/{self.observer2_name}/{self.observation_topic_name}'
         self.observer1_world_frame = f'{self.observer1_name}/{self.world_frame_suffix}'
         self._observer1_use_compressed = self.observer1_image_topic.endswith('/compressed')
-        self.observer1_camera_info_topic = self._camera_info_topic_from_image_topic(
-            self.observer1_image_topic,
-            self.observer1_name,
+        self.observer1_camera_info_topic = (
+            str(self.get_parameter('observer1_camera_info_topic').value).strip()
+            or self._camera_info_topic_from_image_topic(
+                self.observer1_image_topic,
+                self.observer1_name,
+            )
         )
 
         buffer_maxlen = max(32, int(max(1.0, self.processing_rate_hz) * max(1.0, self.observation_buffer_ns / 1e9) * 4.0))
@@ -720,6 +726,7 @@ class TriangulationNode(Node):
         self.get_logger().info('Triangulation node initialization complete.')
         self.get_logger().info(f'Observer 1 topic: {self.observer1_observation_topic}')
         self.get_logger().info(f'Observer 2 topic: {self.observer2_observation_topic}')
+        self.get_logger().info(f'Observer 1 camera info topic: {self.observer1_camera_info_topic}')
         self.get_logger().info(f'Target frame: {self.target_frame_id}')
         self.get_logger().info(f'Observation buffer: {self.observation_buffer_ns / 1e9:.2f} s')
         if self.publish_debug_annotated_image:

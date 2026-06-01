@@ -116,14 +116,29 @@ class LiveMonitorNode(Node):
         p = msg.pose.pose.position
         return np.array([p.x, p.y, p.z])
 
+    def _nearest_estimate_position(self, target_time: float) -> Optional[np.ndarray]:
+        if not self.est_data:
+            return None
+
+        best_position = None
+        best_dt = float('inf')
+        for estimate_time, estimate_position in self.est_data:
+            dt = abs(estimate_time - target_time)
+            if dt < best_dt:
+                best_dt = dt
+                best_position = estimate_position
+
+        return None if best_position is None else best_position.copy()
+
     def _gt_cb(self, msg: Odometry):
         pos = self._pos(msg)
         t = self._time_from_msg(msg)
         with self.lock:
             self.gt_data.append((t, pos))
             self._gt_count += 1
-            if self.est_data:
-                self.err_data.append((t, float(np.linalg.norm(pos - self.est_data[-1][1]))))
+            nearest_estimate = self._nearest_estimate_position(t)
+            if nearest_estimate is not None:
+                self.err_data.append((t, float(np.linalg.norm(pos - nearest_estimate))))
 
     def _est_cb(self, msg: Odometry):
         t = self._time_from_msg(msg)
