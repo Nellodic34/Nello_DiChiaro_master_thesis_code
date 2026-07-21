@@ -18,7 +18,8 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
-from std_msgs.msg import UInt8MultiArray
+from std_msgs.msg import String, UInt8MultiArray
+import json
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -86,24 +87,41 @@ def normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 
- # Packet layout: [stamp_ns, observation_id, confidence, origin xyz, ray xyz, tf_delta_ns, tf_status].
-OBSERVATION_PACKET_STRUCT = struct.Struct('<qIf3f3fqB')
+# ── Observation packet layout ────────────────────────────────────────────────
+# V1 (bearing-only):   [stamp_ns q, obs_id I, conf f, origin 3f, ray 3f, tf_delta q, tf_status B]
+# V2 (bearing+range):  V1 fields + [depth_valid B, depth_m f, depth_sigma_m f]
+# Triangulation node distinguishes by packet size (len == V1.size → V1, len == V2.size → V2).
+OBSERVATION_PACKET_STRUCT = struct.Struct('<qIf3f3fqB')      # V1 — 42 bytes
+OBSERVATION_PACKET_V2_STRUCT = struct.Struct('<qIf3f3fqBBff')  # V2 — 51 bytes
 TF_STATUS_EXACT = 0
 
-
-def unpack_observation_packet(msg: UInt8MultiArray) -> Optional[Tuple[int, int, float, np.ndarray, np.ndarray, int, int]]:
-    """Unpack a compact observer measurement packet from the network topic."""
+def unpack_observation_packet(msg: UInt8MultiArray) -> Optional[Tuple[int, int, float, np.ndarray, np.ndarray, int, int, bool, float, float]]:
+    """Unpack a compact observer measurement packet from the network topic.
+    Returns:
+        stamp_ns, observation_id, confidence, origin, ray, tf_delta_ns, tf_status, depth_valid, depth_m, depth_sigma_m
+    """
     packet_bytes = bytes(msg.data)
-    if len(packet_bytes) != OBSERVATION_PACKET_STRUCT.size:
+    if len(packet_bytes) == OBSERVATION_PACKET_V2_STRUCT.size:
+        unpacked = OBSERVATION_PACKET_V2_STRUCT.unpack(packet_bytes)
+        stamp_ns, observation_id, confidence = unpacked[:3]
+        origin = np.array(unpacked[3:6], dtype=np.float64)
+        ray = np.array(unpacked[6:9], dtype=np.float64)
+        tf_delta_ns = int(unpacked[9])
+        tf_status = int(unpacked[10])
+        depth_valid = bool(unpacked[11])
+        depth_m = float(unpacked[12])
+        depth_sigma_m = float(unpacked[13])
+        return int(stamp_ns), int(observation_id), float(confidence), origin, ray, tf_delta_ns, tf_status, depth_valid, depth_m, depth_sigma_m
+    elif len(packet_bytes) == OBSERVATION_PACKET_STRUCT.size:
+        unpacked = OBSERVATION_PACKET_STRUCT.unpack(packet_bytes)
+        stamp_ns, observation_id, confidence = unpacked[:3]
+        origin = np.array(unpacked[3:6], dtype=np.float64)
+        ray = np.array(unpacked[6:9], dtype=np.float64)
+        tf_delta_ns = int(unpacked[9])
+        tf_status = int(unpacked[10])
+        return int(stamp_ns), int(observation_id), float(confidence), origin, ray, tf_delta_ns, tf_status, False, 0.0, 0.0
+    else:
         return None
-
-    unpacked = OBSERVATION_PACKET_STRUCT.unpack(packet_bytes)
-    stamp_ns, observation_id, confidence = unpacked[:3]
-    origin = np.array(unpacked[3:6], dtype=np.float64)
-    ray = np.array(unpacked[6:9], dtype=np.float64)
-    tf_delta_ns = int(unpacked[9])
-    tf_status = int(unpacked[10])
-    return int(stamp_ns), int(observation_id), float(confidence), origin, ray, tf_delta_ns, tf_status
 
 
 def triangulate_midpoint(
@@ -135,6 +153,613 @@ def triangulate_midpoint(
     return midpoint, error
 
 
+def extract_position_covariance(
+    odom_msg: Odometry,
+    fallback_variance: float = 0.01,
+    logger = None,
+    observer_label: str = "Unknown",
+) -> np.ndarray:
+    """Extract the 3x3 translational position covariance from a nav_msgs/Odometry message.
+
+    The ``pose.covariance`` field is a flat 36-element array representing a 6x6
+    row-major matrix ordered as (x, y, z, roll, pitch, yaw).  We extract the
+    upper-left 3x3 block corresponding to translational degrees of freedom.
+
+    If the covariance is zero (e.g. not published by the driver) or nearly
+    degenerate, a scalar ``fallback_variance * I_3`` is returned to prevent
+    the Jacobian term from vanishing while still being conservative.
+
+    Reference: REP-103 (ROS coordinate conventions), nav_msgs/Odometry.msg.
+
+    Args:
+        odom_msg:         The odometry message from which to extract covariance.
+        fallback_variance: Isotropic variance (m²) used when covariance is
+                          unavailable or non-positive-definite.
+        logger:           Optional rclpy logger for fallback warnings.
+        observer_label:   Name of the observer for log context.
+
+    Returns:
+        P_pos (3×3 float64 ndarray): Translational position covariance.
+    """
+    raw = np.array(odom_msg.pose.covariance, dtype=np.float64).reshape(6, 6)
+    P_pos = raw[:3, :3].copy()
+
+    # Fallback: if the diagonal is all-zeros the driver does not publish covariance.
+    if np.all(np.abs(np.diag(P_pos)) < 1e-12):
+        if logger is not None:
+            logger.warn(
+                f'\033[95m[odom_uncertainty] {observer_label} Odometry covariance is ZERO. '
+                f'Using fallback {fallback_variance} m^2\033[0m',
+                throttle_duration_sec=5.0
+            )
+        return np.eye(3, dtype=np.float64) * fallback_variance
+
+    # Enforce symmetry (numerical rounding in serialisation).
+    P_pos = 0.5 * (P_pos + P_pos.T)
+
+    # Enforce positive-definiteness by clamping eigenvalues.
+    eigvals = np.linalg.eigvalsh(P_pos)
+    if np.any(eigvals <= 0.0):
+        P_pos += (abs(eigvals.min()) + 1e-9) * np.eye(3, dtype=np.float64)
+
+    return P_pos
+
+
+def compute_bearing_jacobian_wrt_observer(
+    p_obs: np.ndarray,
+    p_target: np.ndarray,
+    min_distance: float = 0.5,
+) -> np.ndarray:
+    """Jacobian of the unit bearing vector b = (p_t - p_obs)/‖p_t - p_obs‖
+    with respect to the observer position p_obs.
+
+    Derivation (chain rule on the unit-norm map):
+
+        b(p_obs) = -(p_obs - p_t) / d,   d = ‖p_t - p_obs‖
+
+        ∂b/∂p_obs = -(1/d)(I₃ - b bᵀ)
+
+    This is the standard first-order sensitivity of a bearing measurement to
+    errors in the sensor position, as used in decentralised target tracking
+    literature (e.g. Zhao et al., 2013; Olfati-Saber, 2006).
+
+    The term (I₃ - b bᵀ) is the projection onto the plane perpendicular to b,
+    so only cross-bearing displacements of the observer affect the bearing.
+    Motions along b (radial) cancel at first order — consistent with bearing-
+    only observability theory.
+
+    Args:
+        p_obs:        Observer 3D position in world frame (3,).
+        p_target:     Target 3D position in world frame (3,).
+        min_distance: Clamp on ‖p_t - p_obs‖ to prevent singularity (m).
+
+    Returns:
+        J (3×3 float64 ndarray): Jacobian ∂b/∂p_obs.  Returns zero matrix
+        for degenerate geometry (target and observer co-located).
+    """
+    diff = p_target - p_obs
+    d = float(np.linalg.norm(diff))
+
+    if d < 1e-6:
+        # Fully degenerate: observer and target are co-located.
+        return np.zeros((3, 3), dtype=np.float64)
+
+    d_clamped = max(d, float(min_distance))
+    b = diff / d  # unit bearing vector
+    # J = -(1/d_clamped) * (I - b bᵀ)
+    J = -(1.0 / d_clamped) * (np.eye(3, dtype=np.float64) - np.outer(b, b))
+    return J
+
+
+def _validate_covariance_matrix(
+    R: np.ndarray,
+    name: str,
+    logger=None,
+    eps: float = 1e-9,
+) -> np.ndarray:
+    """Verify symmetry and positive-definiteness of a covariance matrix.
+
+    If either condition is violated the matrix is repaired in-place (symmetrised
+    and shifted) and a ROS WARNING is emitted so the issue is visible in logs
+    without crashing the node.
+
+    Args:
+        R:      Input matrix to validate.
+        name:   Human-readable label for log messages.
+        logger: Optional rclpy logger (node.get_logger()).
+        eps:    Minimum eigenvalue shift to restore PD-ness.
+
+    Returns:
+        Validated (and possibly repaired) matrix.
+    """
+    # Symmetry check
+    sym_err = float(np.max(np.abs(R - R.T)))
+    if sym_err > 1e-6:
+        if logger is not None:
+            logger.warn(
+                f'[odom_uncertainty] {name} not symmetric (max_asym={sym_err:.2e}); enforcing symmetry.',
+                throttle_duration_sec=5.0,
+            )
+        R = 0.5 * (R + R.T)
+
+    # Positive-definiteness check via eigenvalues
+    eigvals = np.linalg.eigvalsh(R)
+    min_eig = float(eigvals.min())
+    if min_eig <= 0.0:
+        shift = abs(min_eig) + eps
+        if logger is not None:
+            logger.warn(
+                f'[odom_uncertainty] {name} not positive-definite (min_eig={min_eig:.2e}); '
+                f'adding {shift:.2e}*I.',
+                throttle_duration_sec=5.0,
+            )
+        R = R + shift * np.eye(R.shape[0], dtype=np.float64)
+
+    return R
+
+
+def triangulate_wls(
+    origin1: np.ndarray,
+    dir1: np.ndarray,
+    P_odom1: Optional[np.ndarray],
+    origin2: np.ndarray,
+    dir2: np.ndarray,
+    P_odom2: Optional[np.ndarray],
+    var_px: float,
+    use_odom_uncertainty: bool = True,
+    distance_dependent_noise: bool = True,
+    odom_max_variance: float = 1.0,
+    prior_target_pos: Optional[np.ndarray] = None,
+    normalize_crlb: bool = True,
+    logger=None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Optimal bearing-only triangulation via Weighted Least Squares (Errors-In-Variables).
+
+    Jointly computes the Maximum-Likelihood Estimate of the target position
+    ``p_hat`` and its Cramér-Rao Lower Bound covariance ``R_out`` (3x3) from
+    two bearing rays, accounting for both visual measurement noise and observer
+    odometry uncertainty.
+
+    The algorithm is a two-step pseudo-linear estimator:
+
+    Step 1 — Bootstrap / Instrumental Variable:
+        Uses an Instrumental Variable (IV) approach to estimate distance and
+        break the Pseudo-Linear Estimator (PLE) bias (Doğançay 2006). If a
+        prior target position is provided (from IMM history), it is used directly
+        to compute the distance, ensuring WLS weights are independent of current
+        bearing noise. If missing, falls back to an Orthogonal Vectors Estimator (OLS).
+
+    Step 2 — Weighted Least Squares:
+        Build the per-ray composite noise covariance::
+
+            V_i = (var_px * d_i^2 * I_3)  +  Pi_i @ P_odom_i @ Pi_i.T
+
+        where ``Pi_i = I - outer(dir_i, dir_i)`` is the orthogonal projector
+        onto the plane perpendicular to the bearing (Doğançay 2015, Sec. II).
+        Accumulate the Fisher Information Matrix::
+
+            Lambda = Pi_1.T @ inv(V_1) @ Pi_1  +  Pi_2.T @ inv(V_2) @ Pi_2
+
+        This equals A.T @ W @ A where A = [Pi_1; Pi_2] and W = block_diag(inv(V_1), inv(V_2)).
+        The output covariance and position follow from::
+
+            R_out  = inv(Lambda)          # CRLB (Bishop et al. 2010, Sec. III)
+            p_hat  = R_out @ (Pi_1.T @ inv(V_1) @ Pi_1 @ c1
+                            + Pi_2.T @ inv(V_2) @ Pi_2 @ c2)
+
+    NOTE on I_3 vs Pi_i for the visual term:
+        Using ``var_px * d_i^2 * I_3`` (isotropic sphere) instead of the
+        theoretically exact ``var_px * d_i^2 * Pi_i`` (rank-2 disk) injects a
+        tiny fictitious variance along the ray direction. This guarantees that
+        ``V_i`` is full-rank and stably invertible even when
+        ``use_odom_uncertainty=False``. The spurious radial component is
+        *exactly* cancelled by the outer ``Pi_i`` projectors in the Lambda
+        accumulation step, so the final ``R_out`` is unaffected. This is a
+        standard Tikhonov-like regularisation for rank-deficient EIV systems.
+
+    References:
+        - Doğançay, K. (2005). Bearings-only target localization using total
+          least squares. *Signal Processing*, 85(9), 1695-1710.
+          doi:10.1016/j.sigpro.2005.03.007
+        - Doğançay, K. (2015). 3D Pseudolinear Target Motion Analysis From
+          Angle Measurements. *IEEE Trans. Signal Process.*, 63(6), 1570-1580.
+          doi:10.1109/TSP.2015.2399869
+        - Xu, S., Doğançay, K., & Hmam, H. (2017). Distributed pseudolinear
+          estimation and UAV path optimization for 3D AOA target tracking.
+          *Signal Processing*, 133, 64-78. doi:10.1016/j.sigpro.2016.10.012
+        - Bishop, A. N., et al. (2010). Optimality analysis of sensor-target
+          localization geometries. *Automatica*, 46(3), 479-492.
+          doi:10.1016/j.automatica.2009.12.003
+
+    Args:
+        origin1/2:              3-D world-frame positions of the two observer cameras (3,).
+        dir1/2:                 Unit bearing vectors toward the target (3,).
+        P_odom1/2:              3x3 observer position covariance (or None).
+        var_px:                 Angular variance seed [rad^2 or m^2/m^2]; the
+                                ``kf_measurement_noise`` parameter from YAML.
+        use_odom_uncertainty:   When True, include P_odom_i in V_i.
+        distance_dependent_noise: When True, visual sigma = var_px * d_i^2.
+        odom_max_variance:      Diagonal clamp [m^2] applied to P_odom before
+                                projection. Prevents barometric Z-blowup
+                                (e.g. sim publishes sigma_z ~ 35 m) from
+                                making V_i ill-conditioned.
+        prior_target_pos:       Optional prior target position for IV estimation.
+        logger:                 Optional rclpy logger.
+
+    Returns:
+        p_hat (3,):  MLE target position in world frame.
+        R_out (3x3): Symmetric PD measurement covariance (CRLB) → use as R_k
+                     in the IMM-KF update step.
+
+    Raises:
+        ValueError: If the bearing lines are nearly parallel (observability
+                    check fails) or if the linear system is singular.
+    """
+    I3 = np.eye(3, dtype=np.float64)
+
+    # ── Observability check ──────────────────────────────────────────────────
+    cross = np.cross(dir1, dir2)
+    sin_angle = float(np.linalg.norm(cross))
+    if sin_angle < 0.087:  # sin(5°) ≈ 0.087
+        raise ValueError(
+            f'[triangulate_wls] Bearing lines nearly parallel '
+            f'(sin_angle={sin_angle:.4f} < 0.087). Observability lost.'
+        )
+
+    # ── Orthogonal projectors  Pi_i = I - dir_i * dir_i^T ───────────────────
+    Pi1 = I3 - np.outer(dir1, dir1)   # (3x3) rango 2
+    Pi2 = I3 - np.outer(dir2, dir2)
+
+    # ── Step 1: Bootstrap / Instrumental Variable per stima distanza ─────────
+    if prior_target_pos is not None:
+        # Metodo IV-WLS: usiamo la predizione passata per rompere il PLE bias
+        # Costo computazionale quasi nullo, stabilità geometrica garantita.
+        d1 = float(max(np.linalg.norm(prior_target_pos - origin1), 0.1))
+        d2 = float(max(np.linalg.norm(prior_target_pos - origin2), 0.1))
+    else:
+        # Fallback OLS classico per la prima misurazione assoluta o reset
+        A_boot = np.vstack([Pi1, Pi2])                          # (6, 3)
+        b_boot = np.concatenate([Pi1 @ origin1, Pi2 @ origin2])  # (6,)
+        ATA = A_boot.T @ A_boot   # (3, 3)
+        ATb = A_boot.T @ b_boot   # (3,)
+        try:
+            p_hat_0 = np.linalg.solve(ATA, ATb)
+        except np.linalg.LinAlgError:
+            # Extremely degenerate geometry: fall back to midpoint
+            p_hat_0 = 0.5 * (origin1 + origin2)
+        d1 = float(max(np.linalg.norm(p_hat_0 - origin1), 0.1))
+        d2 = float(max(np.linalg.norm(p_hat_0 - origin2), 0.1))
+
+    # ── Step 2: Build per-ray composite noise covariance V_i ─────────────────
+    # Visual term: isotropic I_3 used instead of Pi_i for rank stability
+    # (spurious radial component is cancelled by outer Pi projectors in Lambda).
+    d_scale_1 = (d1 ** 2) if distance_dependent_noise else 1.0
+    d_scale_2 = (d2 ** 2) if distance_dependent_noise else 1.0
+
+    V1 = float(var_px) * d_scale_1 * I3   # Visual-only base
+    V2 = float(var_px) * d_scale_2 * I3
+
+    if use_odom_uncertainty:
+        # Clamp diagonal of P_odom to odom_max_variance before projection
+        # to neutralise barometric Z-blowup from the MRS simulator.
+        def _clamp_and_project(P_odom: Optional[np.ndarray], Pi: np.ndarray) -> np.ndarray:
+            if P_odom is None:
+                return np.zeros((3, 3), dtype=np.float64)
+            P_c = P_odom.copy()
+            diag_idx = np.arange(3)
+            P_c[diag_idx, diag_idx] = np.clip(
+                np.diag(P_c), 0.0, float(odom_max_variance)
+            )
+            P_c = 0.5 * (P_c + P_c.T)  # enforce symmetry after clamp
+            return Pi @ P_c @ Pi.T
+
+        V1 = V1 + _clamp_and_project(P_odom1, Pi1)
+        V2 = V2 + _clamp_and_project(P_odom2, Pi2)
+
+    # ── Step 2 (cont.): Build weights W_i = inv(V_i) ─────────────────────────
+    # V_i is SPD because the isotropic visual term guarantees full rank.
+    try:
+        W1 = np.linalg.inv(V1)
+        W2 = np.linalg.inv(V2)
+    except np.linalg.LinAlgError:
+        # Pathological: fall back to identity weighting
+        W1 = I3
+        W2 = I3
+        if logger is not None:
+            logger.warn(
+                '[triangulate_wls] V_i singular during inversion. '
+                'Falling back to identity weights.',
+                throttle_duration_sec=5.0,
+            )
+
+    # ── Step 2 (cont.): Fisher Information Matrix and WLS solution ───────────
+    # Lambda = Pi1^T W1 Pi1 + Pi2^T W2 Pi2  (equivalent to A^T W A)
+    # Computed block-by-block to avoid allocating 6x6 matrices.
+    Pi1W1Pi1 = Pi1.T @ W1 @ Pi1   # (3x3)
+    Pi2W2Pi2 = Pi2.T @ W2 @ Pi2   # (3x3)
+    Lambda = Pi1W1Pi1 + Pi2W2Pi2   # Fisher Information Matrix (3x3)
+
+    rhs = Pi1W1Pi1 @ origin1 + Pi2W2Pi2 @ origin2   # (3,)
+
+    # ── Step 3: Output covariance (CRLB) and MLE position ────────────────────
+    try:
+        R_out = np.linalg.inv(Lambda)
+    except np.linalg.LinAlgError:
+        # Should never occur given the observability check, but be defensive.
+        R_out = I3 * 1e6
+        if logger is not None:
+            logger.warn(
+                '[triangulate_wls] Lambda singular. Returning high-uncertainty R.',
+                throttle_duration_sec=5.0,
+            )
+
+    p_hat = R_out @ rhs
+
+    # ── CRLB Normalisation (controlled by normalize_crlb flag) ───────────────
+    #
+    # Background:
+    #   R_out = Lambda^{-1} is the exact Cramér-Rao Lower Bound (CRLB) for this
+    #   geometry.  Its absolute magnitude is O(var_px * d²), which grows
+    #   quadratically with target distance and can reach ~1000–3000 m² at 15 m.
+    #
+    # Option A — normalize_crlb = True  (legacy / pragmatic, DEFAULT)
+    #   Preserve the ANISOTROPIC SHAPE of the CRLB (eigenvalue ratios encode
+    #   which Cartesian directions are well-observed) but rescale the magnitude
+    #   so that trace(R) = 3 * var_px.  This matches the isotropic scalar
+    #   `R = var_px * I` in the limit of equal weights and 90° geometry, letting
+    #   kf_measurement_noise act as the global trust knob exactly as before.
+    #   → Backward compatible: existing kf_measurement_noise and kf_process_noise_*
+    #     parameters remain valid without re-tuning.
+    #   → Academic note: this is a "normalised-CRLB shape" approach (Ristic et al.,
+    #     2004, "Beyond the Kalman Filter"), defensible but not SOTA.
+    #
+    # Option B — normalize_crlb = False  (physically rigorous, SOTA)
+    #   Return R_out = Lambda^{-1} unchanged.  The Kalman Filter receives the
+    #   true measurement uncertainty; the Kalman Gain automatically decreases at
+    #   large distances (correct physical behaviour) and increases when geometry
+    #   is favourable.
+    #   → Requires the process-noise matrices Q_cv and Q_ca to also be on the
+    #     correct physical scale.  CMA-ES must be re-run with wider Q bounds and
+    # else: R_out = Lambda^{-1} — raw CRLB, physically rigorous.
+
+    # Enforce symmetry (floating-point rounding)
+    R_out = 0.5 * (R_out + R_out.T)
+
+    return p_hat, R_out
+
+
+
+def compute_triangulation_measurement_covariance(
+    midpoint: np.ndarray,
+    origin1: np.ndarray,
+    dir1: np.ndarray,
+    origin2: np.ndarray,
+    dir2: np.ndarray,
+    kf_measurement_noise: float,
+    P_odom1: Optional[np.ndarray] = None,
+    P_odom2: Optional[np.ndarray] = None,
+    min_bearing_distance: float = 0.5,
+    logger=None,
+) -> np.ndarray:
+    """Fisher-information triangulation covariance R (3×3) for a bearing-only pair.
+
+    Maps angular measurement uncertainty into an anisotropic Cartesian ellipsoid.
+    When observer odometry covariances ``P_odom1`` / ``P_odom2`` are provided,
+    the observer position uncertainty is propagated into the bearing measurement
+    noise via the first-order Jacobian (error-propagation law):
+
+        R_total_i = R_pixel_i + J_i @ P_odom_i @ J_iᵀ
+
+    where ``J_i = ∂b_i/∂p_obs_i`` is computed by
+    :func:`compute_bearing_jacobian_wrt_observer`.
+
+    This follows the standard linearised covariance propagation described in:
+
+        Bar-Shalom, Li & Kirubarajan (2001), *Estimation with Applications to
+        Tracking and Navigation*, Ch. 2 — "Error Propagation".
+
+    and is directly related to the Fisher-Information weighting advocated for
+    cooperative bearing-only tracking in:
+
+        Olfati-Saber (2006), "Swarm Stability and Optimization", IEEE CDC;
+        Zhao et al. (2013), "Bearing-only formation control", IEEE TAC.
+
+    Args:
+        midpoint:             Triangulated 3-D midpoint (best estimate of target).
+        origin1/2:            3-D origins of the two bearing rays (camera centres).
+        dir1/2:               Unit bearing directions.
+        kf_measurement_noise: Angular variance seed (m²); same as current param.
+        P_odom1/2:            Optional 3×3 position covariance of each observer.
+                              Pass ``None`` to fall back to pixel-only noise.
+        min_bearing_distance: Clamp passed to Jacobian helper (m).
+        logger:               Optional rclpy logger for validation warnings.
+
+    Returns:
+        R (3×3 float64 ndarray): Symmetric, positive-definite measurement
+        covariance for the IMM update step.
+    """
+    d1 = float(max(np.linalg.norm(midpoint - origin1), 0.1))
+    d2 = float(max(np.linalg.norm(midpoint - origin2), 0.1))
+    d_ref = max(np.sqrt(d1 * d2), 0.5)
+    angular_var = max(float(kf_measurement_noise) / (d_ref ** 2), 1e-8)
+    var1 = (d1 ** 2) * angular_var
+    var2 = (d2 ** 2) * angular_var
+
+    proj1 = np.eye(3, dtype=np.float64) - np.outer(dir1, dir1)
+    proj2 = np.eye(3, dtype=np.float64) - np.outer(dir2, dir2)
+
+    # Base pixel-only information matrices
+    R_pix1 = proj1 * var1  # (3×3) — angular noise for ray 1
+    R_pix2 = proj2 * var2  # (3×3) — angular noise for ray 2
+
+    # Propagate observer position uncertainty (if available)
+    # R_total_i = R_pixel_i + J_i @ P_odom_i @ J_iᵀ
+    if P_odom1 is not None:
+        J1 = compute_bearing_jacobian_wrt_observer(
+            origin1, midpoint, min_distance=min_bearing_distance
+        )
+        odom_contrib1 = (d1 ** 2) * (J1 @ P_odom1 @ J1.T)
+        R_pix1 = R_pix1 + odom_contrib1
+
+    if P_odom2 is not None:
+        J2 = compute_bearing_jacobian_wrt_observer(
+            origin2, midpoint, min_distance=min_bearing_distance
+        )
+        odom_contrib2 = (d2 ** 2) * (J2 @ P_odom2 @ J2.T)
+        R_pix2 = R_pix2 + odom_contrib2
+
+    # Fisher information fusion: I_total = I_1 + I_2
+    # (inverting each R_i gives a proper information weighting)
+    eps = 1e-6 * np.eye(3, dtype=np.float64)
+    try:
+        info1 = np.linalg.inv(R_pix1 + eps)
+    except np.linalg.LinAlgError:
+        info1 = np.eye(3, dtype=np.float64) / max(var1, 1e-6)
+    try:
+        info2 = np.linalg.inv(R_pix2 + eps)
+    except np.linalg.LinAlgError:
+        info2 = np.eye(3, dtype=np.float64) / max(var2, 1e-6)
+
+    try:
+        R_out = np.linalg.inv(info1 + info2)
+    except np.linalg.LinAlgError:
+        R_out = np.eye(3, dtype=np.float64) * (var1 + var2) * 10.0
+
+    return _validate_covariance_matrix(R_out, 'R_triangulation', logger=logger)
+
+
+def compute_single_ray_measurement_covariance(
+    ray_dir_world: np.ndarray,
+    depth_m: float,
+    depth_sigma_m: float,
+    kf_measurement_noise: float,
+) -> np.ndarray:
+    """Fisher-information covariance R (3x3) for a single RGB-D ray.
+
+    Maps radial depth uncertainty and lateral angular uncertainty into an
+    anisotropic Cartesian ellipsoid.
+    """
+    var_radial = float(depth_sigma_m ** 2)
+    var_lateral = (float(depth_m) ** 2) * float(kf_measurement_noise)
+    
+    proj_radial = np.outer(ray_dir_world, ray_dir_world)
+    proj_lateral = np.eye(3, dtype=np.float64) - proj_radial
+    
+    R_single = var_radial * proj_radial + var_lateral * proj_lateral
+    assert np.linalg.matrix_rank(R_single) == 3, "Degenerate single-ray covariance"
+    return R_single
+
+
+@dataclass(frozen=True)
+class PredictionGuidedPairScore:
+    """Cost breakdown for one feasible observer ray pair."""
+
+    cost: float
+    time_term: float
+    geom_term: float
+    innov_term: float
+    midpoint: np.ndarray
+    ray_gap_m: float
+
+
+def score_prediction_guided_pair(
+    origin1: np.ndarray,
+    dir1: np.ndarray,
+    origin2: np.ndarray,
+    dir2: np.ndarray,
+    pair_diff_ns: int,
+    max_pair_age_ns: int,
+    max_triangulation_error_m: float,
+    triangulation_min_baseline_m: float,
+    kf_measurement_noise: float,
+    x_pred: np.ndarray,
+    P_pred_pos: Optional[np.ndarray],
+    weight_time: float,
+    weight_geom: float,
+    weight_innov: float,
+    pairing_mahalanobis_chi2: float,
+    imm_initialized: bool,
+) -> Optional[PredictionGuidedPairScore]:
+    """Score one ray pair for prediction-guided association (lower is better).
+
+    Hard-rejects infeasible geometry before scoring. Innovation term uses
+    S = P_pred_pos + R_3d and is disabled until the IMM has been initialized.
+    """
+    if pair_diff_ns > max_pair_age_ns:
+        return None
+
+    baseline = float(np.linalg.norm(origin2 - origin1))
+    if baseline < triangulation_min_baseline_m:
+        return None
+
+    midpoint, ray_gap_m = triangulate_midpoint(origin1, dir1, origin2, dir2)
+    if ray_gap_m > max_triangulation_error_m:
+        return None
+
+    dt_max = max(float(max_pair_age_ns), 1.0)
+    e_max = max(float(max_triangulation_error_m), 1e-6)
+    chi2_norm = max(float(pairing_mahalanobis_chi2), 1e-6)
+
+    time_term = float(pair_diff_ns) / dt_max
+    geom_term = float(ray_gap_m) / e_max
+
+    innov_term = 0.0
+    if imm_initialized and P_pred_pos is not None:
+        R = compute_triangulation_measurement_covariance(
+            midpoint,
+            origin1,
+            dir1,
+            origin2,
+            dir2,
+            kf_measurement_noise,
+        )
+        S = P_pred_pos + R
+        innovation = midpoint - x_pred
+        try:
+            S_inv = np.linalg.inv(S)
+            d2 = float(innovation.T @ S_inv @ innovation)
+        except np.linalg.LinAlgError:
+            return None
+        innov_term = d2 / chi2_norm
+
+    cost = (
+        float(weight_time) * time_term
+        + float(weight_geom) * geom_term
+        + float(weight_innov) * innov_term
+    )
+    return PredictionGuidedPairScore(
+        cost=cost,
+        time_term=time_term,
+        geom_term=geom_term,
+        innov_term=innov_term,
+        midpoint=midpoint,
+        ray_gap_m=ray_gap_m,
+    )
+
+
+def select_timestamp_only_pair(
+    observations1: List['SpatialObservation'],
+    observations2: List['SpatialObservation'],
+    max_pair_age_ns: int,
+) -> Optional[Tuple['SpatialObservation', 'SpatialObservation', int]]:
+    """Legacy pairing: choose the pair with minimum absolute timestamp difference."""
+    best_obs1 = None
+    best_obs2 = None
+    best_diff = max_pair_age_ns + 1
+
+    for obs1 in observations1:
+        for obs2 in observations2:
+            diff = abs(obs1.stamp_ns - obs2.stamp_ns)
+            if diff < best_diff:
+                best_diff = diff
+                best_obs1 = obs1
+                best_obs2 = obs2
+
+    if best_obs1 is None or best_obs2 is None or best_diff > max_pair_age_ns:
+        return None
+    return best_obs1, best_obs2, best_diff
+
+
 @dataclass
 class StateCov:
     x: np.ndarray
@@ -161,8 +786,17 @@ class LinearKalmanFilter:
         P_new = (np.eye(self.n) - K @ self.H) @ sc.P
         return StateCov(x=x_new, P=P_new)
 
+    def correct_1d(self, sc: StateCov, z_scalar: float, h_vec: np.ndarray, r_scalar: float) -> StateCov:
+        """Sequential 1D update along a specific measurement vector h_vec (1xN)."""
+        y = z_scalar - float(h_vec @ sc.x)
+        S = float(h_vec @ sc.P @ h_vec.T) + r_scalar
+        K = (sc.P @ h_vec.T) / max(S, 1e-12)
+        x_new = sc.x + K * y
+        P_new = (np.eye(self.n) - np.outer(K, h_vec)) @ sc.P
+        return StateCov(x=x_new, P=P_new)
 
-def build_transition_matrix_ca(dt: float) -> np.ndarray:
+
+def build_transition_matrix_ca(dt: float, tau: float = 0.5) -> np.ndarray:
     A = np.eye(9, dtype=np.float64)
     dt2 = 0.5 * dt * dt
     A[0, 3] = dt
@@ -174,6 +808,12 @@ def build_transition_matrix_ca(dt: float) -> np.ndarray:
     A[3, 6] = dt
     A[4, 7] = dt
     A[5, 8] = dt
+    
+    # Singer Model Acceleration Decay
+    alpha = np.exp(-dt / tau)
+    A[6, 6] = alpha
+    A[7, 7] = alpha
+    A[8, 8] = alpha
     return A
 
 
@@ -289,7 +929,7 @@ class IMMFilter:
         z: np.ndarray,
         R: np.ndarray,
         mahalanobis_thresh: float = 9.0,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, float]:
         assert self.sc_cv is not None
         assert self.sc_ca is not None
 
@@ -345,6 +985,19 @@ class IMMFilter:
         y_ca = z - self.kf_ca.H @ sc_pred_ca.x
         S_ca = self.kf_ca.H @ sc_pred_ca.P @ self.kf_ca.H.T + R
 
+        # ── Combined Innovation and Covariance (Mixture Reduction) ──
+        # Evaluated using the predicted mode probabilities (c_bar)
+        nu_comb = c_bar[0] * y_cv + c_bar[1] * y_ca
+        S_comb = (c_bar[0] * S_cv + c_bar[1] * S_ca) + \
+                 c_bar[0] * np.outer(y_cv - nu_comb, y_cv - nu_comb) + \
+                 c_bar[1] * np.outer(y_ca - nu_comb, y_ca - nu_comb)
+        
+        try:
+            invS_comb = np.linalg.inv(S_comb)
+            combined_nis = float(nu_comb.T @ invS_comb @ nu_comb)
+        except np.linalg.LinAlgError:
+            combined_nis = float('inf')
+
         try:
             invS_cv_true = np.linalg.inv(S_cv)
             d_cv = float(y_cv.T @ invS_cv_true @ y_cv)
@@ -370,7 +1023,7 @@ class IMMFilter:
                 self.mu[0] * (self._cov_cv_to_ca(self.sc_cv.P) + np.outer(dx0_comb, dx0_comb))
                 + self.mu[1] * (self.sc_ca.P + np.outer(dx1_comb, dx1_comb))
             )
-            return x_comb, P_comb, self.mu, accepted
+            return x_comb, P_comb, self.mu, accepted, combined_nis
 
         def mv_normal_pdf_fixed(y, S_fixed):
             try:
@@ -404,6 +1057,70 @@ class IMMFilter:
             + self.mu[1] * (self.sc_ca.P + np.outer(dx1_comb, dx1_comb))
         )
 
+        return x_comb, P_comb, self.mu, accepted, combined_nis
+
+    def correct_1d(
+        self,
+        z_scalar: float,
+        h_vec_cv: np.ndarray,
+        h_vec_ca: np.ndarray,
+        r_scalar: float,
+        chi2_thresh: float = 9.0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+        """Apply a 1D scalar update (e.g., depth fusion) to both CV and CA filters."""
+        assert self.sc_cv is not None
+        assert self.sc_ca is not None
+
+        # Calculate innovations and S (variance) for 1D
+        y_cv = z_scalar - float(h_vec_cv @ self.sc_cv.x)
+        S_cv = float(h_vec_cv @ self.sc_cv.P @ h_vec_cv.T) + r_scalar
+        
+        y_ca = z_scalar - float(h_vec_ca @ self.sc_ca.x)
+        S_ca = float(h_vec_ca @ self.sc_ca.P @ h_vec_ca.T) + r_scalar
+
+        # Mahalanobis gating
+        d_cv = (y_cv * y_cv) / max(S_cv, 1e-12)
+        d_ca = (y_ca * y_ca) / max(S_ca, 1e-12)
+
+        accepted = True
+        if d_cv > chi2_thresh and d_ca > chi2_thresh:
+            accepted = False
+            # Reject: keep current state and mu
+            x_comb = self._state_cv_to_ca(self.sc_cv.x) * self.mu[0] + self.sc_ca.x * self.mu[1]
+            dx0_comb = self._state_cv_to_ca(self.sc_cv.x) - x_comb
+            dx1_comb = self.sc_ca.x - x_comb
+            P_comb = (
+                self.mu[0] * (self._cov_cv_to_ca(self.sc_cv.P) + np.outer(dx0_comb, dx0_comb))
+                + self.mu[1] * (self.sc_ca.P + np.outer(dx1_comb, dx1_comb))
+            )
+            return x_comb, P_comb, self.mu, accepted
+
+        # Accept: Update modes
+        sc_upd_cv = self.kf_cv.correct_1d(self.sc_cv, z_scalar, h_vec_cv, r_scalar)
+        sc_upd_ca = self.kf_ca.correct_1d(self.sc_ca, z_scalar, h_vec_ca, r_scalar)
+
+        # Update probabilities
+        norm_cv = 1.0 / np.sqrt(2 * np.pi * max(S_cv, 1e-12))
+        likelihood_cv = norm_cv * np.exp(max(-50.0, min(50.0, -0.5 * d_cv)))
+
+        norm_ca = 1.0 / np.sqrt(2 * np.pi * max(S_ca, 1e-12))
+        likelihood_ca = norm_ca * np.exp(max(-50.0, min(50.0, -0.5 * d_ca)))
+
+        Lambda = np.array([likelihood_cv, likelihood_ca])
+        self.mu = Lambda * self.mu
+        self.mu /= np.sum(self.mu) + 1e-12
+
+        self.sc_cv = sc_upd_cv
+        self.sc_ca = sc_upd_ca
+
+        # Re-mix to output combined state
+        x_comb = self._state_cv_to_ca(self.sc_cv.x) * self.mu[0] + self.sc_ca.x * self.mu[1]
+        dx0_comb = self._state_cv_to_ca(self.sc_cv.x) - x_comb
+        dx1_comb = self.sc_ca.x - x_comb
+        P_comb = (
+            self.mu[0] * (self._cov_cv_to_ca(self.sc_cv.P) + np.outer(dx0_comb, dx0_comb))
+            + self.mu[1] * (self.sc_ca.P + np.outer(dx1_comb, dx1_comb))
+        )
         return x_comb, P_comb, self.mu, accepted
 
 
@@ -419,6 +1136,9 @@ class SpatialObservation:
     confidence: float = 0.0
     tf_delta_ns: int = 0
     tf_status: int = TF_STATUS_EXACT
+    depth_valid: bool = False
+    depth_m: float = 0.0
+    depth_sigma_m: float = 0.0
 
 
 @dataclass(eq=False)
@@ -463,6 +1183,35 @@ class TriangulationNode(Node):
         _default_adaptive_cov_max_multiplier = 50.0
         _default_initial_covariance = 10.0
         _default_mahalanobis_threshold = 9.0
+        _default_max_pair_age_sec = 0.25
+        _default_observation_buffer_sec = 1.0
+        _default_triangulation_min_baseline_m = 0.25
+        _default_max_triangulation_error_m = 2.0
+        _default_processing_rate_hz = 100.0
+        _default_publish_evaluation_packets = False
+        _default_pairing_prediction_enabled = False
+        _default_pairing_weight_time = 1.0
+        _default_pairing_weight_geom = 2.0
+        _default_pairing_weight_innov = 3.0
+        _default_pairing_mahalanobis_chi2 = 9.0
+        _default_pairing_log_best_cost = False
+
+        # Depth fusion defaults (for multi-modal triangulation)
+        _default_df_use_range_constraint = True
+        _default_df_range_chi2 = 9.0
+
+        _default_single_obs_max_age_sec = 0.15
+        _default_single_obs_min_confidence = 0.60
+
+        # Observer odometry uncertainty propagation defaults
+        # Reference: Dogancay (2005/2015), Xu et al. (2017), Bishop et al. (2010).
+        _default_use_odom_uncertainty = True
+        _default_odom_fallback_variance = 0.01   # m²: conservative fallback when P_odom not published
+        _default_min_bearing_distance = 0.5      # m:  kept for legacy; WLS bootstrap handles near-range
+        _default_odom_max_age_sec = 0.5          # s:  stale odometry → fall back to pixel-only
+        _default_distance_dependent_noise = True  # WLS: scale visual sigma by d^2
+        _default_odom_max_variance = 1.0          # m²: diagonal clamp on P_odom (protects against sim baro Z~1286)
+
         if _config_path.exists():
             import yaml
             try:
@@ -522,6 +1271,78 @@ class TriangulationNode(Node):
                             _default_mahalanobis_threshold = float(
                                 _ekf.get('kf_mahalanobis_threshold', _default_mahalanobis_threshold)
                             )
+                        if 'triangulation' in _cfg:
+                            _tri = _cfg['triangulation']
+                            _default_max_pair_age_sec = float(
+                                _tri.get('max_pair_age_sec', _default_max_pair_age_sec)
+                            )
+                            _default_observation_buffer_sec = float(
+                                _tri.get('observation_buffer_sec', _default_observation_buffer_sec)
+                            )
+                            _default_triangulation_min_baseline_m = float(
+                                _tri.get('triangulation_min_baseline_m', _default_triangulation_min_baseline_m)
+                            )
+                            _default_max_triangulation_error_m = float(
+                                _tri.get('max_triangulation_error_m', _default_max_triangulation_error_m)
+                            )
+                            _default_processing_rate_hz = float(
+                                _tri.get('processing_rate_hz', _default_processing_rate_hz)
+                            )
+                            _default_publish_evaluation_packets = bool(
+                                _tri.get('publish_evaluation_packets', _default_publish_evaluation_packets)
+                            )
+                            _default_pairing_prediction_enabled = bool(
+                                _tri.get('pairing_prediction_enabled', _default_pairing_prediction_enabled)
+                            )
+                            _default_pairing_weight_time = float(
+                                _tri.get('pairing_weight_time', _default_pairing_weight_time)
+                            )
+                            _default_pairing_weight_geom = float(
+                                _tri.get('pairing_weight_geom', _default_pairing_weight_geom)
+                            )
+                            _default_pairing_weight_innov = float(
+                                _tri.get('pairing_weight_innov', _default_pairing_weight_innov)
+                            )
+                            _default_pairing_mahalanobis_chi2 = float(
+                                _tri.get('pairing_mahalanobis_chi2', _default_pairing_mahalanobis_chi2)
+                            )
+                            _default_pairing_log_best_cost = bool(
+                                _tri.get('pairing_log_best_cost', _default_pairing_log_best_cost)
+                            )
+                            _default_single_obs_max_age_sec = float(
+                                _tri.get('single_obs_max_age_sec', _default_single_obs_max_age_sec)
+                            )
+                            _default_single_obs_min_confidence = float(
+                                _tri.get('single_obs_min_confidence', _default_single_obs_min_confidence)
+                            )
+                        if 'depth_fusion' in _cfg:
+                            _df = _cfg['depth_fusion']
+                            _default_df_use_range_constraint = bool(
+                                _df.get('fusion_use_range_constraint', _default_df_use_range_constraint)
+                            )
+                            _default_df_range_chi2 = float(
+                                _df.get('fusion_range_chi2', _default_df_range_chi2)
+                            )
+                        if 'observer_odom_uncertainty' in _cfg:
+                            _oou = _cfg['observer_odom_uncertainty']
+                            _default_use_odom_uncertainty = bool(
+                                _oou.get('use_odom_uncertainty', _default_use_odom_uncertainty)
+                            )
+                            _default_odom_fallback_variance = float(
+                                _oou.get('odom_fallback_variance', _default_odom_fallback_variance)
+                            )
+                            _default_min_bearing_distance = float(
+                                _oou.get('min_bearing_distance', _default_min_bearing_distance)
+                            )
+                            _default_odom_max_age_sec = float(
+                                _oou.get('odom_max_age_sec', _default_odom_max_age_sec)
+                            )
+                            _default_distance_dependent_noise = bool(
+                                _oou.get('distance_dependent_noise', _default_distance_dependent_noise)
+                            )
+                            _default_odom_max_variance = float(
+                                _oou.get('odom_max_variance', _default_odom_max_variance)
+                            )
             except Exception:
                 pass
 
@@ -534,23 +1355,45 @@ class TriangulationNode(Node):
         self.declare_parameter('triangulation_raw_topic', '/target/triangulation_raw')
         self.declare_parameter('error_vector_topic', '/target/position_error')
         self.declare_parameter('target_frame_id', 'world')
-        self.declare_parameter('max_pair_age_sec', 0.25)
-        self.declare_parameter('observation_buffer_sec', 1.0)
-        self.declare_parameter('triangulation_min_baseline_m', 0.25)
-        self.declare_parameter('max_triangulation_error_m', 2.0)
+        self.declare_parameter('max_pair_age_sec', _default_max_pair_age_sec)
+        self.declare_parameter('observation_buffer_sec', _default_observation_buffer_sec)
+        self.declare_parameter('triangulation_min_baseline_m', _default_triangulation_min_baseline_m)
+        self.declare_parameter('max_triangulation_error_m', _default_max_triangulation_error_m)
         self.declare_parameter('max_target_gt_age_sec', 0.75)
-        self.declare_parameter('processing_rate_hz', 100.0)
+        self.declare_parameter('processing_rate_hz', _default_processing_rate_hz)
+        self.declare_parameter('pairing_prediction_enabled', _default_pairing_prediction_enabled)
+        self.declare_parameter('pairing_weight_time', _default_pairing_weight_time)
+        self.declare_parameter('pairing_weight_geom', _default_pairing_weight_geom)
+        self.declare_parameter('pairing_weight_innov', _default_pairing_weight_innov)
+        self.declare_parameter('pairing_mahalanobis_chi2', _default_pairing_mahalanobis_chi2)
+        self.declare_parameter('pairing_log_best_cost', _default_pairing_log_best_cost)
+        self.declare_parameter('single_obs_max_age_sec', _default_single_obs_max_age_sec)
+        self.declare_parameter('single_obs_min_confidence', _default_single_obs_min_confidence)
+        self.declare_parameter('df_use_range_constraint', _default_df_use_range_constraint)
+        self.declare_parameter('df_range_chi2', _default_df_range_chi2)
+        self.declare_parameter('use_odom_uncertainty', _default_use_odom_uncertainty)
+        self.declare_parameter('odom_fallback_variance', _default_odom_fallback_variance)
+        self.declare_parameter('min_bearing_distance', _default_min_bearing_distance)
+        self.declare_parameter('odom_max_age_sec', _default_odom_max_age_sec)
+        self.declare_parameter('distance_dependent_noise', _default_distance_dependent_noise)
+        self.declare_parameter('odom_max_variance', _default_odom_max_variance)
         self.declare_parameter('tf_timeout_sec', 0.05)
         self.declare_parameter('world_frame_suffix', _world_frame_suffix)
         self.declare_parameter('kf_process_noise_acc', _default_process_noise_acc)
         self.declare_parameter('kf_process_noise_vel', _default_process_noise_vel)
-        self.declare_parameter('imm_transition_prob', _default_imm_transition_prob)
+        self.declare_parameter('imm_transition_prob', _default_imm_transition_prob)  # legacy, unused
+        self.declare_parameter('imm_p_stay_cv', 0.80)       # P(CV→CV): high = strong straight-flight bias
+        self.declare_parameter('imm_p_return_to_cv', 0.30)  # P(CA→CV): high = fast decay of CA after maneuver
         self.declare_parameter('kf_measurement_noise', _default_measurement_noise)
+        # normalize_crlb: True = rescale CRLB trace to 3*kf_measurement_noise (legacy, backward-compat).
+        # False = pass raw Lambda^{-1} to IMM (SOTA; requires CMA-ES re-run with wider Q bounds).
+        self.declare_parameter('normalize_crlb', True)
         self.declare_parameter('kf_adaptive_cov_max_multiplier', _default_adaptive_cov_max_multiplier)
         self.declare_parameter('kf_initial_covariance', _default_initial_covariance)
         self.declare_parameter('kf_mahalanobis_threshold', _default_mahalanobis_threshold)
         self.declare_parameter('kf_prediction_horizon_sec', 1.0)
         self.declare_parameter('kf_prediction_steps', 25)
+        self.declare_parameter('publish_evaluation_packets', _default_publish_evaluation_packets)
         self.declare_parameter('publish_rviz_markers', _default_publish_markers)
         self.declare_parameter('publish_debug_annotated_image', _default_publish_debug_annotated)
         self.declare_parameter('observer1_image_topic', _observer1_image_topic)
@@ -578,13 +1421,37 @@ class TriangulationNode(Node):
         self.world_frame_suffix = str(self.get_parameter('world_frame_suffix').value)
         self.kf_process_noise_acc = float(self.get_parameter('kf_process_noise_acc').value)
         self.kf_process_noise_vel = float(self.get_parameter('kf_process_noise_vel').value)
-        self.imm_transition_prob = float(self.get_parameter('imm_transition_prob').value)
+        self.imm_transition_prob = float(self.get_parameter('imm_transition_prob').value)  # legacy
+        self.imm_p_stay_cv = float(self.get_parameter('imm_p_stay_cv').value)
+        self.imm_p_return_to_cv = float(self.get_parameter('imm_p_return_to_cv').value)
         self.kf_measurement_noise = float(self.get_parameter('kf_measurement_noise').value)
+        # normalize_crlb: controls whether the raw CRLB (inv(Lambda)) is rescaled to
+        # trace=3*kf_measurement_noise (True, legacy) or passed unchanged to the IMM (False, SOTA).
+        # Set to False only after re-running CMA-ES with wider Q bounds and without
+        # kf_measurement_noise in the optimisation vector.
+        self.normalize_crlb = bool(self.get_parameter('normalize_crlb').value)
         self.kf_adaptive_cov_max_multiplier = float(self.get_parameter('kf_adaptive_cov_max_multiplier').value)
         self.kf_initial_covariance = float(self.get_parameter('kf_initial_covariance').value)
         self.kf_mahalanobis_threshold = float(self.get_parameter('kf_mahalanobis_threshold').value)
         self.kf_prediction_horizon_sec = float(self.get_parameter('kf_prediction_horizon_sec').value)
         self.kf_prediction_steps = max(5, int(self.get_parameter('kf_prediction_steps').value))
+        self.pairing_prediction_enabled = bool(self.get_parameter('pairing_prediction_enabled').value)
+        self.pairing_weight_time = float(self.get_parameter('pairing_weight_time').value)
+        self.pairing_weight_geom = float(self.get_parameter('pairing_weight_geom').value)
+        self.pairing_weight_innov = float(self.get_parameter('pairing_weight_innov').value)
+        self.pairing_mahalanobis_chi2 = float(self.get_parameter('pairing_mahalanobis_chi2').value)
+        self.pairing_log_best_cost = bool(self.get_parameter('pairing_log_best_cost').value)
+        self.single_obs_max_age_ns = int(float(self.get_parameter('single_obs_max_age_sec').value) * 1_000_000_000.0)
+        self.single_obs_min_confidence = float(self.get_parameter('single_obs_min_confidence').value)
+        self.df_use_range_constraint = bool(self.get_parameter('df_use_range_constraint').value)
+        self.df_range_chi2 = float(self.get_parameter('df_range_chi2').value)
+        self.use_odom_uncertainty = bool(self.get_parameter('use_odom_uncertainty').value)
+        self.odom_fallback_variance = float(self.get_parameter('odom_fallback_variance').value)
+        self.min_bearing_distance = float(self.get_parameter('min_bearing_distance').value)
+        self.odom_max_age_ns = int(float(self.get_parameter('odom_max_age_sec').value) * 1_000_000_000.0)
+        self.distance_dependent_noise = bool(self.get_parameter('distance_dependent_noise').value)
+        self.odom_max_variance = float(self.get_parameter('odom_max_variance').value)
+        self.publish_evaluation_packets = bool(self.get_parameter('publish_evaluation_packets').value)
         self.publish_rviz_markers = bool(self.get_parameter('publish_rviz_markers').value)
         self.publish_debug_annotated_image = bool(self.get_parameter('publish_debug_annotated_image').value)
         self.observer1_image_topic = str(self.get_parameter('observer1_image_topic').value) or f'/{self.observer1_name}/rgb/image_raw'
@@ -629,14 +1496,21 @@ class TriangulationNode(Node):
         }
         self.debug_camera_info: Dict[str, CameraInfo] = {}
 
-        # IMM Transition Probability Matrix (Markov Chain)
-        # We define an asymmetric matrix to bias the filter towards Constant Velocity (CV).
-        # This rigorously models the prior that drones fly straight most of the time,
-        # and accelerations are brief maneuvers.
-        # [CV -> CV, CV -> CA]
-        # [CA -> CV, CA -> CA]
-        p_stay_cv = 0.85  # CV retention: moderate bias toward straight flight
-        p_return_to_cv = 0.10  # CA retention: once in CA, stay there to track the full maneuver
+        # IMM Transition Probability Matrix (Markov Chain) — configurable from runtime_stack.yaml
+        # [CV→CV, CV→CA]
+        # [CA→CV, CA→CA]
+        #
+        # imm_p_stay_cv (default 0.80):
+        #   Probability of remaining in CV (straight-flight) model.
+        #   Lower = CA activates faster at braking onset.
+        #   Too low (<0.60) = jittery acceleration, noisy straight flight.
+        #
+        # imm_p_return_to_cv (default 0.30):
+        #   Probability of CA decaying back to CV after a maneuver.
+        #   Higher = CA fades faster; lower = CA persists longer through turns.
+        #   Too low (<0.15) = filter "locks on" to ghost acceleration after curves.
+        p_stay_cv = self.imm_p_stay_cv
+        p_return_to_cv = self.imm_p_return_to_cv
         pi = np.array(
             [
                 [p_stay_cv, 1.0 - p_stay_cv],
@@ -658,6 +1532,13 @@ class TriangulationNode(Node):
         self.target_gt_odom: Optional[Odometry] = None
         self.last_error_log_time = time.time()
 
+        # Observer odometry for position uncertainty propagation into R.
+        # Populated by _observer{1,2}_odom_callback; None when not yet received.
+        self._observer1_odom: Optional[Odometry] = None
+        self._observer1_odom_stamp_ns: int = 0
+        self._observer2_odom: Optional[Odometry] = None
+        self._observer2_odom_stamp_ns: int = 0
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.bridge = CvBridge() if self.publish_debug_annotated_image else None
@@ -667,9 +1548,14 @@ class TriangulationNode(Node):
         self.estimated_position_pub = self.create_publisher(Vector3Stamped, self.estimated_position_topic, 10)
         self.triangulation_raw_pub = self.create_publisher(PointStamped, self.triangulation_raw_topic, 10)
         self.error_vector_pub = self.create_publisher(Vector3Stamped, self.error_vector_topic, 10)
+        self.triangulation_evaluation_pub = None
+        if self.publish_evaluation_packets:
+            self.triangulation_evaluation_pub = self.create_publisher(String, '/target/triangulation_evaluation', 10)
         self.predicted_trajectory_pub = self.create_publisher(Path, '/target/predicted_trajectory', 10)
         self.trajectory_markers_pub = self.create_publisher(MarkerArray, '/target/predicted_trajectory_markers', 10)
         self.position_markers_pub = self.create_publisher(MarkerArray, '/target/position_markers', 10)
+        self.fusion_mode_pub = self.create_publisher(String, '/tracker/fusion_mode', 10)
+        self.last_fusion_mode = "UNINITIALIZED"
         self.observer1_debug_annotated_pub = None
         if self.publish_debug_annotated_image:
             self.observer1_debug_annotated_pub = self.create_publisher(
@@ -679,6 +1565,38 @@ class TriangulationNode(Node):
             )
 
         self.create_subscription(Odometry, self.target_gt_odom_topic, self.target_gt_odom_callback, 20)
+
+        # ── Observer odometry subscribers (for pose uncertainty propagation) ────
+        # Topic pattern mirrors the MRS UAV System standard: /{uav_name}/estimation_manager/odom_main
+        # QoS BEST_EFFORT to match the drone's odometry publisher (avoids queue backpressure).
+        if self.use_odom_uncertainty:
+            _odom_qos = QoSProfile(
+                depth=5,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Odometry,
+                f'/{self.observer1_name}/estimation_manager/odom_main',
+                self._observer1_odom_callback,
+                _odom_qos,
+            )
+            self.create_subscription(
+                Odometry,
+                f'/{self.observer2_name}/estimation_manager/odom_main',
+                self._observer2_odom_callback,
+                _odom_qos,
+            )
+            self.get_logger().info(
+                f'Observer odometry uncertainty enabled. '
+                f'Subscribing to /{self.observer1_name}/estimation_manager/odom_main '
+                f'and /{self.observer2_name}/estimation_manager/odom_main'
+            )
+        else:
+            self.get_logger().info(
+                'Observer odometry uncertainty DISABLED (use_odom_uncertainty=false). '
+                'R computed from pixel noise only.'
+            )
 
         _measurement_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
         self.observer1_measurement_sub = self.create_subscription(
@@ -724,6 +1642,12 @@ class TriangulationNode(Node):
         self.create_timer(1.0 / self.processing_rate_hz, self.processing_timer_callback)
 
         self.get_logger().info('Triangulation node initialization complete.')
+        pairing_mode = 'prediction-guided' if self.pairing_prediction_enabled else 'timestamp-only'
+        self.get_logger().info(
+            f'Ray pairing mode: {pairing_mode} '
+            f'(w_t={self.pairing_weight_time:.2f}, w_g={self.pairing_weight_geom:.2f}, '
+            f'w_i={self.pairing_weight_innov:.2f})'
+        )
         self.get_logger().info(f'Observer 1 topic: {self.observer1_observation_topic}')
         self.get_logger().info(f'Observer 2 topic: {self.observer2_observation_topic}')
         self.get_logger().info(f'Observer 1 camera info topic: {self.observer1_camera_info_topic}')
@@ -737,6 +1661,64 @@ class TriangulationNode(Node):
 
     def target_gt_odom_callback(self, msg: Odometry) -> None:
         self.target_gt_odom = msg
+
+    def _observer1_odom_callback(self, msg: Odometry) -> None:
+        """Cache the latest odometry of observer 1 for position uncertainty propagation.
+
+        Only invoked when ``use_odom_uncertainty=True``.  The message is stored
+        alongside its ROS timestamp (nanoseconds) so that staleness can be checked
+        at triangulation time without TF involvement.
+        """
+        self._observer1_odom = msg
+        self._observer1_odom_stamp_ns = stamp_to_ns(msg.header.stamp)
+
+    def _observer2_odom_callback(self, msg: Odometry) -> None:
+        """Cache the latest odometry of observer 2 for position uncertainty propagation.
+
+        Mirrors :meth:`_observer1_odom_callback`.
+        """
+        self._observer2_odom = msg
+        self._observer2_odom_stamp_ns = stamp_to_ns(msg.header.stamp)
+
+    def _get_observer_position_covariance(
+        self,
+        odom: Optional[Odometry],
+        odom_stamp_ns: int,
+        query_stamp_ns: int,
+        observer_label: str,
+    ) -> Optional[np.ndarray]:
+        """Return the 3x3 position covariance for one observer, or None if unavailable.
+
+        Freshness check: if the cached odometry is older than ``odom_max_age_ns``
+        relative to the bearing measurement timestamp, we do NOT trust it and
+        fall back to pixel-only noise (returns None).
+
+        Args:
+            odom:             Latest cached Odometry message (may be None).
+            odom_stamp_ns:    ROS timestamp of the cached message (nanoseconds).
+            query_stamp_ns:   Timestamp of the triangulation measurement (nanoseconds).
+            observer_label:   Human-readable name for log throttling.
+
+        Returns:
+            3x3 position covariance ndarray, or None.
+        """
+        if odom is None:
+            return None
+        age_ns = abs(query_stamp_ns - odom_stamp_ns)
+        if age_ns > self.odom_max_age_ns:
+            self.get_logger().warn(
+                f'\033[33m[odom_uncertainty] {observer_label} odometry stale '
+                f'({age_ns / 1e6:.1f} ms > {self.odom_max_age_ns / 1e6:.1f} ms); '
+                'falling back to pixel-only covariance.\033[0m',
+                throttle_duration_sec=2.0,
+            )
+            return None
+        return extract_position_covariance(
+            odom,
+            fallback_variance=self.odom_fallback_variance,
+            logger=self.get_logger(),
+            observer_label=observer_label
+        )
 
     def observer1_measurement_callback(self, msg: UInt8MultiArray) -> None:
         """Process frozen observer1 measurements published as compact packets."""
@@ -992,7 +1974,7 @@ class TriangulationNode(Node):
             )
             return
 
-        stamp_ns, observation_id, confidence, origin, ray_raw, tf_delta_ns, tf_status = packet
+        stamp_ns, observation_id, confidence, origin, ray_raw, tf_delta_ns, tf_status, depth_valid, depth_m, depth_sigma_m = packet
         if abs(tf_delta_ns) > self.max_tf_delta_ns:
             self.get_logger().warn(
                 f'Ignoring {source_name} observation with TF delta {tf_delta_ns / 1e6:.1f} ms '
@@ -1017,6 +1999,9 @@ class TriangulationNode(Node):
             confidence=confidence,
             tf_delta_ns=tf_delta_ns,
             tf_status=tf_status,
+            depth_valid=depth_valid,
+            depth_m=depth_m,
+            depth_sigma_m=depth_sigma_m,
         )
         obs = self._transform_observation_to_target_frame(obs)
         if obs is None:
@@ -1025,7 +2010,12 @@ class TriangulationNode(Node):
         self.debug_observations[source_name].append(obs)
         buffer.append(obs)
         self._prune_stale_observations(stamp_ns)
-        self.try_match_and_triangulate()
+        # Stereo triangulation is event-driven: attempt a match every time a new
+        # observation arrives.  This is the correct approach because it minimises
+        # latency and avoids the race-condition where the timer fires between the
+        # arrival of obs1 and obs2 (leaving one buffer empty at match-time).
+        if self.try_match_and_triangulate():
+            self._publish_fusion_mode()
         self._try_publish_debug_image(source_name, stamp_ns)
 
     def _transform_observation_to_target_frame(self, obs: SpatialObservation) -> Optional[SpatialObservation]:
@@ -1041,6 +2031,9 @@ class TriangulationNode(Node):
                 confidence=obs.confidence,
                 tf_delta_ns=obs.tf_delta_ns,
                 tf_status=obs.tf_status,
+                depth_valid=obs.depth_valid,
+                depth_m=obs.depth_m,
+                depth_sigma_m=obs.depth_sigma_m,
             )
 
         if self._shares_common_world_origin(obs.frame_id):
@@ -1054,6 +2047,9 @@ class TriangulationNode(Node):
                 confidence=obs.confidence,
                 tf_delta_ns=obs.tf_delta_ns,
                 tf_status=obs.tf_status,
+                depth_valid=obs.depth_valid,
+                depth_m=obs.depth_m,
+                depth_sigma_m=obs.depth_sigma_m,
             )
 
         try:
@@ -1096,6 +2092,9 @@ class TriangulationNode(Node):
             confidence=obs.confidence,
             tf_delta_ns=obs.tf_delta_ns,
             tf_status=obs.tf_status,
+            depth_valid=obs.depth_valid,
+            depth_m=obs.depth_m,
+            depth_sigma_m=obs.depth_sigma_m,
         )
 
     def _prune_stale_observations(self, reference_stamp_ns: Optional[int] = None) -> None:
@@ -1118,41 +2117,180 @@ class TriangulationNode(Node):
             self.debug_matched_pairs.popleft()
 
     def processing_timer_callback(self) -> None:
+        """Timer callback: handles single-ray fallback and coasting only.
+
+        Stereo triangulation is intentionally event-driven (triggered on every
+        incoming observation).  The timer exists solely for two purposes:
+          1. Single RGB-D fallback  - when stereo pairing cannot be formed but
+             at least one observer has a fresh, valid depth measurement.
+          2. Coasting               - pure kinematic prediction when no sensor
+             data is available at all.
+
+        This separation eliminates the race condition where the timer fires
+        between the arrival of obs1 and obs2 from the two cameras, which would
+        cause try_match_and_triangulate() to see an empty buffer and
+        prematurely fall through to Single-Ray or Coast.
+        """
         now_ns = self.get_clock().now().nanoseconds
         self._prune_stale_observations(now_ns)
 
-        if self.imm_initialized and self.imm_last_stamp_ns is not None:
-            dt_since = (now_ns - self.imm_last_stamp_ns) / 1e9
-            if dt_since > 0.2:
-                self._coast_predict(now_ns)
+        # Guard: if stereo has fired very recently, the filter is healthy —
+        # skip fallback evaluation to avoid double-updating.
+        if self.imm_last_stamp_ns is not None:
+            dt_since_last = (now_ns - self.imm_last_stamp_ns) / 1e9
+        else:
+            dt_since_last = float('inf')
 
-    def try_match_and_triangulate(self) -> None:
-        """Greedily pair the closest timestamps from the two observer buffers and triangulate them."""
-        while self.observer1_observations and self.observer2_observations:
-            best_obs1 = None
-            best_obs2 = None
-            best_diff = self.max_pair_age_ns + 1
+        # Only evaluate fallback if we have not received a stereo update recently.
+        # 0.05 s ≈ half a camera frame at 30 Hz — tight enough to catch genuine
+        # dropouts without masking a momentarily delayed stereo pair.
+        if dt_since_last < 0.05:
+            return
 
-            for obs1 in self.observer1_observations:
-                for obs2 in self.observer2_observations:
-                    diff = abs(obs1.stamp_ns - obs2.stamp_ns)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_obs1 = obs1
-                        best_obs2 = obs2
+        # Priority 2: SINGLE RGB-D FALLBACK
+        best_obs = None
+        for buffer in (self.observer1_observations, self.observer2_observations):
+            for obs in reversed(buffer):
+                if obs.depth_valid and obs.confidence >= self.single_obs_min_confidence:
+                    age_ns = abs(now_ns - obs.stamp_ns)
+                    if age_ns <= self.single_obs_max_age_ns:
+                        if best_obs is None or obs.stamp_ns > best_obs.stamp_ns:
+                            best_obs = obs
 
-            if best_obs1 is None or best_obs2 is None or best_diff > self.max_pair_age_ns:
+        if best_obs is not None:
+            if self.execute_single_observation_fusion(best_obs, best_obs.stamp_ns):
+                self._publish_fusion_mode()
                 return
 
+        # Priority 3: COAST — only when no sensor data is available at all.
+        if self.imm_initialized and self.imm_last_stamp_ns is not None:
+            if dt_since_last > 0.05:
+                self._coast_predict(now_ns)
+                self.last_fusion_mode = "COAST"
+                self._publish_fusion_mode()
+                
+    def _publish_fusion_mode(self) -> None:
+        msg = String()
+        msg.data = self.last_fusion_mode
+        self.fusion_mode_pub.publish(msg)
+
+    def _predict_position_at_stamp_ns(self, stamp_ns: int) -> np.ndarray:
+        """Extrapolate the filtered target position to an arbitrary timestamp."""
+        if not self.imm_initialized or self.imm_last_stamp_ns is None:
+            return self.filtered_position.copy()
+
+        dt = (stamp_ns - self.imm_last_stamp_ns) / 1e9
+        return (
+            self.filtered_position
+            + self.filtered_velocity * dt
+            + 0.5 * self.filtered_acceleration * dt * dt
+        )
+
+    def _select_best_observation_pair(
+        self,
+    ) -> Optional[Tuple[SpatialObservation, SpatialObservation, int]]:
+        """Pick one feasible observer pair using legacy or prediction-guided association."""
+        if not self.pairing_prediction_enabled:
+            return select_timestamp_only_pair(
+                list(self.observer1_observations),
+                list(self.observer2_observations),
+                self.max_pair_age_ns,
+            )
+
+        best_obs1 = None
+        best_obs2 = None
+        best_diff = self.max_pair_age_ns + 1
+        best_cost = float('inf')
+        best_geom = float('inf')
+        best_score: Optional[PredictionGuidedPairScore] = None
+
+        for obs1 in self.observer1_observations:
+            for obs2 in self.observer2_observations:
+                pair_diff_ns = abs(obs1.stamp_ns - obs2.stamp_ns)
+                if pair_diff_ns > self.max_pair_age_ns:
+                    continue
+
+                aligned_obs1, aligned_obs2, aligned_stamp_ns = self._time_align_observations(obs1, obs2)
+                x_pred = self._predict_position_at_stamp_ns(aligned_stamp_ns)
+                P_pred_pos = self.combined_cov[:3, :3] if self.imm_initialized else None
+                score = score_prediction_guided_pair(
+                    aligned_obs1.origin,
+                    aligned_obs1.ray,
+                    aligned_obs2.origin,
+                    aligned_obs2.ray,
+                    pair_diff_ns,
+                    self.max_pair_age_ns,
+                    self.max_triangulation_error_m,
+                    self.triangulation_min_baseline_m,
+                    self.kf_measurement_noise,
+                    x_pred,
+                    P_pred_pos,
+                    self.pairing_weight_time,
+                    self.pairing_weight_geom,
+                    self.pairing_weight_innov,
+                    self.pairing_mahalanobis_chi2,
+                    self.imm_initialized,
+                )
+                if score is None:
+                    continue
+
+                if (
+                    score.cost < best_cost
+                    or (
+                        abs(score.cost - best_cost) <= 1e-12
+                        and pair_diff_ns < best_diff
+                    )
+                    or (
+                        abs(score.cost - best_cost) <= 1e-12
+                        and pair_diff_ns == best_diff
+                        and score.ray_gap_m < best_geom
+                    )
+                ):
+                    best_cost = score.cost
+                    best_geom = score.ray_gap_m
+                    best_diff = pair_diff_ns
+                    best_obs1 = obs1
+                    best_obs2 = obs2
+                    best_score = score
+
+        if best_obs1 is None or best_obs2 is None:
+            return None
+
+        if self.pairing_log_best_cost and best_score is not None:
+            self.get_logger().info(
+                'Prediction-guided pair selected: '
+                f'J={best_score.cost:.3f} '
+                f'(c_t={best_score.time_term:.3f}, c_g={best_score.geom_term:.3f}, '
+                f'c_i={best_score.innov_term:.3f}, gap={best_score.ray_gap_m:.3f} m, '
+                f'dt={best_diff / 1e6:.1f} ms)',
+                throttle_duration_sec=1.0,
+            )
+
+        return best_obs1, best_obs2, best_diff
+
+    def try_match_and_triangulate(self) -> bool:
+        """Pair observer rays from both buffers and triangulate accepted matches."""
+        executed = False
+        all_pairs = []
+        
+        while self.observer1_observations and self.observer2_observations:
+            selection = self._select_best_observation_pair()
+            if selection is None:
+                break
+
+            best_obs1, best_obs2, best_diff = selection
             self.observer1_observations.remove(best_obs1)
             self.observer2_observations.remove(best_obs2)
+            all_pairs.append((best_obs1, best_obs2, best_diff))
 
+        # Sort pairs by aligned timestamp to ensure strictly forward-in-time updates
+        all_pairs.sort(key=lambda x: max(x[0].stamp_ns, x[1].stamp_ns))
+
+        for best_obs1, best_obs2, best_diff in all_pairs:
             aligned_obs1, aligned_obs2, aligned_stamp_ns = self._time_align_observations(best_obs1, best_obs2)
             accepted = self.execute_triangulation(
-                aligned_obs1.origin,
-                aligned_obs1.ray,
-                aligned_obs2.origin,
-                aligned_obs2.ray,
+                aligned_obs1,
+                aligned_obs2,
                 aligned_stamp_ns,
             )
             self.debug_matched_pairs.append(
@@ -1167,6 +2305,11 @@ class TriangulationNode(Node):
                 )
             )
             self._try_publish_debug_image(self.observer1_name, best_obs1.stamp_ns)
+            if accepted:
+                self.last_fusion_mode = "STEREO"
+                executed = True
+                
+        return executed
 
     def _time_align_observations(
         self,
@@ -1197,6 +2340,9 @@ class TriangulationNode(Node):
                 confidence=obs.confidence,
                 tf_delta_ns=obs.tf_delta_ns,
                 tf_status=obs.tf_status,
+                depth_valid=obs.depth_valid,
+                depth_m=obs.depth_m,
+                depth_sigma_m=obs.depth_sigma_m,
             )
 
         dt = (target_stamp_ns - obs.stamp_ns) / 1e9
@@ -1211,77 +2357,151 @@ class TriangulationNode(Node):
             confidence=obs.confidence,
             tf_delta_ns=obs.tf_delta_ns,
             tf_status=obs.tf_status,
+            depth_valid=obs.depth_valid,
+            depth_m=obs.depth_m,
+            depth_sigma_m=obs.depth_sigma_m,
         )
 
-    def execute_triangulation(
+    def execute_single_observation_fusion(
         self,
-        origin1: np.ndarray,
-        dir1: np.ndarray,
-        origin2: np.ndarray,
-        dir2: np.ndarray,
+        obs: SpatialObservation,
         stamp_ns: int,
     ) -> bool:
-        """Triangulate one matched pair, reject weak geometry, and feed the accepted point into the IMM."""
-        baseline = float(np.linalg.norm(origin2 - origin1))
-        if baseline < self.triangulation_min_baseline_m:
-            return False
+        """Fuse a single RGB-D observation into the IMM using anisotropic covariance."""
+        measurement_3d = obs.origin + obs.ray * obs.depth_m
+        R_single = compute_single_ray_measurement_covariance(
+            obs.ray,
+            obs.depth_m,
+            obs.depth_sigma_m,
+            self.kf_measurement_noise,
+        )
 
-        midpoint, error = triangulate_midpoint(origin1, dir1, origin2, dir2)
-        if error > self.max_triangulation_error_m:
-            self.get_logger().warn(
-                f'Triangulation rejected: ray mismatch {error:.2f} m exceeds {self.max_triangulation_error_m:.2f} m'
-            )
-            return False
+        if not self.imm_initialized:
+            self.imm.initialize(measurement_3d, self.kf_initial_covariance * 4.0)
+            self.imm_initialized = True
+            self.imm_last_stamp_ns = stamp_ns
+            self.combined_cov = np.eye(9) * self.kf_initial_covariance * 4.0
+            self.filtered_position = measurement_3d.copy()
+            self.filtered_velocity = np.zeros(3)
+            self.filtered_acceleration = np.zeros(3)
+        else:
+            dt = (stamp_ns - self.imm_last_stamp_ns) / 1_000_000_000.0
+            if dt > 0.0:
+                Q_cv = build_process_noise_cv(dt, self.kf_process_noise_vel)
+                Q_ca = build_process_noise_ca(dt, self.kf_process_noise_acc)
+                x_comb, self.combined_cov, self.imm_probs, accepted, _ = self.imm.predict_and_correct(
+                    dt,
+                    Q_cv,
+                    Q_ca,
+                    measurement_3d,
+                    R_single,
+                    mahalanobis_thresh=self.kf_mahalanobis_threshold,
+                )
 
-        measurement = midpoint
+                if not accepted:
+                    self.get_logger().warn(
+                        'Single-ray measurement rejected by Mahalanobis gating! Filter coasting.'
+                    )
+                    return False
+
+                self.filtered_position = x_comb[:3].copy()
+                self.filtered_velocity = x_comb[3:6].copy()
+                self.filtered_acceleration = x_comb[6:9].copy()
+
+        self.imm_last_stamp_ns = stamp_ns
+        self.last_fusion_mode = "SINGLE_DEPTH"
 
         raw_msg = PointStamped()
         raw_msg.header.frame_id = self.target_frame_id
         raw_msg.header.stamp.sec = stamp_ns // 1_000_000_000
         raw_msg.header.stamp.nanosec = stamp_ns % 1_000_000_000
-        raw_msg.point.x = float(midpoint[0])
-        raw_msg.point.y = float(midpoint[1])
-        raw_msg.point.z = float(midpoint[2])
+        raw_msg.point.x = float(measurement_3d[0])
+        raw_msg.point.y = float(measurement_3d[1])
+        raw_msg.point.z = float(measurement_3d[2])
         self.triangulation_raw_pub.publish(raw_msg)
+        
+        return True
 
-        # ---------------------------------------------------------------------
-        # Analytic Cartesian Covariance Projection (Information Matrix Method)
-        # Instead of feeding the filter a generic spherical noise or an empirical
-        # stretched ellipsoid, we compute the exact 3D Cartesian covariance of the 
-        # triangulated point using the sum of the Fisher Information Matrices of the rays.
-        # This elegantly maps 2D angular uncertainty into a highly anisotropic 3D 
-        # ellipsoid that accurately scales with both baseline angle AND distance squared.
-        # ---------------------------------------------------------------------
-        d1 = float(max(np.linalg.norm(midpoint - origin1), 0.1))
-        d2 = float(max(np.linalg.norm(midpoint - origin2), 0.1))
-        
-        # Convert the Cartesian measurement noise parameter to angular variance.
-        # kf_measurement_noise is calibrated as a spatial variance (m²) at some
-        # nominal operating distance. We recover the implicit angular variance
-        # by dividing by the geometric mean distance squared, so that at the
-        # current operating distances the lateral R entries stay consistent
-        # with the original parameter intent.
-        d_ref = max(np.sqrt(d1 * d2), 0.5)
-        angular_var = max(self.kf_measurement_noise / (d_ref ** 2), 1e-8)
-        
-        # Spatial variance perpendicular to each ray grows with distance squared
-        var1 = (d1 ** 2) * angular_var
-        var2 = (d2 ** 2) * angular_var
-        
-        # Information matrices (inverse covariance) for each ray
-        # A ray provides no information along its direction (hence I - d*d^T)
-        proj1 = np.eye(3) - np.outer(dir1, dir1)
-        proj2 = np.eye(3) - np.outer(dir2, dir2)
-        info1 = proj1 / var1
-        info2 = proj2 / var2
-        
+    def execute_triangulation(
+        self,
+        obs1: SpatialObservation,
+        obs2: SpatialObservation,
+        stamp_ns: int,
+    ) -> bool:
+        """Triangulate one matched pair, reject weak geometry, and feed the accepted point into the IMM."""
+        origin1 = obs1.origin
+        dir1 = obs1.ray
+        origin2 = obs2.origin
+        dir2 = obs2.ray
+
+        baseline = float(np.linalg.norm(origin2 - origin1))
+        if baseline < self.triangulation_min_baseline_m:
+            return False
+
+        # ── Geometry pre-check (still uses midpoint for the ray-gap test) ────
+        # We keep the cheap midpoint solely to gate on max_triangulation_error_m.
+        # The WLS call below provides the true MLE estimate and covariance.
+        midpoint_check, ray_gap_m = triangulate_midpoint(origin1, dir1, origin2, dir2)
+        if ray_gap_m > self.max_triangulation_error_m:
+            self.get_logger().warn(
+                f'Triangulation rejected: ray mismatch {ray_gap_m:.2f} m exceeds {self.max_triangulation_error_m:.2f} m'
+            )
+            return False
+
+        # ── Observer odometry covariance (for WLS EIV model) ─────────────────
+        # When use_odom_uncertainty=True, P_odom_i is fetched and clamped
+        # inside triangulate_wls (odom_max_variance). This prevents the
+        # barometric Z-blowup (sim: sigma_z ~ 35 m) from inflating R.
+        # Reference: Dogancay (2015) Sec. II; Xu et al. (2017) Sec. III.
+        P_odom1: Optional[np.ndarray] = None
+        P_odom2: Optional[np.ndarray] = None
+        if self.use_odom_uncertainty:
+            P_odom1 = self._get_observer_position_covariance(
+                self._observer1_odom,
+                self._observer1_odom_stamp_ns,
+                stamp_ns,
+                self.observer1_name,
+            )
+            P_odom2 = self._get_observer_position_covariance(
+                self._observer2_odom,
+                self._observer2_odom_stamp_ns,
+                stamp_ns,
+                self.observer2_name,
+            )
+
+        # ── Optimal WLS triangulation (MLE + CRLB covariance) ────────────────
+        # triangulate_wls() jointly solves for p_hat and R_out in one pass.
+        # R_out = Lambda^{-1} is the Cramér-Rao Lower Bound for this geometry
+        # and is passed directly as R_k to the IMM-KF measurement update.
+        #
+        # IV-WLS: Pass the filtered position to break the Pseudo-Linear Estimator bias
+        prior_pos = self.filtered_position if self.imm_initialized else None
+
         try:
-            # The 3D Covariance is the inverse of the Total Information Matrix
-            R = np.linalg.inv(info1 + info2)
-        except np.linalg.LinAlgError:
-            # Fallback for perfectly collinear rays
-            R = np.eye(3) * (var1 + var2) * 10.0
-        # ---------------------------------------------------------------------
+            measurement, R = triangulate_wls(
+                origin1, dir1, P_odom1,
+                origin2, dir2, P_odom2,
+                var_px=self.kf_measurement_noise,
+                use_odom_uncertainty=self.use_odom_uncertainty,
+                distance_dependent_noise=self.distance_dependent_noise,
+                odom_max_variance=self.odom_max_variance,
+                prior_target_pos=prior_pos,
+                normalize_crlb=self.normalize_crlb,
+                logger=self.get_logger(),
+            )
+        except ValueError as exc:
+            self.get_logger().warn(str(exc), throttle_duration_sec=2.0)
+            return False
+
+        # Publish raw WLS estimate (MLE, before IMM smoothing)
+        raw_msg = PointStamped()
+        raw_msg.header.frame_id = self.target_frame_id
+        raw_msg.header.stamp.sec = stamp_ns // 1_000_000_000
+        raw_msg.header.stamp.nanosec = stamp_ns % 1_000_000_000
+        raw_msg.point.x = float(measurement[0])
+        raw_msg.point.y = float(measurement[1])
+        raw_msg.point.z = float(measurement[2])
+        self.triangulation_raw_pub.publish(raw_msg)
 
         if not self.imm_initialized:
             self.imm.initialize(measurement, self.kf_initial_covariance)
@@ -1296,7 +2516,8 @@ class TriangulationNode(Node):
             if dt > 0.0:
                 Q_cv = build_process_noise_cv(dt, self.kf_process_noise_vel)
                 Q_ca = build_process_noise_ca(dt, self.kf_process_noise_acc)
-                x_comb, self.combined_cov, self.imm_probs, accepted = self.imm.predict_and_correct(
+
+                x_comb, self.combined_cov, self.imm_probs, accepted, _ = self.imm.predict_and_correct(
                     dt,
                     Q_cv,
                     Q_ca,
@@ -1309,10 +2530,53 @@ class TriangulationNode(Node):
                     self.get_logger().warn(
                         'Outlier measurement rejected by Mahalanobis gating! Filter coasting purely on kinetics.'
                     )
+                
+                # --- SEQUENTIAL 1D DEPTH FUSION ---
+                if accepted and self.df_use_range_constraint:
+                    for obs in (obs1, obs2):
+                        if obs.depth_valid and obs.depth_m > 0:
+                            # The target vector from camera to the currently estimated target position
+                            # in world coordinates.
+                            diff = x_comb[:3] - obs.origin
+                            dist = float(np.linalg.norm(diff))
+                            if dist > 0.1:
+                                h_pos = diff / dist
+                                
+                                h_cv = np.zeros(6, dtype=np.float64)
+                                h_cv[:3] = h_pos
+                                
+                                h_ca = np.zeros(9, dtype=np.float64)
+                                h_ca[:3] = h_pos
+                                
+                                z_1d = obs.depth_m
+                                r_1d = obs.depth_sigma_m ** 2
+                                
+                                x_comb, self.combined_cov, self.imm_probs, depth_accepted = self.imm.correct_1d(
+                                    z_scalar=z_1d,
+                                    h_vec_cv=h_cv,
+                                    h_vec_ca=h_ca,
+                                    r_scalar=r_1d,
+                                    chi2_thresh=self.df_range_chi2,
+                                )
+                                
+                                if not depth_accepted:
+                                    self.get_logger().warn(
+                                        f'Depth constraint rejected by Mahalanobis gating! '
+                                        f'(z={z_1d:.2f}m, expected={dist:.2f}m)'
+                                    )
 
                 self.filtered_position = x_comb[:3].copy()
                 self.filtered_velocity = x_comb[3:6].copy()
                 self.filtered_acceleration = x_comb[6:9].copy()
+                
+                # Clamp velocity to max limits (e.g., F450 limit 10m/s)
+                speed = np.linalg.norm(self.filtered_velocity)
+                if speed > 10.0:
+                    self.filtered_velocity = (self.filtered_velocity / speed) * 10.0
+                    self.imm.sc_cv.x[3:6] = self.filtered_velocity
+                    self.imm.sc_ca.x[3:6] = self.filtered_velocity
+                    x_comb[3:6] = self.filtered_velocity
+                    
                 self.imm_last_stamp_ns = stamp_ns
 
                 cov_trace = float(np.trace(self.combined_cov))
@@ -1334,27 +2598,64 @@ class TriangulationNode(Node):
             stamp_ns,
         )
         self.publish_ground_truth_error(self.filtered_position, stamp_ns)
+
+        # Publish evaluation packet for CMA-ES offline tuning
+        if self.triangulation_evaluation_pub is not None:
+            payload = {
+                'schema_version': 1,
+                'frame_stamp_ns': stamp_ns,
+                'triangulation_residual_m': 0.0,
+                'num_observers': 2,
+                'estimated_position_xyz': self.filtered_position.tolist(),
+                'estimated_velocity_xyz': self.filtered_velocity.tolist(),
+                'covariance_6x6': self.combined_cov[:6, :6].tolist(),
+            }
+            packet_msg = String()
+            packet_msg.data = json.dumps(payload, separators=(',', ':'), ensure_ascii=True)
+            self.triangulation_evaluation_pub.publish(packet_msg)
+
         return True
 
     def _coast_predict(self, now_ns: int) -> None:
-        """Advance the filter without a measurement when the matched observation stream goes temporarily quiet."""
+        """Advance the filter without a measurement when the matched observation stream goes temporarily quiet.
+
+        CRITICAL: this method intentionally does NOT update self.imm_last_stamp_ns.
+        imm_last_stamp_ns must always reflect the timestamp of the last real
+        sensor measurement (stereo triangulation or single-ray fusion).  Updating
+        it here with the wallclock would cause the next genuine measurement — whose
+        stamp_ns is in sensor time, typically behind wallclock — to compute a
+        negative dt and be silently discarded by the `if dt > 0.0` guard inside
+        execute_triangulation / execute_single_observation_fusion.
+        """
         if self.imm_last_stamp_ns is None:
             return
         dt = (now_ns - self.imm_last_stamp_ns) / 1e9
         if dt <= 0.0 or dt > 5.0:
             return
-        self.filtered_position = (
+
+        tau = 0.5  # Singer decay time constant
+        alpha = np.exp(-dt / tau)
+
+        # Project position/velocity/acceleration forward by dt, but store the
+        # result only in the publishing fields — do NOT advance imm_last_stamp_ns.
+        coast_position = (
             self.filtered_position
             + self.filtered_velocity * dt
             + 0.5 * self.filtered_acceleration * dt * dt
         )
-        self.filtered_velocity = self.filtered_velocity + self.filtered_acceleration * dt
-        self.imm_last_stamp_ns = now_ns
+        coast_velocity = self.filtered_velocity + self.filtered_acceleration * dt
+        coast_acceleration = self.filtered_acceleration * alpha
+
+        # Clamp maximum speed (e.g., F450 limit ~10m/s)
+        speed = np.linalg.norm(coast_velocity)
+        if speed > 10.0:
+            coast_velocity = (coast_velocity / speed) * 10.0
+
         self.get_logger().info(f'Coast predict: dt={dt:.2f}s, no measurement', throttle_duration_sec=2.0)
         self.publish_pose_estimate(
-            self.filtered_position,
-            self.filtered_velocity,
-            self.filtered_acceleration,
+            coast_position,
+            coast_velocity,
+            coast_acceleration,
             now_ns,
         )
 
@@ -1430,22 +2731,23 @@ class TriangulationNode(Node):
             # Start with the currently estimated optimal combined state
             pos = self.filtered_position.copy()
             vel = self.filtered_velocity.copy()
-            
+
             # The effective acceleration is the CA acceleration weighted by the CA model probability
             # (since CV assumes zero acceleration). This perfectly captures the current maneuver intent.
             acc = self.imm.sc_ca.x[6:9].copy() * self.imm.mu[1]
 
-            # Clamp acceleration magnitude to a physically achievable envelope (~1.5g).
-            # Any estimate above this limit is measurement-noise leakage, not real physics.
-            MAX_ACCEL_PRED = 15.0  # m/s²
+            # Clamp acceleration magnitude to a physically achievable envelope (~2g for racing drones).
+            MAX_ACCEL_PRED = 20.0  # m/s²
             acc_mag = float(np.linalg.norm(acc))
             if acc_mag > MAX_ACCEL_PRED:
                 acc = acc * (MAX_ACCEL_PRED / acc_mag)
 
-            # Singer model decay: acceleration decays to zero over time, naturally 
+            # Singer model decay: acceleration decays to zero over time, naturally
             # modeling the Markov transition back to Constant Velocity (straight flight).
-            # A time constant of 0.5s is typical for a drone completing a sharp maneuver.
-            tau = 0.5
+            # tau=1.5s allows the prediction to follow the full arc of a banking turn
+            # before decaying to straight flight (tau=0.5s was too short and produced
+            # trajectories that appeared stuck on CV during sustained maneuvers).
+            tau = 1.5
             alpha = float(np.exp(-dt_step / tau))
 
             for _ in range(self.kf_prediction_steps + 1):

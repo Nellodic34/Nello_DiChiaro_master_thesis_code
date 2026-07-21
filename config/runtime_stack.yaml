@@ -5,8 +5,8 @@ launcher:
 
 vision:
   publish_annotated_image: false  # detection boxes image on /detection... ; useful for debug, costs bandwidth
-  publish_debug_annotated_image: false  # publish observer debug overlays and triangulation-side ray overlays on separate topics
-  publish_detector_evaluation_packets: false  # when false the observer skips all evaluator telemetry and adds no extra evaluation workload
+  publish_debug_annotated_image: false  # ((RAYS)) publish observer debug overlays and triangulation-side ray overlays on separate topics
+  publish_detector_evaluation_packets: true  # when false the observer skips all evaluator telemetry and adds no extra evaluation workload
   publish_camera_static_tf: true  # publish camera static TF locally from this node; normally false in sim/real, useful for bag replay/debug only
   model_path: "dataset_tools/weights2/best_openvino_model"  # YOLO/OpenVINO weights for observer_node; relative paths are resolved from the repo root
   device: "cpu"  # inference device: "cpu" for Intel drone, "cuda" for GPU, "GPU" for Intel iGPU via OpenVINO
@@ -33,6 +33,39 @@ vision:
   roi_selection_lambda: 0.3   # when ROI is active, penalize detections far from the predicted center during candidate selection
   camera_frame_override: ""  # override camera frame_id from CameraInfo for TF lookups (e.g. {uav_name}/rgbd_front/color_optical)
   publish_rviz_markers: false  # predicted trajectory & position markers to RViz (disable to save CPU)
+
+# Top-Down 3D→2D Tight Coupling (Information-Driven Feedback Architecture)
+# When enabled, the triangulation node's 3D estimate is used to create a
+# "3D-Informed Gate" on each observer's image plane. Detections that pass the
+# local 2D Kalman gate but fall outside this 3D-projected ellipse are rejected.
+# Reference: Carlson, "Federated Square Root Filter for Decentralized Parallel
+# Processes", IEEE Trans. Aerospace & Electronic Systems, 1990.
+# Safety switch: feedback is automatically disabled when the 3D filter's
+# covariance exceeds a threshold or the estimate is too old (prevents the
+# "Swallowing Effect" during prolonged occlusions).
+#
+# Velocity-Compensated Projection (latency correction):
+# The 3D estimate is forward-extrapolated from its publish time to the current
+# camera frame time using:  p(t_now) = p(t_odom) + v*dt + 0.5*a*dt²
+# This eliminates spurious TC rejections during sharp observer maneuvers
+# (e.g. synchronized pitch-forward/backward) where the stale world point would
+# otherwise project to the wrong pixel due to TF rotation mismatch.
+# The covariance is also inflated by (sigma_v_inflate * dt)² per axis so that
+# the gate widens naturally during the prediction horizon.
+tight_coupling:
+  enabled: false                    # master switch; false = pure loose coupling (identical to current behavior)
+  target_odometry_topic: "/target/odometry_estimate"  # topic published by triangulation_node
+  max_3d_age_sec: 0.5              # ignore 3D state older than this (stale data = no feedback)
+  max_3d_covariance_trace: 100.0   # if tr(P_pos) > this, the 3D estimate is too uncertain → disable feedback
+  gating_chi2_threshold: 9.21      # chi² threshold for 2-DOF gate (99% confidence interval for 2 DOF)
+  sigma_v_inflate: 1.5             # (Better if between 1 and 2) [m/s] velocity uncertainty for gate inflation over the prediction horizon dt.
+                                   # Gate grows by (sigma_v_inflate * dt)² per axis. Raise this if TC still
+                                   # rejects valid detections during aggressive observer maneuvers.
+  r_pixel_sigma_px: 10.0           # [L2-bug2] Std-dev (pixels) of the pinhole measurement noise floor for the
+                                   # TC gate covariance: R_pixel = diag(sigma²,sigma²). Should match kf_sigma_px
+                                   # so the local 2D KF and the 3D TC gate share the same noise model.
+
+
 
 # Static TF: {uav_name}/fcu rgbd_link (camera mount on each drone)
 # Measure x/y/z offset in metres from FCU center to camera center (body FLU: x=fwd, y=left, z=up)
@@ -68,13 +101,71 @@ uav_roles:
   target: uav28      # TARGET drone name edit to match your real drone
 
 ekf:
-  kf_process_noise_acc: 3.0   # CA jerk std-dev (m/s³); lowered to smooth acceleration estimates
-  kf_process_noise_vel: 1.0   # CV acceleration std-dev (m/s²); strict straight flight model
-  imm_transition_prob: 0.90   # legacy; Markov matrix is now defined in code
-  kf_measurement_noise: 0.02  # Cartesian angular variance seed (m²); reduced to trust inliers more
+  kf_process_noise_acc: 13.28   # CA jerk std-dev (m/s³) — raised to track aggressive maneuvers
+  kf_process_noise_vel: 0.05    # CV acceleration std-dev (m/s²) — small enough to be smooth, large enough to not break the gate
+  imm_transition_prob: 0.90    # LEGACY — no longer used. Kept for backward compat only.
+
+  # ---------------------------------------------------------------------------
+  # IMM Markov Transition Matrix
+  # Controls how quickly the filter switches between the two dynamic models:
+  #   CV (Constant Velocity): smooth, biased for straight/hover flight
+  #   CA (Constant Acceleration): reactive, active during braking and sharp turns
+  #
+  # The 2x2 Markov matrix is:
+  #   [ imm_p_stay_cv,       1 - imm_p_stay_cv   ]   (CV row)
+  #   [ imm_p_return_to_cv,  1 - imm_p_return_to_cv ] (CA row)
+  #
+  # imm_p_stay_cv — P(CV→CV): probability of remaining in straight-flight mode.
+  #   Range: [0.60 – 0.95]
+  #   ↓ Lower  → CA activates faster at braking onset (more reactive on curves)
+  #   ↑ Higher → CA activates slower, filter prefers smooth straight-line prediction
+  #   Recommended for aggressive maneuvering targets: 0.70–0.80
+  #   Too low (<0.60): jittery estimation during straight flight (ghosting acceleration)
+  imm_p_stay_cv: 0.75
+
+  # imm_p_return_to_cv — P(CA→CV): probability that CA model decays back to CV.
+  #   Range: [0.15 – 0.50]
+  #   ↑ Higher → CA fades faster after a maneuver (cleaner steady-state)
+  #   ↓ Lower  → CA persists longer through long tight turns
+  #   Recommended: 0.25–0.35 for UAV targets with short aggressive maneuvers
+  #   Too low (<0.15): filter "locks on" to ghost acceleration after curves end
+  imm_p_return_to_cv: 0.30
+  # ---------------------------------------------------------------------------
+  kf_measurement_noise: 0.00020 # Visual angular variance seed (rad²).
+                                 # sqrt(0.0002)*1396.8 ≈ 22px YOLO jitter (reduced from 30px/0.0005).
+                                 # SOTA mode: V_vis = kf_measurement_noise * d² * I (bearing cone).
+                                 # MUST match tuning.yaml fixed_kf_measurement_noise.
   kf_adaptive_cov_max_multiplier: 50.0
   kf_initial_covariance: 2.0
-  kf_mahalanobis_threshold: 9.0  # Tightened from 50.0. Rejects high-frequency bounding box jitter (98% conf for 3DOF)
+  kf_mahalanobis_threshold: 34.0  # chi²(3, 0.999): RAISED massively. With normalize_crlb=false, R is tight.
+                                  # If this is too small, the filter will reject valid braking frames and coast 10m!
+
+  # ---------------------------------------------------------------------------
+  # CRLB Normalisation Switch
+  # Controls whether the raw Cramér-Rao Lower Bound R = inv(Lambda) is rescaled
+  # before being passed to the IMM-KF measurement update.
+  #
+  # normalize_crlb: true  (CURRENT — legacy / pragmatic mode)
+  #   Preserves the ANISOTROPIC SHAPE of the CRLB (eigenvalue ratios encode
+  #   which axes are well-observed) but forces trace(R) = 3 * kf_measurement_noise.
+  #   Backward-compatible: existing kf_process_noise_* and kf_mahalanobis_threshold
+  #   values remain valid without re-tuning.
+  #   Reference: Ristic et al. (2004), "Beyond the Kalman Filter", Artech House.
+  #
+  # normalize_crlb: false  (SOTA — physically rigorous mode)
+  #   Returns R = inv(Lambda) unchanged.  The Kalman Gain automatically adapts
+  #   to real measurement uncertainty: large at long range, small when geometry
+  #   is favourable (near 90° intersection angle).
+  #   REQUIREMENT: CMA-ES must be re-run with:
+  #     1. kf_measurement_noise REMOVED from the optimised vector (fix it to the
+  #        true angular variance of the YOLO detector, e.g. 1e-4 rad²).
+  #     2. Wider Q bounds: kf_process_noise_vel in [1.0, 50.0],
+  #                        kf_process_noise_acc in [1.0, 100.0].
+  #     3. kf_mahalanobis_threshold re-tuned (likely wider, e.g. [9.0, 30.0]).
+  #   Reference: Bishop et al. (2010), Automatica 46(3); Bar-Shalom et al. (2001).
+  # ---------------------------------------------------------------------------
+  normalize_crlb: false   # SOTA: R = inv(Lambda), anisotropic geometry-aware CRLB.
+                           # Requires use_odom_uncertainty=false (match tuning config).
 
 triangulation:
   max_pair_age_sec: 0.20  # maximum timestamp separation accepted for one observer1/observer2 pair
@@ -82,32 +173,200 @@ triangulation:
   triangulation_min_baseline_m: 0.25  # reject pairs whose camera centers are too close for stable geometry
   max_triangulation_error_m: 2.0  # reject midpoint solutions when the two rays remain too far apart
   processing_rate_hz: 100.0  # node timer rate for pruning buffers, coast prediction, and debug housekeeping
+  publish_evaluation_packets: true # set to true to publish /target/triangulation_evaluation for CMA-ES
+
+  # ---------------------------------------------------------------------------
+  # Prediction-Guided Ray Pairing (Global Nearest Neighbor association)
+  # Selects the observer1/observer2 ray pair minimizing:
+  #
+  #   J = w_time * (|dt| / max_pair_age_sec)
+  #     + w_geom * (e / max_triangulation_error_m)
+  #     + w_innov * (d2 / pairing_mahalanobis_chi2)
+  #
+  # where:
+  #   dt  = |stamp_obs1 - stamp_obs2|
+  #   e   = 3D ray intersection gap from triangulate_midpoint()
+  #   d2  = (p_mid - x_pred)^T * S^{-1} * (p_mid - x_pred)
+  #   S   = P_pred_pos + R_3d(Fisher information from both rays)
+  #
+  # When pairing_prediction_enabled=false → legacy behavior: pick min |dt| only.
+  # References: Bar-Shalom et al. (gating); Blackman & Popoli (GNN association).
+  # ---------------------------------------------------------------------------
+  pairing_prediction_enabled: true
+  pairing_weight_time: 4.0        # w_t: temporal synchronization weight
+  pairing_weight_geom: 1.5          # w_g: ray mismatch penalty (geometry quality)
+  pairing_weight_innov: 1.5         # w_i: 3D innovation consistency with IMM prediction
+  pairing_mahalanobis_chi2: 18.0    # chi² normalization for 3-DOF position innovation (MUST MATCH kf_mahalanobis_threshold)
+  pairing_log_best_cost: false      # debug: log winning J, c_t, c_g, c_i at INFO throttle
+
+  # ---------------------------------------------------------------------------
+  # Single-ray RGB-D Depth Fusion Fallback
+  # When stereo pairing fails (e.g. mutual occlusion) but one drone has a valid
+  # depth measurement, the system updates the IMM using a single-sensor
+  # formulation. The 3D uncertainty is highly anisotropic: narrow radially (depth)
+  # but wider laterally (angular).
+  # ---------------------------------------------------------------------------
+  single_obs_max_age_sec: 0.15      # max age for an unpaired observation to be fused
+  single_obs_min_confidence: 0.60   # min YOLO confidence required to use single-sensor fallback
 
 # Image-space Kalman filter — false positive rejection layer inside each ObserverNode.
-# Operates on pixel centroids (u, v) before any 3D ray is published.
-# Based on DeepSORT Mahalanobis gating + TAKF ego-motion/distance-adaptive mechanisms.
 kalman_filter:
-  kf_enabled: true                   # master switch for the image-space KF; false = original unfiltered path
-  kf_sigma_a: 300.0                   # pixel acceleration std dev for DWNA process noise (px/s^2)
-  kf_sigma_px: 10.0                    # base measurement noise std dev (px)
-  kf_conf_beta: 1.0                   # confidence scaling exponent for R and gate [1.0–2.0]
-  kf_conf_min: 0.20                   # minimum YOLO confidence to enter gating at all
-  kf_n_confirm: 3                     # consecutive hits to transition TENTATIVE → CONFIRMED
-  kf_max_age: 5                       # consecutive misses to transition CONFIRMED → LOST
-  kf_p_max: 800.0                    # diagonal covariance cap (px^2), prevents unbounded gate growth
-  kf_nis_window: 15                   # sliding window length for NIS consistency monitor
-  kf_nis_threshold: 8.0               # mean NIS above which track is flagged as inconsistent
-  kf_ghost_timeout_sec: 0.5           # keep ghost memory short so stale image-space anchors expire quickly
-  kf_ghost_reentry_m: 2               # require brief temporal evidence before trusting re-entry after LOST
-  kf_ghost_reentry_n: 3               # re-entry evidence window; keep short to avoid delayed recovery
-  kf_ghost_reentry_conf_min: 0.35     # slightly below the default to let motion-blurred true detections count
-  kf_ghost_reentry_spread_px: 100.0   # dedicated re-entry slack; widens recovery without relaxing normal ROI init
-  kf_ego_motion_enabled: true         # compensate KF prediction for camera rotation between frames
-  kf_bbox_area_ref: 3600.0            # reference bbox area at nominal distance (60x60 px); calibrate per setup
-  kf_dist_gamma: 0.2                  # exponent for distance-based R scaling
-  kf_cam_aware_gating_enabled: true   # perspective-corrected gate threshold for image edges
+  kf_enabled: true
+  kf_sigma_a: 300.0
+  kf_sigma_px: 11.0
+  kf_conf_beta: 1.0
+  kf_conf_min: 0.2
+  kf_n_confirm: 3.0
+  kf_max_age: 5
+  kf_p_max: 800.0
+  kf_nis_window: 15
+  kf_nis_threshold: 8.0
+  kf_ghost_timeout_sec: 0.5
+  kf_ghost_reentry_m: 2
+  kf_ghost_reentry_n: 3
+  kf_ghost_reentry_conf_min: 0.35
+  kf_ghost_reentry_spread_px: 100.0
+  kf_ego_motion_enabled: true
+  kf_bbox_area_ref: 3600.0
+  kf_dist_gamma: 0.2
+  kf_cam_aware_gating_enabled: true
 
 evaluation:
   auto_start_with_launch_sim: true  # when false ./launch_sim.sh skips the prediction evaluator and keeps only the live monitor window pane
   odom_topic_suffix: "estimation_manager/odom_main" #hw_api/ground_truth" #"estimation_manager/odom_main"  # simulation ground truth — change to odometry/odom_main for real drone
   world_frame_suffix: "world_origin"  # real drone RTK origin, V2 uses f9p_origin
+
+  # ---------------------------------------------------------------------------
+  # Live Monitor Display Mode
+  # Controls which plots are shown when ./launch_live_monitor.sh or
+  # ./launch_sim.sh opens the live monitor window.
+  #
+  # Modes:
+  #   "classic"     — 3 panels: XY bird's-eye, Z altitude, 3D position error norm.
+  #                   The original layout; lightest on CPU.
+  #
+  #   "full_3d"     — 4 panels in a 2×2 grid:
+  #                   [XY bird's-eye]  [3D trajectory vs GT]
+  #                   [Z altitude]     [3D position error norm]
+  #                   The 3D panel uses the same colour scheme / legend as the
+  #                   XY panel and supports mouse rotation + scroll-to-zoom.
+  #
+  #   "minimal_3d"  — 3 panels focused on the 3D view:
+  #                   [3D trajectory vs GT] (large, interactive)
+  #                   [XY error over time]  [Z error over time]
+  #                   Best for understanding spatial trajectory divergence
+  #                   without the bird's-eye projection ambiguity.
+  # ---------------------------------------------------------------------------
+  live_monitor_mode: "minimal_3d"  # one of: classic | full_3d | minimal_3d
+
+# ---------------------------------------------------------------------------
+# RGB-D Depth Fusion  (Bar-Shalom et al. — gating & scalar measurement fusion;
+#                      Hartley & Zisserman — projection / depth along ray;
+#                      Khoshelham & Elberink 2012 — depth noise vs distance)
+# Master switch: when enabled=false no depth subscriber is created and every
+# downstream depth code-path is dead — identical CPU/network load to bearing-only.
+# ---------------------------------------------------------------------------
+depth_fusion:
+  # Master switch. false = no depth subscriber, no depth code path, identical to bearing-only.
+  enabled: false
+  # Topic suffix relative to uav_name: full topic = /{uav_name}/{depth_topic_suffix}
+  # Supports sensor_msgs/Image with encoding 16UC1 (millimetres) or 32FC1 (metres).
+  depth_topic_suffix: "rgb/depth_aligned"
+  # Maximum time skew between depth frame and RGB frame (milliseconds).
+  # Uses the same spirit as vision.max_tf_delta_ms.
+  depth_max_align_ms: 40.0
+  # Valid sensor range (metres). Tune from bag statistics for your hardware.
+  min_range_m: 0.3
+  max_range_m: 10.0
+  # Depth sample extraction inside the YOLO bounding box (full-frame pixel coords).
+  # Methods: "median" (default, robust to holes & flying pixels — Khoshelham 2012),
+  #          "center_pixel", "trimmed_mean".
+  sample_method: "median"
+  trimmed_mean_fraction: 0.2    # for trimmed_mean: discard top/bottom fraction
+  min_valid_pixel_fraction: 0.001  # reject depth if fewer valid pixels cover the bbox
+  depth_sample_stride: 2          # stride for subsampling large bboxes (2 = halve CPU for area > 4000px²)
+  # Depth consistency gate vs 3D odometry (collinear occluder rejection).
+  # Rejects near occluder when |z_meas - z_pred| > gate_k * sqrt(sigma_z_meas² + sigma_z_pred²).
+  # Reference: Bar-Shalom, Li & Kirubarajan — "Estimation with Applications to
+  # Tracking and Navigation" (2001), Sec. 3.4 (scalar gating).
+  gating_enabled: true
+  gate_k: 3.0
+  max_odom_age_sec: 0.5          # same spirit as tight_coupling.max_3d_age_sec
+  max_odom_covariance_trace: 100.0  # disable depth gate if 3D positional uncertainty is too large
+  gate_odom_topic: "/target/odometry_estimate"  # [L3-bug2] Dedicated IMM odom topic for the depth consistency
+                                                 # gate, independent of tight_coupling.enabled.
+  # Depth measurement noise model (Khoshelham & Elberink 2012, Eq. 5):
+  #   sigma_z = sigma_z_base + sigma_z_range_coeff * z_meas
+  sigma_z_base_m: 0.02
+  sigma_z_range_coeff: 0.01
+  # Triangulation fusion policy parameters (triangulation_node).
+  # When one or both observers carry a valid depth measurement, the range
+  # along the bearing ray is used as an additional 1-D Kalman update
+  # (H_r = d_hat^T, R_r = sigma_z^2) after the bearing-only triangulation
+  # measurement, following Bar-Shalom et al. sequential update.
+  fusion_use_range_constraint: true
+  fusion_range_chi2: 9.0     # chi² threshold for per-ray depth consistency check (1-DOF)
+
+# ---------------------------------------------------------------------------
+# Observer Odometry Uncertainty Propagation
+# When enabled, the 3x3 translational position covariance of each observer
+# drone is extracted from its nav_msgs/Odometry message and propagated into
+# Observer Odometry Uncertainty (WLS Errors-In-Variables Model)
+#
+# The triangulation_node now uses an Optimal Weighted Least Squares (WLS)
+# estimator following the Errors-In-Variables (EIV) formulation. Each bearing
+# ray has a composite noise covariance:
+#
+#   V_i = (kf_measurement_noise * d_i^2 * I_3)  +  (Pi_i @ P_odom_i @ Pi_i^T)
+#
+# where Pi_i = I - b_i*b_i^T is the orthogonal projector onto the plane
+# perpendicular to the bearing (bearing-null-space). The Fisher Information
+# Matrix Lambda = sum_i (Pi_i^T * W_i * Pi_i) is inverted to yield the
+# Cramér-Rao Lower Bound covariance R_out, which is passed as R_k to the IMM.
+#
+# Theoretical references:
+#   Dogancay, K. (2015). IEEE Trans. Signal Processing 63(6). [projector Pi]
+#   Xu, Dogancay & Hmam (2017). Signal Processing 133. [composite V_i, UAV]
+#   Bishop et al. (2010). Automatica 46(3). [CRLB optimality]
+#   Dogancay (2005). Signal Processing 85(9). [bootstrap OLS / Orth. Vectors]
+#
+# Zero-overhead policy:
+#   When use_odom_uncertainty=false, P_odom is ignored and V_i = var_px*d^2*I_3.
+# ---------------------------------------------------------------------------
+observer_odom_uncertainty:
+  use_odom_uncertainty: false  # MUST match tuning.yaml to avoid R mismatch between training/deployment.
+                               # Bags have no P_odom → training with True gives wrong R scale.
+  odom_fallback_variance: 0.01      # m²: isotropic P_odom used when driver publishes zero cov
+  min_bearing_distance: 0.5         # m:  legacy clamp; WLS bootstrap is inherently stable
+  odom_max_age_sec: 0.5             # s:  reject stale odometry and fall back to pixel-only
+  distance_dependent_noise: true    # WLS: if true, visual sigma = var_px * d^2; false = constant width beam
+  odom_max_variance: 1.0            # m²: diagonal clamp on P_odom diagonals; prevents barometric Z-blowup
+
+# ---------------------------------------------------------------------------
+# Observer Self-Detection Rejection (Layer 4)
+# Uses the known 3D odometry of the OTHER observer drone to project its
+# expected image-plane position and reject detections that coincide with it.
+# This handles intra-swarm false positives when one observer drone flies
+# into the line-of-sight of the other.
+#
+# Gate formula (Hartley & Zisserman 2004, §6.1 pinhole projection):
+#   gate_px = (rejection_gate_radius_m / Zc) * max(fx, fy)
+# Foreground condition (optional):
+#   reject only when Zc_observer < Zc_target_IMM - rejection_depth_margin_m
+#
+# Reference: Blackman & Popoli (1999) — Design and Analysis of Modern
+#   Tracking Systems, Chapter 7: negative object recognition gate.
+# ---------------------------------------------------------------------------
+observer_self_rejection:
+  enabled: false                    # master switch; false = zero overhead (no subscriber created)
+  max_odom_age_sec: 0.3             # s: reject only when other-observer odom is fresh
+  rejection_gate_radius_m: 0.8      # m: physical drone body radius used to compute pixel gate
+  rejection_depth_margin_m: 1.5     # m: unused while rejection_only_if_closer=false; kept for future re-enable
+  rejection_only_if_closer: false   # false = unconditional geometric exclusion (correct for two observers
+                                     # rigidly/net-coupled together): reject purely on pixel-projection match,
+                                     # independent of the (possibly stale/unavailable) 3D target estimate.
+                                     # true = only reject when the sibling is nearer than the IMM target by
+                                     # rejection_depth_margin_m; fails OPEN (no rejection) whenever no fresh
+                                     # /target/odometry_estimate exists, or when the sibling is farther than
+                                     # the target — do not use this mode for tethered/formation-flying observers.
+

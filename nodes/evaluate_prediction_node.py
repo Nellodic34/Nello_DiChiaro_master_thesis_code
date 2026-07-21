@@ -18,6 +18,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import String
 import rclpy.executors as rclpy_executors
 from rclpy.node import Node
 
@@ -94,7 +95,6 @@ class PredictionEvaluatorNode(Node):
 
         self.declare_parameter('gt_odom_topic', f'/{target_name}/{eval_odom_suffix}')
         self.declare_parameter('proposed_path_topic', '/target/predicted_trajectory')
-        self.declare_parameter('baseline_path_topic', '')
         self.declare_parameter('stamp_tolerance_sec', 0.10)
         self.declare_parameter('anees_stamp_tolerance_sec', 0.15)
         self.declare_parameter('max_pending_age_sec', 6.0)
@@ -110,6 +110,7 @@ class PredictionEvaluatorNode(Node):
         self.declare_parameter('known_path_topic', '/target/known_trajectory_path')
         self.declare_parameter('estimate_odom_topic', '/target/odometry_estimate')
         self.declare_parameter('raw_triangulation_topic', '/target/triangulation_raw')
+        self.declare_parameter('fusion_mode_topic', '/tracker/fusion_mode')
 
         self.declare_parameter('enable_known_trajectory_model', False)
         self.declare_parameter('model_initial_offset_x', 3.0)
@@ -126,7 +127,6 @@ class PredictionEvaluatorNode(Node):
 
         self.gt_odom_topic = str(self.get_parameter('gt_odom_topic').value)
         self.proposed_path_topic = str(self.get_parameter('proposed_path_topic').value)
-        self.baseline_path_topic = str(self.get_parameter('baseline_path_topic').value)
         self.stamp_tolerance_ns = int(float(self.get_parameter('stamp_tolerance_sec').value) * 1e9)
         self.anees_stamp_tolerance_ns = int(float(self.get_parameter('anees_stamp_tolerance_sec').value) * 1e9)
         self.max_pending_age_ns = int(float(self.get_parameter('max_pending_age_sec').value) * 1e9)
@@ -166,11 +166,12 @@ class PredictionEvaluatorNode(Node):
         self.known_path_topic = str(self.get_parameter('known_path_topic').value)
         self.estimate_odom_topic = str(self.get_parameter('estimate_odom_topic').value)
         self.raw_triangulation_topic = str(self.get_parameter('raw_triangulation_topic').value)
+        self.fusion_mode_topic = str(self.get_parameter('fusion_mode_topic').value)
 
         self.gt_history: Dict[int, np.ndarray] = {}
         self.pending: List[PendingPrediction] = []
-        self.evaluated_predictions: Dict[str, List[EvaluatedPrediction]] = {'proposed': [], 'baseline': []}
-        self.evaluated_model_predictions: Dict[str, List[EvaluatedPrediction]] = {'proposed': [], 'baseline': []}
+        self.evaluated_predictions: Dict[str, List[EvaluatedPrediction]] = {'proposed': []}
+        self.evaluated_model_predictions: Dict[str, List[EvaluatedPrediction]] = {'proposed': []}
         self.finalized = False
 
         self.metrics = {
@@ -183,16 +184,9 @@ class PredictionEvaluatorNode(Node):
                 'pos_point_count': 0,
                 'vel_sq_error_sum': 0.0,
                 'vel_point_count': 0,
-            },
-            'baseline': {
-                'count': 0,
-                'ade_sum': 0.0,
-                'fde_sum': 0.0,
-                'max_error_sum': 0.0,
-                'pos_sq_error_sum': 0.0,
-                'pos_point_count': 0,
-                'vel_sq_error_sum': 0.0,
-                'vel_point_count': 0,
+                'endpoint_sq_error_sum': 0.0,
+                'endpoint_count': 0,
+                'horizon_sec_sum': 0.0,
             },
         }
         self.model_metrics = {
@@ -205,16 +199,9 @@ class PredictionEvaluatorNode(Node):
                 'pos_point_count': 0,
                 'vel_sq_error_sum': 0.0,
                 'vel_point_count': 0,
-            },
-            'baseline': {
-                'count': 0,
-                'ade_sum': 0.0,
-                'fde_sum': 0.0,
-                'max_error_sum': 0.0,
-                'pos_sq_error_sum': 0.0,
-                'pos_point_count': 0,
-                'vel_sq_error_sum': 0.0,
-                'vel_point_count': 0,
+                'endpoint_sq_error_sum': 0.0,
+                'endpoint_count': 0,
+                'horizon_sec_sum': 0.0,
             },
         }
 
@@ -225,6 +212,7 @@ class PredictionEvaluatorNode(Node):
         self.gt_timestamps_ns: List[int] = []
         self.estimate_position_history: Dict[int, np.ndarray] = {}
         self.estimate_cov_history: Dict[int, np.ndarray] = {}
+        self.estimate_velocity_history: Dict[int, np.ndarray] = {}
         self.estimate_timestamps_ns: List[int] = []
         self.known_path_stamps_ns: List[int] = []
         self.known_path_positions: List[np.ndarray] = []
@@ -238,6 +226,20 @@ class PredictionEvaluatorNode(Node):
         self.estimate_msg_count: int = 0
         self.anees_unmatched_count: int = 0
         self.estimation_errors: List[Tuple[float, float]] = []
+        self.odom_estimate_errors: List[Tuple[float, float]] = []
+        self.odom_estimate_sq_error_sum: float = 0.0
+        self.odom_estimate_error_count: int = 0
+        self.odom_estimate_error_max: float = 0.0
+        self.odom_estimate_velocity_sq_error_sum: float = 0.0
+        self.odom_estimate_velocity_error_count: int = 0
+        # Stratified by fusion mode: lets us compare the filter fairly against raw
+        # triangulation, which only ever has samples for STEREO/SINGLE_DEPTH instants
+        # and never for COAST (pure dead-reckoning, no fresh measurement).
+        self.last_fusion_mode: str = 'UNKNOWN'
+        self.odom_estimate_active_sq_error_sum: float = 0.0
+        self.odom_estimate_active_error_count: int = 0
+        self.odom_estimate_coast_sq_error_sum: float = 0.0
+        self.odom_estimate_coast_error_count: int = 0
 
         self.create_subscription(Odometry, self.gt_odom_topic, self.gt_callback, 100)
         if self.estimate_odom_topic.strip():
@@ -245,9 +247,9 @@ class PredictionEvaluatorNode(Node):
         
         if self.raw_triangulation_topic.strip():
             self.create_subscription(PointStamped, self.raw_triangulation_topic, self.raw_triangulation_callback, 100)
+        if self.fusion_mode_topic.strip():
+            self.create_subscription(String, self.fusion_mode_topic, self.fusion_mode_callback, 20)
         self.create_subscription(Path, self.proposed_path_topic, self.proposed_path_callback, 20)
-        if self.baseline_path_topic.strip():
-            self.create_subscription(Path, self.baseline_path_topic, self.baseline_path_callback, 20)
         if self.known_path_topic.strip():
             self.create_subscription(Path, self.known_path_topic, self.known_path_callback, 10)
         if self.plot_observer_markers:
@@ -273,8 +275,6 @@ class PredictionEvaluatorNode(Node):
 
         self.get_logger().info(f'GT topic: {self.gt_odom_topic}')
         self.get_logger().info(f'Proposed path topic: {self.proposed_path_topic}')
-        if self.baseline_path_topic.strip():
-            self.get_logger().info(f'Baseline path topic: {self.baseline_path_topic}')
         self.get_logger().info(f'Output directory: {self.output_dir}')
         self.get_logger().info(f'Known trajectory model enabled: {self.enable_known_trajectory_model}')
         if self.plot_observer_markers:
@@ -293,6 +293,9 @@ class PredictionEvaluatorNode(Node):
     def observer_callback(self, role: str, msg: Odometry) -> None:
         self.observer_positions[role] = vec3_from_pose(msg.pose.pose)
 
+    def fusion_mode_callback(self, msg: String) -> None:
+        self.last_fusion_mode = msg.data
+
     def known_path_callback(self, msg: Path) -> None:
         poses = msg.poses
         if not poses:
@@ -309,9 +312,18 @@ class PredictionEvaluatorNode(Node):
 
         cov = np.asarray(msg.pose.covariance, dtype=np.float64).reshape(6, 6)
         cov_pos = cov[:3, :3].copy()
+        vel = np.array(
+            [
+                msg.twist.twist.linear.x,
+                msg.twist.twist.linear.y,
+                msg.twist.twist.linear.z,
+            ],
+            dtype=np.float64,
+        )
 
         self.estimate_position_history[t_ns] = pos
         self.estimate_cov_history[t_ns] = cov_pos
+        self.estimate_velocity_history[t_ns] = vel
         if not self.estimate_timestamps_ns or t_ns > self.estimate_timestamps_ns[-1]:
             self.estimate_timestamps_ns.append(t_ns)
         elif not had_stamp:
@@ -322,6 +334,7 @@ class PredictionEvaluatorNode(Node):
             for k in keys[:5000]:
                 self.estimate_position_history.pop(k, None)
                 self.estimate_cov_history.pop(k, None)
+                self.estimate_velocity_history.pop(k, None)
             self.estimate_timestamps_ns = [k for k in self.estimate_timestamps_ns if k in self.estimate_position_history]
 
     def nearest_timestamp(self, stamps_ns: List[int], target_ns: int) -> Optional[int]:
@@ -337,7 +350,7 @@ class PredictionEvaluatorNode(Node):
             return None
         return min(candidates, key=lambda k: abs(k - target_ns))
 
-    def nearest_estimate_state(self, t_ns: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def nearest_estimate_state(self, t_ns: int) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
         if not self.estimate_position_history:
             return None
 
@@ -349,9 +362,10 @@ class PredictionEvaluatorNode(Node):
 
         est_pos = self.estimate_position_history.get(nearest_k)
         est_cov = self.estimate_cov_history.get(nearest_k)
+        est_vel = self.estimate_velocity_history.get(nearest_k)
         if est_pos is None or est_cov is None:
             return None
-        return est_pos, est_cov
+        return est_pos, est_cov, est_vel
 
     def compute_nees_3d(self, error_vec: np.ndarray, cov_pos: np.ndarray) -> Optional[float]:
         if error_vec.shape != (3,) or cov_pos.shape != (3, 3):
@@ -534,8 +548,45 @@ class PredictionEvaluatorNode(Node):
 
         est_state = self.nearest_estimate_state(t_ns)
         if est_state is not None:
-            est_pos, est_cov = est_state
-            nees = self.compute_nees_3d(est_pos - gt_position, est_cov)
+            est_pos, est_cov, est_vel = est_state
+            err_vec = est_pos - gt_position
+            err_norm = float(np.linalg.norm(err_vec))
+            if math.isfinite(err_norm):
+                # Zero-lag comparison: current filtered odometry estimate vs GT at the
+                # same instant (no forward propagation). This is what a PN/interception
+                # consumer of /target/odometry_estimate actually sees.
+                self.odom_estimate_sq_error_sum += err_norm ** 2
+                self.odom_estimate_error_count += 1
+                self.odom_estimate_error_max = max(self.odom_estimate_error_max, err_norm)
+
+                # Stratify by fusion mode: raw triangulation only ever has a data
+                # point when a fresh STEREO/SINGLE_DEPTH measurement was fused, so
+                # comparing it against the filter's aggregate (which also includes
+                # COAST dead-reckoning instants) is not apples-to-apples.
+                if self.last_fusion_mode in ('STEREO', 'SINGLE_DEPTH'):
+                    self.odom_estimate_active_sq_error_sum += err_norm ** 2
+                    self.odom_estimate_active_error_count += 1
+                elif self.last_fusion_mode == 'COAST':
+                    self.odom_estimate_coast_sq_error_sum += err_norm ** 2
+                    self.odom_estimate_coast_error_count += 1
+
+                obs_positions = [pos for pos in self.observer_positions.values() if pos is not None]
+                if obs_positions:
+                    centroid = np.mean(obs_positions, axis=0)
+                    dist_to_obs = float(np.linalg.norm(gt_position - centroid))
+                else:
+                    dist_to_obs = float(np.linalg.norm(gt_position))
+                self.odom_estimate_errors.append((dist_to_obs, err_norm))
+                
+                # Also calculate velocity error (same timestamp guaranteed)
+                if est_vel is not None:
+                    vel_err = gt_velocity - est_vel
+                    vel_err_norm = float(np.linalg.norm(vel_err))
+                    if math.isfinite(vel_err_norm):
+                        self.odom_estimate_velocity_sq_error_sum += vel_err_norm ** 2
+                        self.odom_estimate_velocity_error_count += 1
+
+            nees = self.compute_nees_3d(err_vec, est_cov)
             if nees is not None:
                 self.anees_sum += nees
                 self.anees_count += 1
@@ -590,9 +641,6 @@ class PredictionEvaluatorNode(Node):
 
     def proposed_path_callback(self, msg: Path) -> None:
         self.enqueue_prediction(msg, 'proposed')
-
-    def baseline_path_callback(self, msg: Path) -> None:
-        self.enqueue_prediction(msg, 'baseline')
 
     def enqueue_prediction(self, path_msg: Path, source: str) -> None:
         poses = path_msg.poses
@@ -763,6 +811,14 @@ class PredictionEvaluatorNode(Node):
         if result.velocity_errors_m:
             m['vel_sq_error_sum'] += float(np.sum(np.square(np.asarray(result.velocity_errors_m, dtype=np.float64))))
             m['vel_point_count'] += len(result.velocity_errors_m)
+        # Full-horizon endpoint error: GT vs the LAST point of the published path only
+        # (i.e. "GT vs the prediction T seconds ahead"), as opposed to position_rmse_m
+        # above which averages over every step from t+0 to t+T.
+        if result.point_errors_m:
+            m['endpoint_sq_error_sum'] += result.point_errors_m[-1] ** 2
+            m['endpoint_count'] += 1
+        if len(result.pose_stamps_ns) >= 2:
+            m['horizon_sec_sum'] += (result.pose_stamps_ns[-1] - result.pose_stamps_ns[0]) / 1e9
 
     def timer_evaluate_pending(self) -> None:
         latest_gt = self.last_gt_ns
@@ -814,6 +870,8 @@ class PredictionEvaluatorNode(Node):
                 'max_error_m': float('nan'),
                 'position_rmse_m': float('nan'),
                 'velocity_rmse_m': float('nan'),
+                'endpoint_rmse_m': float('nan'),
+                'mean_horizon_sec': float('nan'),
             }
 
         pos_rmse = float('nan')
@@ -824,6 +882,14 @@ class PredictionEvaluatorNode(Node):
         if m['vel_point_count'] > 0:
             vel_rmse = float(math.sqrt(m['vel_sq_error_sum'] / m['vel_point_count']))
 
+        endpoint_rmse = float('nan')
+        if m.get('endpoint_count', 0) > 0:
+            endpoint_rmse = float(math.sqrt(m['endpoint_sq_error_sum'] / m['endpoint_count']))
+
+        mean_horizon_sec = float('nan')
+        if m.get('horizon_sec_sum') is not None and m.get('endpoint_count', 0) > 0:
+            mean_horizon_sec = m['horizon_sec_sum'] / m['endpoint_count']
+
         return {
             'count': cnt,
             'ade_m': m['ade_sum'] / cnt,
@@ -831,6 +897,8 @@ class PredictionEvaluatorNode(Node):
             'max_error_m': m['max_error_sum'] / cnt,
             'position_rmse_m': pos_rmse,
             'velocity_rmse_m': vel_rmse,
+            'endpoint_rmse_m': endpoint_rmse,
+            'mean_horizon_sec': mean_horizon_sec,
         }
 
     def print_source_metrics(self, source: str) -> None:
@@ -850,22 +918,15 @@ class PredictionEvaluatorNode(Node):
                 )
         self.get_logger().info(msg)
 
-    def safe_div(self, numerator: float, denominator: float) -> float:
-        if abs(denominator) < 1e-12:
-            return float('nan')
-        return numerator / denominator
-
     def build_summary_dict(self) -> Dict[str, object]:
         proposed = self.source_summary('proposed', self.metrics)
-        baseline = self.source_summary('baseline', self.metrics)
 
         out: Dict[str, object] = {
             'proposed': proposed,
-            'baseline': baseline,
-            'improvement_percent': {},
             'known_trajectory_model': {},
             'ground_truth_vs_known_trajectory': {},
             'anees_3d_position': {},
+            'odom_estimate_vs_gt': {},
             'rviz_topics': {
                 'predicted_trajectory': self.proposed_path_topic,
                 'odometry_estimate': self.estimate_odom_topic,
@@ -876,32 +937,16 @@ class PredictionEvaluatorNode(Node):
                 'xy_plot': self.output_xy_plot_path,
                 'xyz_plot': self.output_xyz_plot_path,
                 'distance_plot': self.output_distance_plot_path,
+                'estimation_vs_odom_plot': self.output_estimation_vs_odom_plot_path,
                 'report': self.output_report_path,
                 'csv': self.output_csv_path,
             },
         }
 
-        if proposed['count'] > 0 and baseline['count'] > 0:
-            out['improvement_percent'] = {
-                'ade': 100.0 * self.safe_div(baseline['ade_m'] - proposed['ade_m'], baseline['ade_m']),
-                'fde': 100.0 * self.safe_div(baseline['fde_m'] - proposed['fde_m'], baseline['fde_m']),
-                'max_error': 100.0 * self.safe_div(baseline['max_error_m'] - proposed['max_error_m'], baseline['max_error_m']),
-            }
-
         if self.enable_known_trajectory_model:
             model_proposed = self.source_summary('proposed', self.model_metrics)
-            model_baseline = self.source_summary('baseline', self.model_metrics)
-            model_improvement = {}
-            if model_proposed['count'] > 0 and model_baseline['count'] > 0:
-                model_improvement = {
-                    'ade': 100.0 * self.safe_div(model_baseline['ade_m'] - model_proposed['ade_m'], model_baseline['ade_m']),
-                    'fde': 100.0 * self.safe_div(model_baseline['fde_m'] - model_proposed['fde_m'], model_baseline['fde_m']),
-                    'max_error': 100.0 * self.safe_div(model_baseline['max_error_m'] - model_proposed['max_error_m'], model_baseline['max_error_m']),
-                }
             out['known_trajectory_model'] = {
                 'proposed': model_proposed,
-                'baseline': model_baseline,
-                'improvement_percent': model_improvement,
             }
 
             if self.gt_model_error_count > 0:
@@ -921,6 +966,33 @@ class PredictionEvaluatorNode(Node):
                 'gt_unmatched_count': self.anees_unmatched_count,
                 'stamp_tolerance_sec': self.anees_stamp_tolerance_ns / 1e9,
             }
+
+        if self.odom_estimate_error_count > 0:
+            out['odom_estimate_vs_gt'] = {
+                'count': self.odom_estimate_error_count,
+                'rmse_m': math.sqrt(self.odom_estimate_sq_error_sum / self.odom_estimate_error_count),
+                'max_error_m': self.odom_estimate_error_max,
+            }
+            if self.odom_estimate_velocity_error_count > 0:
+                out['odom_estimate_vs_gt']['velocity_rmse_m_s'] = math.sqrt(
+                    self.odom_estimate_velocity_sq_error_sum / self.odom_estimate_velocity_error_count
+                )
+            # Fair, apples-to-apples comparison against raw triangulation: only
+            # count samples where a fresh measurement was actually fused this cycle
+            # (excludes COAST dead-reckoning, which raw triangulation never sees).
+            if self.odom_estimate_active_error_count > 0:
+                out['odom_estimate_vs_gt']['rmse_active_fusion_m'] = math.sqrt(
+                    self.odom_estimate_active_sq_error_sum / self.odom_estimate_active_error_count
+                )
+                out['odom_estimate_vs_gt']['count_active_fusion'] = self.odom_estimate_active_error_count
+            if self.odom_estimate_coast_error_count > 0:
+                out['odom_estimate_vs_gt']['rmse_coast_m'] = math.sqrt(
+                    self.odom_estimate_coast_sq_error_sum / self.odom_estimate_coast_error_count
+                )
+                out['odom_estimate_vs_gt']['count_coast'] = self.odom_estimate_coast_error_count
+            total_stratified = self.odom_estimate_active_error_count + self.odom_estimate_coast_error_count
+            if total_stratified > 0:
+                out['odom_estimate_vs_gt']['coast_fraction'] = self.odom_estimate_coast_error_count / total_stratified
 
         return out
 
@@ -976,7 +1048,7 @@ class PredictionEvaluatorNode(Node):
                     'position_rmse_m',
                     'velocity_rmse_m',
                 ])
-                for source in ('proposed', 'baseline'):
+                for source in ('proposed',):
                     for idx, sample in enumerate(self.evaluated_predictions[source], start=1):
                         writer.writerow([
                             source,
@@ -1088,7 +1160,7 @@ class PredictionEvaluatorNode(Node):
         ax.grid(True, alpha=0.25)
 
         plotted = False
-        for source, color in (('proposed', 'tab:blue'), ('baseline', 'tab:orange')):
+        for source, color in (('proposed', 'tab:blue'),):
             steps, means = self.mean_error_profile(source, self.evaluated_predictions)
             if steps.size > 0:
                 ax.plot(steps, means, label=f'{source} vs GT', color=color, linewidth=2.0)
@@ -1136,7 +1208,7 @@ class PredictionEvaluatorNode(Node):
         ax.grid(True, alpha=0.25)
 
         plotted = False
-        for source, color in (('proposed', 'tab:blue'), ('baseline', 'tab:orange')):
+        for source, color in (('proposed', 'tab:blue'),):
             steps, means = self.mean_velocity_error_profile(source, self.evaluated_predictions)
             if steps.size > 0:
                 ax.plot(steps, means, label=f'{source} vs GT', color=color, linewidth=2.0)
@@ -1183,32 +1255,21 @@ class PredictionEvaluatorNode(Node):
 
         summary = self.build_summary_dict()
         proposed = summary['proposed']
-        baseline = summary['baseline']
-        improvement = summary['improvement_percent']
 
         lines = [
-            'Prediction vs ground truth',
+            'Prediction vs ground truth (whole published horizon, averaged)',
             'source      count   ADE [m]   FDE [m]   MAX [m]   RMSE [m]   V_RMSE [m/s]',
             f"proposed    {proposed['count']:>5}   {self.format_metric(proposed['ade_m']):>7}   {self.format_metric(proposed['fde_m']):>7}   {self.format_metric(proposed['max_error_m']):>7}   {self.format_metric(proposed['position_rmse_m']):>8}   {self.format_metric(proposed['velocity_rmse_m']):>11}",
-            f"baseline    {baseline['count']:>5}   {self.format_metric(baseline['ade_m']):>7}   {self.format_metric(baseline['fde_m']):>7}   {self.format_metric(baseline['max_error_m']):>7}   {self.format_metric(baseline['position_rmse_m']):>8}   {self.format_metric(baseline['velocity_rmse_m']):>11}",
         ]
-
-        if improvement:
-            lines.extend([
-                f"GT improvement ADE: {self.format_metric(float(improvement['ade']))}%",
-                f"GT improvement FDE: {self.format_metric(float(improvement['fde']))}%",
-            ])
 
         known = summary.get('known_trajectory_model', {})
         if isinstance(known, dict) and known:
             kp = known.get('proposed', {})
-            kb = known.get('baseline', {})
             lines.extend([
                 '',
                 'Prediction vs known model',
                 'source      count   ADE [m]   FDE [m]   MAX [m]   RMSE [m]   V_RMSE [m/s]',
                 f"proposed    {int(kp.get('count', 0)):>5}   {self.format_metric(float(kp.get('ade_m', float('nan')))):>7}   {self.format_metric(float(kp.get('fde_m', float('nan')))):>7}   {self.format_metric(float(kp.get('max_error_m', float('nan')))):>7}   {self.format_metric(float(kp.get('position_rmse_m', float('nan')))):>8}   {self.format_metric(float(kp.get('velocity_rmse_m', float('nan')))):>11}",
-                f"baseline    {int(kb.get('count', 0)):>5}   {self.format_metric(float(kb.get('ade_m', float('nan')))):>7}   {self.format_metric(float(kb.get('fde_m', float('nan')))):>7}   {self.format_metric(float(kb.get('max_error_m', float('nan')))):>7}   {self.format_metric(float(kb.get('position_rmse_m', float('nan')))):>8}   {self.format_metric(float(kb.get('velocity_rmse_m', float('nan')))):>11}",
             ])
 
         gt_model = summary.get('ground_truth_vs_known_trajectory', {})
@@ -1230,6 +1291,19 @@ class PredictionEvaluatorNode(Node):
                 f"Estimate odom msgs  : {int(anees.get('estimate_messages', 0))}",
                 f"GT unmatched samples: {int(anees.get('gt_unmatched_count', 0))}",
             ])
+
+        odom_est = summary.get('odom_estimate_vs_gt', {})
+        if isinstance(odom_est, dict) and odom_est:
+            lines.extend([
+                '',
+                'GT vs odometry estimate (zero-lag, current filter state)',
+                f"samples: {int(odom_est.get('count', 0))}   RMSE pos: {self.format_metric(float(odom_est.get('rmse_m', float('nan'))))} m   MAX pos: {self.format_metric(float(odom_est.get('max_error_m', float('nan'))))} m   RMSE vel: {self.format_metric(float(odom_est.get('velocity_rmse_m_s', float('nan'))))} m/s",
+            ])
+            if 'rmse_active_fusion_m' in odom_est:
+                lines.append(
+                    f"  active-fusion only: {self.format_metric(float(odom_est.get('rmse_active_fusion_m', float('nan'))))} m "
+                    f"({int(odom_est.get('count_active_fusion', 0))} samples)   coast fraction: {self.format_metric(float(odom_est.get('coast_fraction', float('nan'))) * 100)}%"
+                )
 
         ax.text(0.02, 0.98, '\n'.join(lines), ha='left', va='top', family='monospace', fontsize=9)
 
@@ -1279,12 +1353,14 @@ class PredictionEvaluatorNode(Node):
         self,
         bins: int = 20,
         max_distance: Optional[float] = None,
+        data: Optional[List[Tuple[float, float]]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        if not self.estimation_errors:
+        samples = data if data is not None else self.estimation_errors
+        if not samples:
             return np.array([]), np.array([])
         
-        all_dist = [e[0] for e in self.estimation_errors]
-        all_err = [e[1] for e in self.estimation_errors]
+        all_dist = [e[0] for e in samples]
+        all_err = [e[1] for e in samples]
         
         min_d = min(all_dist)
         max_d = max_distance if max_distance is not None else max(all_dist)
@@ -1309,27 +1385,53 @@ class PredictionEvaluatorNode(Node):
         return centers[valid], np.sqrt(sums[valid] / counts[valid])
 
     def add_estimation_error_plot(self, ax) -> None:
-        ax.set_title('Estimation Accuracy (Pose/Triangulation)')
+        ax.set_title('Estimation Accuracy (Raw Triangulation vs Filtered Estimate)')
         ax.set_xlabel('distance from observers [m]')
-        ax.set_ylabel('pose estimation RMSE [m]')
+        ax.set_ylabel('position RMSE [m]')
         ax.grid(True, alpha=0.25)
-        
+
+        # Single source of truth for the "overall RMSE" figures: reuse the same
+        # summary dict that feeds the JSON/report.md, instead of recomputing
+        # locally (which previously could silently drift out of sync).
+        odom_est_summary = self.build_summary_dict().get('odom_estimate_vs_gt', {})
+        odom_est_rmse = odom_est_summary.get('rmse_m', float('nan'))
+        odom_est_active_rmse = odom_est_summary.get('rmse_active_fusion_m', float('nan'))
+
+        plotted = False
+
         if self.estimation_errors:
-            # Plot raw scatter points with low alpha
             all_dist = [e[0] for e in self.estimation_errors]
             all_err = [e[1] for e in self.estimation_errors]
-            ax.scatter(all_dist, all_err, color='tab:green', alpha=0.1, s=1, label='raw estimation error')
+            ax.scatter(all_dist, all_err, color='tab:green', alpha=0.1, s=1, label=None)
 
-        d, e = self.mean_estimation_error_over_distance(bins=50)
-        if d.size > 0:
-            ax.plot(d, e, label='estimation RMSE (50 bins)', color='tab:green', linewidth=1.5)
-            # Filter for finite values to avoid numpy errors/warnings
-            finite_errs = [err[1] for err in self.estimation_errors if np.isfinite(err[1])]
-            if finite_errs:
-                mean_sq_total = float(np.mean(np.square(finite_errs)))
-                rmse_total = np.sqrt(mean_sq_total)
-                ax.axhline(rmse_total, color='tab:green', linestyle=':', alpha=0.6, label=f'overall RMSE: {rmse_total:.3f}m')
-            ax.legend()
+            d, e = self.mean_estimation_error_over_distance(bins=50, data=self.estimation_errors)
+            if d.size > 0:
+                ax.plot(d, e, label='raw triangulation RMSE (50 bins)', color='tab:green', linewidth=1.5)
+                finite_errs = [err[1] for err in self.estimation_errors if np.isfinite(err[1])]
+                if finite_errs:
+                    rmse_total = float(np.sqrt(np.mean(np.square(finite_errs))))
+                    ax.axhline(rmse_total, color='tab:green', linestyle=':', alpha=0.6, label=f'raw triangulation overall RMSE: {rmse_total:.3f}m')
+                plotted = True
+
+        if self.odom_estimate_errors:
+            all_dist = [e[0] for e in self.odom_estimate_errors]
+            all_err = [e[1] for e in self.odom_estimate_errors]
+            ax.scatter(all_dist, all_err, color='tab:orange', alpha=0.1, s=1, label=None)
+
+            d, e = self.mean_estimation_error_over_distance(bins=50, data=self.odom_estimate_errors)
+            if d.size > 0:
+                ax.plot(d, e, label='filtered estimate RMSE, zero-lag, all samples (50 bins)', color='tab:orange', linewidth=1.5)
+                if math.isfinite(odom_est_rmse):
+                    ax.axhline(odom_est_rmse, color='tab:orange', linestyle=':', alpha=0.6, label=f'filtered estimate overall RMSE (incl. coast): {odom_est_rmse:.3f}m')
+                if math.isfinite(odom_est_active_rmse):
+                    # Fair comparison: only counts instants where a fresh measurement was
+                    # actually fused (STEREO/SINGLE_DEPTH) — directly comparable to the
+                    # raw triangulation line above, which never has COAST samples.
+                    ax.axhline(odom_est_active_rmse, color='tab:red', linestyle='--', alpha=0.8, label=f'filtered estimate RMSE (active fusion only): {odom_est_active_rmse:.3f}m')
+                plotted = True
+
+        if plotted:
+            ax.legend(fontsize=8)
         else:
             ax.text(0.5, 0.5, 'No estimation data', ha='center', va='center', transform=ax.transAxes)
 
@@ -1340,7 +1442,7 @@ class PredictionEvaluatorNode(Node):
         ax.grid(True, alpha=0.25)
 
         plotted = False
-        for source, color in (('proposed', 'tab:blue'), ('baseline', 'tab:orange')):
+        for source, color in (('proposed', 'tab:blue'),):
             d, e = self.mean_rmse_over_observer_distance(source, bins=20)
             if d.size > 0:
                 ax.plot(d, e, label=f'{source} vs GT', color=color, linewidth=2.0, marker='o', markersize=4)
@@ -1593,59 +1695,33 @@ class PredictionEvaluatorNode(Node):
             self.ensure_parent_dir(self.output_report_path)
             summary = self.build_summary_dict()
             proposed = summary['proposed']
-            baseline = summary['baseline']
-            improvement = summary['improvement_percent']
 
             lines = [
                 '# Prediction evaluation report',
                 '',
-                '## Prediction vs ground truth',
+                '## Prediction vs ground truth (whole published horizon, averaged over all steps)',
+                '',
+                '> Averages every point of the published path from t+0 up to t+horizon. See the',
+                '> "GT vs odometry estimate" section below for the zero-lag (current instant)',
+                '> filter state accuracy.',
                 '',
                 '| source | count | ADE [m] | RMSE pos [m] | FDE [m] | MAX error [m] | RMSE vel [m/s] |',
                 '| --- | ---: | ---: | ---: | ---: | ---: | ---: |',
                 f"| proposed | {proposed['count']} | {self.format_metric(float(proposed['ade_m']))} | {self.format_metric(float(proposed['position_rmse_m']))} | {self.format_metric(float(proposed['fde_m']))} | {self.format_metric(float(proposed['max_error_m']))} | {self.format_metric(float(proposed['velocity_rmse_m']))} |",
-                f"| baseline | {baseline['count']} | {self.format_metric(float(baseline['ade_m']))} | {self.format_metric(float(baseline['position_rmse_m']))} | {self.format_metric(float(baseline['fde_m']))} | {self.format_metric(float(baseline['max_error_m']))} | {self.format_metric(float(baseline['velocity_rmse_m']))} |",
                 '',
             ]
-
-            if improvement:
-                lines.extend([
-                    '### Improvement vs baseline (ground truth)',
-                    '',
-                    '| metric | improvement [%] |',
-                    '| --- | ---: |',
-                    f"| ADE | {self.format_metric(float(improvement['ade']))} |",
-                    f"| FDE | {self.format_metric(float(improvement['fde']))} |",
-                    f"| MAX error | {self.format_metric(float(improvement['max_error']))} |",
-                    '',
-                ])
 
             known = summary.get('known_trajectory_model', {})
             if isinstance(known, dict) and known:
                 kp = known.get('proposed', {})
-                kb = known.get('baseline', {})
-                kimpr = known.get('improvement_percent', {})
                 lines.extend([
                     '## Prediction vs known trajectory model',
                     '',
                     '| source | count | ADE [m] | RMSE pos [m] | FDE [m] | MAX error [m] | RMSE vel [m/s] |',
                     '| --- | ---: | ---: | ---: | ---: | ---: | ---: |',
                     f"| proposed | {int(kp.get('count', 0))} | {self.format_metric(float(kp.get('ade_m', float('nan'))))} | {self.format_metric(float(kp.get('position_rmse_m', float('nan'))))} | {self.format_metric(float(kp.get('fde_m', float('nan'))))} | {self.format_metric(float(kp.get('max_error_m', float('nan'))))} | {self.format_metric(float(kp.get('velocity_rmse_m', float('nan'))))} |",
-                    f"| baseline | {int(kb.get('count', 0))} | {self.format_metric(float(kb.get('ade_m', float('nan'))))} | {self.format_metric(float(kb.get('position_rmse_m', float('nan'))))} | {self.format_metric(float(kb.get('fde_m', float('nan'))))} | {self.format_metric(float(kb.get('max_error_m', float('nan'))))} | {self.format_metric(float(kb.get('velocity_rmse_m', float('nan'))))} |",
                     '',
                 ])
-
-                if isinstance(kimpr, dict) and kimpr:
-                    lines.extend([
-                        '### Improvement vs baseline (known model)',
-                        '',
-                        '| metric | improvement [%] |',
-                        '| --- | ---: |',
-                        f"| ADE | {self.format_metric(float(kimpr.get('ade', float('nan'))))} |",
-                        f"| FDE | {self.format_metric(float(kimpr.get('fde', float('nan'))))} |",
-                        f"| MAX error | {self.format_metric(float(kimpr.get('max_error', float('nan'))))} |",
-                        '',
-                    ])
 
             gt_model = summary.get('ground_truth_vs_known_trajectory', {})
             if isinstance(gt_model, dict) and gt_model:
@@ -1669,14 +1745,42 @@ class PredictionEvaluatorNode(Node):
                     '',
                 ])
 
+            odom_est = summary.get('odom_estimate_vs_gt', {})
+            if isinstance(odom_est, dict) and odom_est:
+                lines.extend([
+                    '## GT vs odometry estimate (zero-lag, current filter state)',
+                    '',
+                    '> Compares `/target/odometry_estimate` (the filter\'s CURRENT state, no forward',
+                    '> propagation) against GT at the same instant. This is the accuracy figure',
+                    '> relevant for consumers that only need the present state (e.g. proportional',
+                    '> navigation), as opposed to the whole-horizon table above.',
+                    '',
+                    '| samples | RMSE pos [m] | MAX error pos [m] | RMSE vel [m/s] |',
+                    '| ---: | ---: | ---: | ---: |',
+                    f"| {int(odom_est.get('count', 0))} | {self.format_metric(float(odom_est.get('rmse_m', float('nan'))))} | {self.format_metric(float(odom_est.get('max_error_m', float('nan'))))} | {self.format_metric(float(odom_est.get('velocity_rmse_m_s', float('nan'))))} |",
+                    '',
+                ])
+
+                if 'rmse_active_fusion_m' in odom_est:
+                    lines.extend([
+                        '> The row above mixes COAST (pure dead-reckoning, no fresh measurement)',
+                        '> instants with STEREO/SINGLE_DEPTH (freshly fused) instants. Raw',
+                        '> triangulation never has a COAST equivalent, so comparing it against the',
+                        '> row above is not apples-to-apples. The breakdown below is:',
+                        '',
+                        '| fusion mode | samples | RMSE pos [m] |',
+                        '| --- | ---: | ---: |',
+                        f"| active fusion (STEREO/SINGLE_DEPTH) | {int(odom_est.get('count_active_fusion', 0))} | {self.format_metric(float(odom_est.get('rmse_active_fusion_m', float('nan'))))} |",
+                        f"| coast (dead-reckoning) | {int(odom_est.get('count_coast', 0))} | {self.format_metric(float(odom_est.get('rmse_coast_m', float('nan'))))} |",
+                        '',
+                        f"coast fraction of zero-lag samples: {self.format_metric(float(odom_est.get('coast_fraction', float('nan'))) * 100)}%",
+                        '',
+                    ])
+
             lines.extend([
                 '## Worst proposed predictions by ADE (vs GT)',
                 '',
                 *self.build_worst_samples_table('proposed', self.evaluated_predictions),
-                '',
-                '## Worst baseline predictions by ADE (vs GT)',
-                '',
-                *self.build_worst_samples_table('baseline', self.evaluated_predictions),
                 '',
                 '> Note: metrics and plots are computed on all timestamps where prediction and reference can be matched.',
                 '',
@@ -1693,6 +1797,7 @@ class PredictionEvaluatorNode(Node):
                 f'- XY comparison PNG: `{self.output_xy_plot_path}`',
                 f'- XYZ comparison PNG: `{self.output_xyz_plot_path}`',
                 f'- Distance error PNG: `{self.output_distance_plot_path}`',
+                f'- Estimation-vs-odometry PNG: `{self.output_estimation_vs_odom_plot_path}`',
                 f'- Per-sample CSV: `{self.output_csv_path}`',
             ])
 
@@ -1740,13 +1845,18 @@ def main() -> None:
     except (KeyboardInterrupt, rclpy_executors.ExternalShutdownException):
         pass
     except Exception as e:
-        # Ignore pybind11/conversion errors that often happen during shutdown race conditions
-        is_shutdown_race = not rclpy.ok() and ("Unable to convert call argument" in str(e) or "pybind11" in str(e))
+        # Ctrl+C can land mid-`take_message()` in rclpy's executor and surface as a
+        # RuntimeError/pybind11 conversion error instead of a clean KeyboardInterrupt,
+        # even while rclpy.ok() still reports True for a few more instructions. Treat
+        # these known shutdown-race signatures as benign regardless of rclpy.ok().
+        msg = str(e)
+        is_shutdown_race = (
+            "Unable to convert call argument" in msg
+            or "pybind11" in msg
+            or not rclpy.ok()
+        )
         if not is_shutdown_race:
-            if rclpy.ok():
-                node.get_logger().error(f"Unhandled exception in spin(): {str(e)}\n{traceback.format_exc()}")
-            else:
-                print(f"Unhandled exception in spin() after shutdown: {str(e)}\n{traceback.format_exc()}", flush=True)
+            node.get_logger().error(f"Unhandled exception in spin(): {msg}\n{traceback.format_exc()}")
     finally:
         node.finalize_report()
         try:

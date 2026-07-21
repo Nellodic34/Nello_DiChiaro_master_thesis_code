@@ -64,7 +64,6 @@ class IMMImageOverlayNode(Node):
         # ── Load config ──────────────────────────────────────────────────
         _config_path = FsPath(__file__).resolve().parent.parent / 'config' / 'runtime_stack.yaml'
         _override_image_topic = ''
-        _default_camera_frame_override = ''
         if _config_path.exists():
             import yaml
             try:
@@ -72,7 +71,6 @@ class IMMImageOverlayNode(Node):
                     _cfg = yaml.safe_load(_f)
                     if _cfg and 'vision' in _cfg:
                         _override_image_topic = _cfg['vision'].get('observer_image_topic', '') or ''
-                        _default_camera_frame_override = _cfg['vision'].get('camera_frame_override', '') or ''
             except Exception:
                 pass
 
@@ -81,7 +79,7 @@ class IMMImageOverlayNode(Node):
         self.declare_parameter('target_name', 'uav3')
         self.declare_parameter('world_frame_suffix', 'world_origin')
         self.declare_parameter('tf_timeout_sec', 0.1)
-        self.declare_parameter('processing_rate_hz', 100.0)
+        self.declare_parameter('processing_rate_hz', 10.0)
         self.declare_parameter('trajectory_color_start', [0, 255, 255])   # cyan (BGR)
         self.declare_parameter('trajectory_color_end', [0, 0, 255])       # red (BGR)
         self.declare_parameter('estimate_color', [255, 165, 0])           # orange (BGR)
@@ -91,7 +89,6 @@ class IMMImageOverlayNode(Node):
         self.declare_parameter('jpeg_quality', 75)
         self.declare_parameter('draw_raw_triangulation', True)
         self.declare_parameter('draw_velocity_arrow', True)
-        self.declare_parameter('camera_frame_override', _default_camera_frame_override)
 
         self.uav_name = str(self.get_parameter('uav_name').value)
         self.target_name = str(self.get_parameter('target_name').value)
@@ -107,13 +104,11 @@ class IMMImageOverlayNode(Node):
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.draw_raw_triangulation = bool(self.get_parameter('draw_raw_triangulation').value)
         self.draw_velocity_arrow = bool(self.get_parameter('draw_velocity_arrow').value)
-        self._camera_frame_override = str(self.get_parameter('camera_frame_override').value) or ''
 
         # ── Topic names ──────────────────────────────────────────────────
         self.image_topic = _override_image_topic or f'/{self.uav_name}/rgb/image_raw'
         self._use_compressed = self.image_topic.endswith('/compressed')
-        _img_base = self.image_topic.replace('/compressed', '').rsplit('/image_raw', 1)[0]
-        self.camera_info_topic = f'{_img_base}/camera_info'
+        self.camera_info_topic = f'/{self.uav_name}/rgb/camera_info'
         self.predicted_path_topic = '/target/predicted_trajectory'
         self.estimate_odom_topic = '/target/odometry_estimate'
         self.raw_tri_topic = '/target/triangulation_raw'
@@ -198,7 +193,7 @@ class IMMImageOverlayNode(Node):
 
         # Get camera intrinsics
         K = np.array(self.camera_info.k, dtype=np.float64).reshape(3, 3)
-        camera_frame = self._camera_frame_override or self.camera_info.header.frame_id
+        camera_frame = self.camera_info.header.frame_id
 
         # Get world → camera transform
         try:
