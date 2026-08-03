@@ -59,6 +59,7 @@ class LiveMonitorNode(Node):
         obs2 = 'uav2'
         target = 'uav3'
         odom_suffix = 'hw_api/ground_truth'
+        gt_aligned_topic = ''      # empty -> fall back to the target's raw odom topic
         self.mode = 'classic'
 
         if config_path.exists():
@@ -72,12 +73,16 @@ class LiveMonitorNode(Node):
                     target = roles.get('target', target)
                     eval_cfg = cfg.get('evaluation', {})
                     odom_suffix = eval_cfg.get('odom_topic_suffix', odom_suffix)
+                    gt_aligned_topic = eval_cfg.get('gt_aligned_topic', gt_aligned_topic)
                     self.mode = eval_cfg.get('live_monitor_mode', self.mode)
             except Exception as e:
                 self.get_logger().warn(f'Could not load config: {e}')
 
         # ── Topics ───────────────────────────────────────────────────────
-        self.target_odom_topic = f'/{target}/{odom_suffix}'
+        # Aligned GT when the triangulation node republishes it: the raw topic is in the target
+        # drone's own origin frame and its z datum differs from the estimate's by several metres,
+        # which the Z panel would draw as a constant tracking error.
+        self.target_odom_topic = gt_aligned_topic or f'/{target}/{odom_suffix}'
         self.estimate_odom_topic = '/target/odometry_estimate'
         self.predicted_path_topic = '/target/predicted_trajectory'
 

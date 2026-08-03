@@ -1560,7 +1560,7 @@ class ObserverNode(Node):
             )
         except Exception as exc:
             self.get_logger().warn(
-                f'TF lookup {self.world_frame_id} <- {camera_frame} failed: {exc}',
+                f'[{self.uav_name}] TF lookup {self.world_frame_id} <- {camera_frame} failed: {exc}',
                 throttle_duration_sec=2.0,
             )
             return None
@@ -1571,7 +1571,7 @@ class ObserverNode(Node):
         tf_delta_ns = transform_stamp_ns - stamp_ns
         if abs(tf_delta_ns) > self.max_tf_delta_ns:
             self.get_logger().warn(
-                f'Dropping measurement because TF delta is {tf_delta_ns / 1e6:.1f} ms '
+                f'[{self.uav_name}] Dropping measurement because TF delta is {tf_delta_ns / 1e6:.1f} ms '
                 f'(limit {self.max_tf_delta_ns / 1e6:.1f} ms).',
                 throttle_duration_sec=2.0,
             )

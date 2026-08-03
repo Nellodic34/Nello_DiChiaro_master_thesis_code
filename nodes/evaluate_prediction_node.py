@@ -5,6 +5,7 @@ import bisect
 import csv
 import json
 import math
+import signal
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
@@ -71,6 +72,7 @@ class PredictionEvaluatorNode(Node):
         obs2_name = 'uav2'
         target_name = 'uav3'
         eval_odom_suffix = 'hw_api/ground_truth'
+        gt_aligned_topic = ''      # empty -> fall back to the target's raw odom topic
         
         if config_path.exists():
             import yaml
@@ -84,6 +86,7 @@ class PredictionEvaluatorNode(Node):
                             target_name = config['uav_roles'].get('target', target_name)
                         if 'evaluation' in config:
                             eval_odom_suffix = config['evaluation'].get('odom_topic_suffix', eval_odom_suffix)
+                            gt_aligned_topic = config['evaluation'].get('gt_aligned_topic', gt_aligned_topic)
                 self.get_logger().info(f'Loaded evaluation config: obs1={obs1_name}, obs2={obs2_name}, target={target_name}, suffix={eval_odom_suffix}')
             except Exception as e:
                 self.get_logger().error(f'Failed to load config from {config_path}: {e}')
@@ -93,7 +96,7 @@ class PredictionEvaluatorNode(Node):
         self.output_dir = default_output_dir / timestamp
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.declare_parameter('gt_odom_topic', f'/{target_name}/{eval_odom_suffix}')
+        self.declare_parameter('gt_odom_topic', gt_aligned_topic or f'/{target_name}/{eval_odom_suffix}')
         self.declare_parameter('proposed_path_topic', '/target/predicted_trajectory')
         self.declare_parameter('stamp_tolerance_sec', 0.10)
         self.declare_parameter('anees_stamp_tolerance_sec', 0.15)
@@ -1811,6 +1814,15 @@ class PredictionEvaluatorNode(Node):
             return
         self.finalized = True
 
+        # The five plots below take seconds to render, and the launcher kills this process the
+        # instant it shuts down. Every run so far ended up with json+csv and nothing else because
+        # the signal landed mid-render, so hold both signals off until the artifacts are on disk.
+        for _sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(_sig, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass  # not the main thread; the writes below still run
+
         self.write_json_summary()
         self.write_csv_summary()
         self.write_plot()
@@ -1819,6 +1831,15 @@ class PredictionEvaluatorNode(Node):
         self.write_xyz_plot()
         self.write_estimation_vs_odom_plot()
         self.write_report()
+
+        # debug/evaluation/latest was a hand-made symlink nobody ever moved, so it kept pointing
+        # at a run from days earlier. Repoint it here, where the artifacts are known complete.
+        try:
+            link = self.output_dir.parent / 'latest'
+            link.unlink(missing_ok=True)
+            link.symlink_to(self.output_dir, target_is_directory=True)
+        except OSError as exc:
+            self.safe_log_info(f'Could not update the "latest" symlink: {exc}')
 
         self.safe_log_info('Final evaluation artifacts saved:')
         self.safe_log_info(f'  JSON: {self.output_json_path}')
@@ -1840,6 +1861,15 @@ def main() -> None:
 
     rclpy.init()
     node = PredictionEvaluatorNode()
+
+    # Python has no default Python-level handler for SIGTERM, so the launcher's kill used to end
+    # the process outright and skip the finally below. Route it through the normal shutdown path.
+    def _on_sigterm(*_):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        rclpy.try_shutdown()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, rclpy_executors.ExternalShutdownException):

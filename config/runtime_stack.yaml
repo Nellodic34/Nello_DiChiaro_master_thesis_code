@@ -1,20 +1,26 @@
 launcher:
   drone_run_mode: "decentralized_evaluation"  # one of: simple_detection, decentralized, decentralized_evaluation
   auto_start_node: triangulation  # one of: none, detection, triangulation
-  use_sim_time: false  # true for bag/simulation/clock playback, false for real drones
+  use_sim_time: false  # REAL DRONES: no /clock, wall time only
 
 vision:
-  publish_annotated_image: false  # detection boxes image on /detection... ; useful for debug, costs bandwidth
+  publish_annotated_image: true  # detection boxes image on /detection... ; useful for debug, costs bandwidth
   publish_debug_annotated_image: false  # ((RAYS)) publish observer debug overlays and triangulation-side ray overlays on separate topics
   publish_detector_evaluation_packets: true  # when false the observer skips all evaluator telemetry and adds no extra evaluation workload
-  publish_camera_static_tf: true  # publish camera static TF locally from this node; normally false in sim/real, useful for bag replay/debug only
-  model_path: "dataset_tools/weights2/best_openvino_model"  # YOLO/OpenVINO weights for observer_node; relative paths are resolved from the repo root
+  publish_camera_static_tf: true  # MUST stay true on these drones. Verified against the 22-7 bag's /tf_static:
+                                  # the RealSense driver publishes its chain UN-namespaced (rgbd_link->rgbd_color_frame->
+                                  # rgbd_color_optical_frame, plus the depth branch) and it has NO link to fcu at all.
+                                  # The only fcu->rgbd_link transforms in the bag are uav8/fcu->uav8/rgbd_link and
+                                  # uav81/fcu->uav81/rgbd_link, i.e. the ones THIS node publishes. Set it false and the
+                                  # TF chain from fcu to the camera does not exist, so the observer produces no rays.
+                                  # It is not a bag-replay-only flag despite what the old comment claimed.
+  model_path: "dataset_tools/weights6/best_openvino_model"  # YOLO/OpenVINO weights for observer_node; relative paths are resolved from the repo root
   device: "cpu"  # inference device: "cpu" for Intel drone, "cuda" for GPU, "GPU" for Intel iGPU via OpenVINO
   observation_topic_name: "target_observation"  # per-observer frozen 3D measurement topic suffix, e.g. /uav1/target_observation
   allow_tf_fallback: true  # if true, observer publishes a measurement using latest TF when exact frame-time TF is unavailable
   max_tf_delta_ms: 40.0  # local image/TF skew budget in ms; observer drops stale ray-freeze TFs and triangulation rejects packets exceeding it
-  observer_image_topic: "/uav8/rgbd/color/image_raw/compressed"  # role-specific override used when the generic observer node runs as observer2
-  main_image_topic: "/uav11/rgbd/color/image_raw/compressed"      # role-specific override used when the generic observer node runs as observer1
+  observer_image_topic: "/uav8/rgbd/color/image_raw/compressed"   # observer2 = uav8 (22-7 bag); camera_info derived as /uav8/rgbd/color/camera_info
+  main_image_topic: "/uav81/rgbd/color/image_raw/compressed"      # observer1 = uav81 (22-7 bag); camera_info derived as /uav81/rgbd/color/camera_info
   observer_camera_info_topic: ""  # role-specific CameraInfo override for observer2; empty = derive from observer_image_topic
   main_camera_info_topic: ""  # role-specific CameraInfo override for observer1/main; empty = derive from main_image_topic
   # ROI logic: at margin=1.0 the node chooses a base crop whose resize to roi_reference_imgsz
@@ -75,8 +81,8 @@ camera_tf:
     y: 0.0
     z: -0.085
     roll: 0.0    # radians
-    pitch: 0.0
-    yaw: 0.0
+    pitch: 0.0      # PROVISIONAL: earlier -0.05..-0.09 were CONTAMINATED. tf proves all origin frames are nord-aligned (yaw 0), differing only by a per-flight Z datum (5.4 m in v5). That z-offset + near-constant heading makes translation degenerate with rotation, so the Kabsch "camera tilt" was mostly a z/translation artifact. Only v3 (26 deg heading sweep) has observability -> ~-3 deg pitch but with translation-class scatter. Do NOT tune here until a dedicated heading-sweep calibration flight isolates a real rotation. Real fix is in-pipeline (unify z via utm). See triangulation-diagnosis memory.
+    yaw: 0.0        # no camera yaw exists (frames nord-aligned; the v3/v5 "yaw" was z-datum + constant-heading degeneracy).
     yaw_offset: 0.0  # [GENERAL] Align world-origin headings (radians)
   observer2:  # observer drone camera mount
     x: 0.085
@@ -86,19 +92,36 @@ camera_tf:
     pitch: 0.0
     yaw: 0.0
     yaw_offset: 0.0 # [V2 CALIBRATION] Matches the 13.32 degree bias discovered in logs
+  child_frame: "rgbd_link"  # camera driver frame name (same on all drones)
 
 #ros2 run tf2_ros tf2_echo uav28/world_origin uav28/fcu
 
+# ---------------------------------------------------------------------------
+# PER-FLIGHT SURVEY CONSTANTS.  Empty on purpose in the DEPLOY tree.
+#
+# The bearing_bias numbers that live here in the bagtest tree are a fit to ONE
+# BOOT of one flight: the level reference is set at each power-up, so uav81's
+# -9.07 deg ground pitch belongs to that power-up and to no other.  Carrying a
+# profile forward injects 4-8 deg of pointing error, which at 18 m is 0.31 m per
+# degree.  On a real flight there is also no target ground truth to fit against.
+#
+# So: keep this "none".  If a flight is recorded and later analysed offline, fit
+# the bias in the bagtest tree, on that bag, and leave this file alone.
+# ---------------------------------------------------------------------------
+bag_profile: "none"
 
-  child_frame: "rgbd_link"  # camera driver frame name (same on all drones)
+bag_profiles:
+
+  none: {}   # no per-flight correction whatsoever -- the only valid deploy value
+
 
 simulation:
   drone_count: 3  # allowed values: 1, 2, 3
 
 uav_roles:
-  observer1: uav11  # generic observer role binding for the main drone
-  observer2: uav8 # generic observer role binding for the secondary drone
-  target: uav28      # TARGET drone name edit to match your real drone
+  observer1: uav81  # main/triangulating drone (22-7 bag)
+  observer2: uav8   # secondary observer drone (22-7 bag)
+  target: uav28     # TARGET drone name edit to match your real drone
 
 ekf:
   kf_process_noise_acc: 13.28   # CA jerk std-dev (m/s³) — raised to track aggressive maneuvers
@@ -131,10 +154,18 @@ ekf:
   #   Too low (<0.15): filter "locks on" to ghost acceleration after curves end
   imm_p_return_to_cv: 0.30
   # ---------------------------------------------------------------------------
-  kf_measurement_noise: 0.00020 # Visual angular variance seed (rad²).
-                                 # sqrt(0.0002)*1396.8 ≈ 22px YOLO jitter (reduced from 30px/0.0005).
+  kf_measurement_noise: 0.0019  # Visual angular variance seed (rad²) = sigma 2.5 deg.
                                  # SOTA mode: V_vis = kf_measurement_noise * d² * I (bearing cone).
                                  # MUST match tuning.yaml fixed_kf_measurement_noise.
+                                 # Was 0.00020 (sigma 0.81 deg), sized from the DETECTOR alone
+                                 # ("~22px YOLO jitter"). That is not the error budget: the camera is
+                                 # bolted to fcu with identity rotation, so attitude error enters the
+                                 # bearing 1:1 and dominates it at 1.5-3.9 deg measured on the 22-7
+                                 # bags. At 49 m the old value claimed sigma_range 3.8 m against a
+                                 # true 16.4 m -- a ~19x variance gap, which is the measured ANEES~64.
+                                 # NOTE: kf_process_noise_* and kf_mahalanobis_threshold below were
+                                 # CMA-ES-tuned against 0.00020. Re-run the tuner; until then the
+                                 # gate is effectively looser than it was tuned to be.
   kf_adaptive_cov_max_multiplier: 50.0
   kf_initial_covariance: 2.0
   kf_mahalanobis_threshold: 34.0  # chi²(3, 0.999): RAISED massively. With normalize_crlb=false, R is tight.
@@ -212,7 +243,7 @@ triangulation:
 # Image-space Kalman filter — false positive rejection layer inside each ObserverNode.
 kalman_filter:
   kf_enabled: true
-  kf_sigma_a: 300.0
+  kf_sigma_a: 400.0
   kf_sigma_px: 11.0
   kf_conf_beta: 1.0
   kf_conf_min: 0.2
@@ -233,8 +264,14 @@ kalman_filter:
 
 evaluation:
   auto_start_with_launch_sim: true  # when false ./launch_sim.sh skips the prediction evaluator and keeps only the live monitor window pane
-  odom_topic_suffix: "estimation_manager/odom_main" #hw_api/ground_truth" #"estimation_manager/odom_main"  # simulation ground truth — change to odometry/odom_main for real drone
+  odom_topic_suffix: "estimation_manager/odom_main"  # CORRECT for real drones: the 22-7 bags contain /uav28/estimation_manager/odom_main etc. The old comment calling this "simulation ground truth" and pointing at odometry/odom_main was wrong -- that topic does not exist on these drones. hw_api/ground_truth is the SIM-only one.
   world_frame_suffix: "world_origin"  # real drone RTK origin, V2 uses f9p_origin
+
+  # GT re-published by the triangulation node after the utm datum hop, in the same frame as
+  # /target/odometry_estimate. The raw <target>/odom topic is in the TARGET drone's own origin
+  # frame, whose z datum differs by several metres (5.4 m in v5), so comparing it against the
+  # estimate charts that constant gap as tracking error. Set to "" to go back to the raw topic.
+  gt_aligned_topic: "/target/ground_truth_aligned"
 
   # ---------------------------------------------------------------------------
   # Live Monitor Display Mode
@@ -257,7 +294,7 @@ evaluation:
   #                   Best for understanding spatial trajectory divergence
   #                   without the bird's-eye projection ambiguity.
   # ---------------------------------------------------------------------------
-  live_monitor_mode: "minimal_3d"  # one of: classic | full_3d | minimal_3d
+  live_monitor_mode: "classic"  # one of: classic | full_3d | minimal_3d
 
 # ---------------------------------------------------------------------------
 # RGB-D Depth Fusion  (Bar-Shalom et al. — gating & scalar measurement fusion;
@@ -358,7 +395,7 @@ observer_odom_uncertainty:
 #   Tracking Systems, Chapter 7: negative object recognition gate.
 # ---------------------------------------------------------------------------
 observer_self_rejection:
-  enabled: false                    # master switch; false = zero overhead (no subscriber created)
+  enabled: true                     # master switch; false = zero overhead (no subscriber created)
   max_odom_age_sec: 0.3             # s: reject only when other-observer odom is fresh
   rejection_gate_radius_m: 0.8      # m: physical drone body radius used to compute pixel gate
   rejection_depth_margin_m: 1.5     # m: unused while rejection_only_if_closer=false; kept for future re-enable

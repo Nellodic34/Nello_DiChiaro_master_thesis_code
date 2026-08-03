@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import collections
+import os
 import struct
 import time
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path as FsPath
 from typing import Deque, Dict, List, Optional, Tuple
@@ -39,6 +41,259 @@ def quat_to_rotmat(x: float, y: float, z: float, w: float) -> np.ndarray:
     )
 
 
+def clip_segment_to_front(p_a, p_b, z_near=0.1):
+    """Clip a camera-frame segment against the z=z_near plane. None if fully behind."""
+    za, zb = float(p_a[2]), float(p_b[2])
+    if za < z_near and zb < z_near:
+        return None
+    if za < z_near:
+        p_a = p_a + (p_b - p_a) * ((z_near - za) / (zb - za))
+    elif zb < z_near:
+        p_b = p_a + (p_b - p_a) * ((z_near - za) / (zb - za))
+    return p_a, p_b
+
+
+def bearing_error_deg(origin, ray, point):
+    """Angle in degrees between a ray and the true bearing origin->point."""
+    v = np.asarray(point, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
+    denom = float(np.linalg.norm(v) * np.linalg.norm(ray))
+    if denom < 1e-9:
+        return float('nan')
+    return float(np.degrees(np.arccos(np.clip(float(np.dot(v, ray)) / denom, -1.0, 1.0))))
+
+
+def bearing_error_az_el_deg(origin, ray, point):
+    """Bearing error split into (azimuth, elevation), degrees, in the north-aligned world frame.
+
+    Azimuth is measured in the horizontal plane, elevation against it. A drone heading bias
+    lands entirely in azimuth; a Z-datum or camera-pitch fault lands entirely in elevation.
+    """
+    v = np.asarray(point, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
+    r = np.asarray(ray, dtype=np.float64)
+    az = np.degrees(np.arctan2(r[1], r[0]) - np.arctan2(v[1], v[0]))
+    az = (az + 180.0) % 360.0 - 180.0
+    el = np.degrees(
+        np.arctan2(r[2], np.hypot(r[0], r[1])) - np.arctan2(v[2], np.hypot(v[0], v[1]))
+    )
+    return float(az), float(el)
+
+
+def _bearing_az_el_deg(origin, point):
+    """Absolute (azimuth, elevation) of point seen from origin, degrees, world frame."""
+    v = np.asarray(point, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
+    return (float(np.degrees(np.arctan2(v[1], v[0]))),
+            float(np.degrees(np.arctan2(v[2], np.hypot(v[0], v[1])))))
+
+
+def derotate_bearing(ray, az_deg, el_deg):
+    """Remove a constant (azimuth, elevation) bias from a world-frame ray.
+
+    Exact inverse of what bearing_error_az_el_deg measures, so a measured bias can be pasted
+    back as a correction. Azimuth is applied about world Z, which is where a magnetometer
+    heading error lives -- NOT about the body z of camera_tf.yaw_offset, which differs by the
+    drone's roll/pitch (6.6 deg of roll on uav8 in the v5 bag).
+
+    The observer's position is deliberately untouched: it comes from RTK, which a miscalibrated
+    compass does not affect. Only the pointing direction is wrong.
+    """
+    if not az_deg and not el_deg:
+        return ray
+    r = np.asarray(ray, dtype=np.float64)
+    az = np.arctan2(r[1], r[0]) - np.radians(az_deg)
+    el = np.arctan2(r[2], np.hypot(r[0], r[1])) - np.radians(el_deg)
+    c = np.cos(el)
+    return np.array([c * np.cos(az), c * np.sin(az), np.sin(el)], dtype=np.float64)
+
+
+def rebias_about(cam_pos, origin, ray, az_deg, el_deg):
+    """Put a corrected world ray back into the biased world one camera's tf still believes in.
+
+    derotate_bearing takes the compass error OUT of the rays, but a tf lookup still hands back
+    the biased camera pose, so projecting a corrected ray with it draws the ray off by the full
+    bias. Re-applying the bias here is what makes the two agree again.
+
+    The rotation is about the CAMERA's position, not the world origin: the bias rotates the
+    camera's attitude and leaves RTK positions where they are, so a point p must come back as
+    cam_pos + Rz(az)*(p - cam_pos). Returns the (origin, ray) pair ready to project.
+    """
+    if not az_deg and not el_deg:
+        return origin, ray
+    offset = np.asarray(origin, dtype=np.float64) - np.asarray(cam_pos, dtype=np.float64)
+    dist = float(np.linalg.norm(offset))
+    if dist > 0.0:
+        # derotate_bearing normalises, so carry the length across by hand.
+        offset = derotate_bearing(offset, -az_deg, -el_deg) * dist
+    return cam_pos + offset, derotate_bearing(ray, -az_deg, -el_deg)
+
+
+def fit_bias_offsets(samples):
+    """Constant (az, el) bias of one observer, fitted on the first half of its samples.
+
+    Returns (az_fit, el_fit, az_residual, el_residual, n) in degrees, or None if too few
+    samples. Fitting and scoring on the same frames would be circular, so the split is by
+    time: the offsets come from the early half and the residual is measured on frames the
+    fit never saw. A residual near zero means the bias really is a constant of the platform
+    (a miscalibrated compass) rather than drift or a bad fit.
+
+    Median, not mean: a handful of false detections would drag a mean and leave the offset
+    describing the outliers instead of the hardware.
+    """
+    if len(samples) < 4:
+        return None
+    ordered = sorted(samples)
+    half = len(ordered) // 2
+    az_fit = float(np.median([s[1] for s in ordered[:half]]))
+    el_fit = float(np.median([s[2] for s in ordered[:half]]))
+    az_res = float(np.median([s[1] for s in ordered[half:]])) - az_fit
+    el_res = float(np.median([s[2] for s in ordered[half:]])) - el_fit
+    return az_fit, el_fit, az_res, el_res, len(ordered)
+
+
+def metric_or_angular(d_el_deg, rng_m):
+    """Score 'constant degrees' against 'constant metres' as explanations of an elevation error.
+
+    A camera that really points wrong holds its DEGREES at every range. A ray whose ORIGIN
+    (or whose target's GT) sits at the wrong height holds its METRES, and its angle decays as
+    1/range. At a single range the two are indistinguishable, which is how a fitted el_deg
+    ends up not transferring to the next flight.
+
+    Both are scored on the same axis -- metres of vertical miss at the target -- so the
+    residuals compare directly. Returns (med_deg, med_m, res_ang_m, res_met_m, r_lo, r_hi).
+    """
+    d_el_deg = np.asarray(d_el_deg, dtype=np.float64)
+    rng_m = np.asarray(rng_m, dtype=np.float64)
+    med_deg = float(np.median(d_el_deg))
+    miss_m = np.radians(d_el_deg) * rng_m
+    med_m = float(np.median(miss_m))
+    return (med_deg, med_m,
+            float(np.median(np.abs(miss_m - np.radians(med_deg) * rng_m))),
+            float(np.median(np.abs(miss_m - med_m))),
+            float(rng_m.min()), float(rng_m.max()))
+
+
+def verdict_metric_or_angular(res_ang, res_met, r_lo, r_hi, med_m, what):
+    """Name the winning model, or refuse to when the range span cannot separate them."""
+    if r_hi < 1.5 * r_lo:
+        return f'range span too narrow to tell them apart (need r_hi > 1.5*r_lo)'
+    if res_met < 0.7 * res_ang:
+        return f'METRIC: {what} origin/GT height off by {-med_m:+.2f} m, an angle will not fix it'
+    if res_ang < 0.7 * res_met:
+        return f'ANGULAR: {what} really points wrong, an el_deg correction is the right shape'
+    return 'inconclusive'
+
+
+def differential_bias(s1, s2, max_dt_ns):
+    """Median (obs2 - obs1) az/el error, matching samples by nearest timestamp.
+
+    Differencing the two observers cancels any fault they SHARE -- above all the GT's own
+    altitude error, since a baseline much shorter than the range puts both at nearly the
+    same distance so a metric GT error subtracts out. What survives is the relative geometry
+    of the two observers.
+
+    That survivor has two possible homes, and they are NOT interchangeable:
+
+      angular -- uav8's camera really points higher (mount, or a bad attitude solution).
+                 The elevation discrepancy is then constant in DEGREES at every range.
+      metric  -- uav8's ray ORIGIN sits at the wrong height, because its world_origin z
+                 datum is set at its own take-off and differs from uav81's. The discrepancy
+                 is then constant in METRES and its angle shrinks as 1/range.
+
+    Both look identical at a single range, which is why an el_deg fitted on one flight does
+    not transfer to the next. So both models are scored on the same axis (metres of vertical
+    miss at the target) and the residuals returned side by side: whichever residual is
+    smaller names the fault, provided the range span is wide enough to tell them apart.
+
+    Returns (n, d_az, d_el_deg, d_el_m, res_ang_m, res_met_m, r_lo, r_hi) or None.
+    """
+    if len(s1) < 30 or len(s2) < 30:
+        return None
+    a = np.array(s1, dtype=np.float64)
+    b = np.array(s2, dtype=np.float64)
+    order_a = np.argsort(a[:, 0])
+    a = a[order_a]
+    j = np.clip(np.searchsorted(a[:, 0], b[:, 0]), 1, len(a) - 1)
+    near = np.where(np.abs(b[:, 0] - a[j - 1, 0]) < np.abs(b[:, 0] - a[j, 0]), j - 1, j)
+    ok = np.abs(b[:, 0] - a[near, 0]) <= max_dt_ns
+
+    # The cancellation only works while both observers sit at nearly the same range: a metric
+    # GT fault subtends different angles at different distances, so on a dispersed formation
+    # it stops subtracting out and leaks into the difference as a fake camera bias. On the v3
+    # flight the ratio runs 0.53..2.08, so this is not a hypothetical.
+    ratio = b[:, 5] / np.maximum(a[near, 5], 1e-6)
+    ok &= (ratio > 0.8) & (ratio < 1.25)
+    if int(ok.sum()) < 30:
+        return None
+
+    d_az = b[ok, 1] - a[near[ok], 1]
+    d_el = b[ok, 2] - a[near[ok], 2]
+    med_el, med_m, res_ang, res_met, r_lo, r_hi = metric_or_angular(d_el, b[ok, 5])
+
+    return (int(ok.sum()), float(np.median(d_az)), med_el, med_m,
+            res_ang, res_met, r_lo, r_hi)
+
+
+def fit_field_slope(samples):
+    """Where does an observer's bearing error live: the mount, the optics, or the attitude?
+
+    Each fault class leaves a different signature in how the error varies across the field of
+    view, so both error axes are regressed against BOTH true bearing axes at once:
+
+        err_el = A*el_true + B*az_true + drift*t + c
+        err_az = C*el_true + D*az_true + drift*t + c
+
+    - A camera bolted on crooked (a fixed pitch or yaw offset) rotates the whole ray bundle
+      rigidly: every slope 0, error in the constant.
+    - Wrong focal length or principal point scales the error with the distance off-axis, so it
+      shows on the DIAGONAL terms A and D.
+    - A roll about the optical axis moves a point perpendicular to its offset from image centre,
+      turning horizontal distance into vertical error. That is the CROSS term B (and -C), and it
+      is the one fault that leaves the detector's box perfectly on target in its own image while
+      the world-frame ray still misses. B ~= the roll angle in radians.
+
+    Two traps this has to dodge:
+
+    - The target crosses the field of view WHILE time passes, so a slow drift (in the compass,
+      or in the target's own odometry) masquerades as a field-of-view slope. Fitting time as its
+      own regressor is what separates them; when the target sweeps monotonically the two are
+      collinear and NOTHING can separate them, which is what `corr` is for. Above ~0.9 the slope
+      is not identifiable and must not be acted on.
+    - Regressing against the measured bearing instead of the true one shares the noise between
+      the two axes and manufactures a slope out of it, so the regressor is always the true one.
+
+    Valid only while the camera is static (v5 has the observers on a table), where the true world
+    bearing differs from the image position by a fixed rotation. On a moving observer the
+    body-frame direction has to be used instead.
+
+    Returns a dict per error axis with `d_el`/`d_az` [deg/deg], `drift` [deg/min], `lo`/`hi`
+    [deg], plus the regressor spans and their collinearity with time. A slope means nothing
+    without span: no leverage, no conclusion.
+    """
+    if len(samples) < 8:
+        return None
+    a = np.asarray(samples, dtype=np.float64)
+    if a.shape[1] < 5:
+        return None
+    az_err, el_err, az_true, el_true = a[:, 1], a[:, 2], a[:, 3], a[:, 4]
+    t_min = (a[:, 0] - a[:, 0].min()) / 6e10          # ns -> minutes
+
+    el_span, az_span = float(np.ptp(el_true)), float(np.ptp(az_true))
+    if el_span <= 1e-6 or az_span <= 1e-6 or t_min.max() <= 1e-9:
+        return None
+    design = np.column_stack([el_true, az_true, t_min, np.ones_like(el_err)])
+
+    def _axis(err):
+        c = np.linalg.lstsq(design, err, rcond=None)[0]
+        return dict(d_el=float(c[0]), d_az=float(c[1]), drift=float(c[2]),
+                    lo=float(err.min()), hi=float(err.max()))
+
+    return {
+        'el': _axis(el_err), 'az': _axis(az_err), 'n': len(a),
+        'el_span': el_span, 'az_span': az_span,
+        'corr_el_t': abs(float(np.corrcoef(el_true, t_min)[0, 1])),
+        'corr_az_t': abs(float(np.corrcoef(az_true, t_min)[0, 1])),
+    }
+
+
 def project_ray_on_image(image, camera_info, transform_wc, observations, color_list=None, thickness=2, length=10.0):
     """Project matched world-frame rays back onto observer1's image for triangulation debug."""
     img = image.copy()
@@ -60,8 +315,14 @@ def project_ray_on_image(image, camera_info, transform_wc, observations, color_l
         point_start_camera = rotation_cw @ point_start_world + translation_cw
         point_end_camera = rotation_cw @ point_end_world + translation_cw
 
-        if point_start_camera[2] <= 0 or point_end_camera[2] <= 0:
+        # Clip the segment to the part in front of the camera instead of dropping it.
+        # The remote observer's ray starts at the OTHER drone, which is almost always
+        # behind/outside this camera: skipping on start_z<=0 made the remote ray invisible
+        # in every frame, which is exactly the case we need to see.
+        clipped = clip_segment_to_front(point_start_camera, point_end_camera)
+        if clipped is None:
             continue
+        point_start_camera, point_end_camera = clipped
 
         points_camera = np.stack([point_start_camera, point_end_camera], axis=0).T
         points_2d = camera_matrix @ points_camera
@@ -1211,6 +1472,9 @@ class TriangulationNode(Node):
         _default_odom_max_age_sec = 0.5          # s:  stale odometry → fall back to pixel-only
         _default_distance_dependent_noise = True  # WLS: scale visual sigma by d^2
         _default_odom_max_variance = 1.0          # m²: diagonal clamp on P_odom (protects against sim baro Z~1286)
+        _bag_profile_name = 'none'                # which bag_profiles block was applied
+        _bearing_bias_cfg = {}                    # per-role constant (az, el) ray bias, degrees
+        _target_gt_z_offset_m = 0.0               # m: residual z the utm datum hop leaves on the GT
 
         if _config_path.exists():
             import yaml
@@ -1227,6 +1491,19 @@ class TriangulationNode(Node):
                             _eval = _cfg['evaluation']
                             _world_frame_suffix = _eval.get('world_frame_suffix', _world_frame_suffix)
                             _target_gt_odom_suffix = _eval.get('odom_topic_suffix', _target_gt_odom_suffix)
+                        # Per-flight survey constants live under bag_profiles; bag_profile
+                        # picks one and "none" picks nothing, so a new bag replays raw. The
+                        # BAG_PROFILE env var overrides for a single run without editing yaml.
+                        _bag_profile_name = os.environ.get(
+                            'BAG_PROFILE') or _cfg.get('bag_profile') or 'none'
+                        _profiles = _cfg.get('bag_profiles') or {}
+                        if _bag_profile_name != 'none' and _bag_profile_name not in _profiles:
+                            raise SystemExit(
+                                f'bag_profile "{_bag_profile_name}" is not in {_config_path}. '
+                                f'Known profiles: {sorted(_profiles) + ["none"]}')
+                        _profile = _profiles.get(_bag_profile_name) or {}
+                        _bearing_bias_cfg = _profile.get('bearing_bias') or {}
+                        _target_gt_z_offset_m = float(_profile.get('target_gt_z_offset_m') or 0.0)
                         if 'vision' in _cfg:
                             _vision = _cfg['vision']
                             _default_publish_markers = bool(
@@ -1354,6 +1631,7 @@ class TriangulationNode(Node):
         self.declare_parameter('estimated_position_topic', '/target/position_estimate')
         self.declare_parameter('triangulation_raw_topic', '/target/triangulation_raw')
         self.declare_parameter('error_vector_topic', '/target/position_error')
+        self.declare_parameter('gt_aligned_topic', '/target/ground_truth_aligned')
         self.declare_parameter('target_frame_id', 'world')
         self.declare_parameter('max_pair_age_sec', _default_max_pair_age_sec)
         self.declare_parameter('observation_buffer_sec', _default_observation_buffer_sec)
@@ -1410,6 +1688,7 @@ class TriangulationNode(Node):
         self.estimated_position_topic = str(self.get_parameter('estimated_position_topic').value)
         self.triangulation_raw_topic = str(self.get_parameter('triangulation_raw_topic').value)
         self.error_vector_topic = str(self.get_parameter('error_vector_topic').value)
+        self.gt_aligned_topic = str(self.get_parameter('gt_aligned_topic').value)
         self.target_frame_id = str(self.get_parameter('target_frame_id').value)
         self.max_pair_age_ns = int(float(self.get_parameter('max_pair_age_sec').value) * 1_000_000_000.0)
         self.observation_buffer_ns = int(float(self.get_parameter('observation_buffer_sec').value) * 1_000_000_000.0)
@@ -1530,6 +1809,30 @@ class TriangulationNode(Node):
         self._imm_cov_trace_reset_thresh = 500.0
 
         self.target_gt_odom: Optional[Odometry] = None
+        # Origin-frame datum offsets are survey constants; resolve once per source frame.
+        self._datum_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        # Per-observer (stamp, az_err, el_err) history, for fitting a constant heading bias.
+        # Bounded: the fit is re-run every 50 samples and is O(n), so an unbounded list makes
+        # a long flight pay for its own history. 20k samples is ~11 min at 30 Hz per observer,
+        # past any fit the drift regressor can still call constant.
+        self._bias_samples: Dict[str, Deque] = collections.defaultdict(
+            lambda: collections.deque(maxlen=20000))
+        self._bias_sample_count = 0
+        # Measured constant bearing bias per observer, keyed by uav name (see [BIASFIT] log).
+        self.bearing_bias: Dict[str, Tuple[float, float]] = {}
+        self.get_logger().info(f'Bag profile: {_bag_profile_name}')
+        for _role, _uav in (('observer1', self.observer1_name), ('observer2', self.observer2_name)):
+            _b = _bearing_bias_cfg.get(_role) or {}
+            _az, _el = float(_b.get('az_deg', 0.0)), float(_b.get('el_deg', 0.0))
+            if _az or _el:
+                self.bearing_bias[_uav] = (_az, _el)
+                self.get_logger().info(
+                    f'Bearing bias correction for {_uav}: az={_az:+.2f} deg el={_el:+.2f} deg')
+        # Residual z the utm datum hop leaves on the target GT (see config for why it is on the GT).
+        self.target_gt_z_offset_m = _target_gt_z_offset_m
+        if self.target_gt_z_offset_m:
+            self.get_logger().info(
+                f'Target GT z datum offset: {self.target_gt_z_offset_m:+.2f} m')
         self.last_error_log_time = time.time()
 
         # Observer odometry for position uncertainty propagation into R.
@@ -1548,6 +1851,7 @@ class TriangulationNode(Node):
         self.estimated_position_pub = self.create_publisher(Vector3Stamped, self.estimated_position_topic, 10)
         self.triangulation_raw_pub = self.create_publisher(PointStamped, self.triangulation_raw_topic, 10)
         self.error_vector_pub = self.create_publisher(Vector3Stamped, self.error_vector_topic, 10)
+        self.gt_aligned_pub = self.create_publisher(Odometry, self.gt_aligned_topic, 20)
         self.triangulation_evaluation_pub = None
         if self.publish_evaluation_packets:
             self.triangulation_evaluation_pub = self.create_publisher(String, '/target/triangulation_evaluation', 10)
@@ -1556,6 +1860,14 @@ class TriangulationNode(Node):
         self.position_markers_pub = self.create_publisher(MarkerArray, '/target/position_markers', 10)
         self.fusion_mode_pub = self.create_publisher(String, '/tracker/fusion_mode', 10)
         self.last_fusion_mode = "UNINITIALIZED"
+        # Pairing/gating diagnostics: counters flushed to a one-line summary every 2 s.
+        self._diag = collections.Counter()
+        self._diag_last_log_ns = 0
+        # Geometry probe: on failing cycles, measure the RAW ray-gap of time-feasible
+        # candidate pairs and correlate it with dt, to separate a geometry/calibration
+        # miss (gap large even at dt~0) from a time-sync miss (gap grows with dt).
+        self._probe = {}
+        self._probe_reset()
         self.observer1_debug_annotated_pub = None
         if self.publish_debug_annotated_image:
             self.observer1_debug_annotated_pub = self.create_publisher(
@@ -1662,6 +1974,25 @@ class TriangulationNode(Node):
     def target_gt_odom_callback(self, msg: Odometry) -> None:
         self.target_gt_odom = msg
 
+        # The raw GT sits in the target drone's own origin frame, several metres off in z from
+        # the frame the estimate is published in. Every consumer that compared the two raw
+        # topics (live monitor, evaluator) was therefore reporting the datum gap as tracking
+        # error. Re-emit the aligned copy once here so they all share one frame.
+        pos = self.gt_position_in_target_frame()
+        if pos is None:
+            return
+        aligned = Odometry()
+        aligned.header.stamp = msg.header.stamp
+        aligned.header.frame_id = self.target_frame_id
+        # Twist is expressed in child_frame_id (body), so a datum shift leaves it untouched.
+        aligned.child_frame_id = msg.child_frame_id
+        aligned.twist = msg.twist
+        aligned.pose.pose.orientation = msg.pose.pose.orientation
+        aligned.pose.pose.position.x = float(pos[0])
+        aligned.pose.pose.position.y = float(pos[1])
+        aligned.pose.pose.position.z = float(pos[2])
+        self.gt_aligned_pub.publish(aligned)
+
     def _observer1_odom_callback(self, msg: Odometry) -> None:
         """Cache the latest odometry of observer 1 for position uncertainty propagation.
 
@@ -1739,14 +2070,6 @@ class TriangulationNode(Node):
             if image_base:
                 return f'{image_base}/camera_info'
         return f'/{uav_name}/rgb/camera_info'
-
-    def _shares_common_world_origin(self, frame_id: str) -> bool:
-        if not frame_id or not self.target_frame_id:
-            return False
-        return (
-            self._frame_leaf(frame_id) == self.world_frame_suffix
-            and self._frame_leaf(self.target_frame_id) == self.world_frame_suffix
-        )
 
     @staticmethod
     def _resolve_camera_frame(source_name: str, camera_frame: str) -> str:
@@ -1878,6 +2201,18 @@ class TriangulationNode(Node):
         if not rays_to_draw:
             return False
 
+        # transform_wc comes straight from tf and still carries this camera's compass bias, while
+        # the rays have had theirs removed. Undo the correction for drawing only, or the local
+        # (green) ray lands a full bias away from the target it was measured on.
+        az_deg, el_deg = self.bearing_bias.get(source_name, (0.0, 0.0))
+        if az_deg or el_deg:
+            rot_wc = quat_to_rotmat(transform_wc.transform.rotation.x, transform_wc.transform.rotation.y,
+                                    transform_wc.transform.rotation.z, transform_wc.transform.rotation.w)
+            t_wc = np.array([transform_wc.transform.translation.x, transform_wc.transform.translation.y,
+                             transform_wc.transform.translation.z], dtype=np.float64)
+            cam_pos = -rot_wc.T @ t_wc
+            rays_to_draw = [rebias_about(cam_pos, o, r, az_deg, el_deg) for o, r in rays_to_draw]
+
         # local_obs and remote_obs are expressed in semantically common world_origin coordinates.
         debug_img = project_ray_on_image(
             debug_frame.bgr_image,
@@ -2006,9 +2341,12 @@ class TriangulationNode(Node):
         obs = self._transform_observation_to_target_frame(obs)
         if obs is None:
             return
+        obs = self._apply_bearing_bias(obs)
+        self._collect_bias_sample(obs)
 
         self.debug_observations[source_name].append(obs)
         buffer.append(obs)
+        self._diag['rx_' + source_name] += 1
         self._prune_stale_observations(stamp_ns)
         # Stereo triangulation is event-driven: attempt a match every time a new
         # observation arrives.  This is the correct approach because it minimises
@@ -2017,6 +2355,185 @@ class TriangulationNode(Node):
         if self.try_match_and_triangulate():
             self._publish_fusion_mode()
         self._try_publish_debug_image(source_name, stamp_ns)
+
+    def _datum_rt(
+        self,
+        source_frame: str,
+        stamp_ns: int,
+        label: str = '',
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Rotation+translation mapping source_frame -> target frame, hopping through utm.
+
+        Every drone roots its own tf tree at its own fcu, so a direct target<-source lookup
+        fails. utm is the one grid all of them share, so we do two INTRA-tree lookups and
+        compose. Measured on the v5 bag: the origin frames are exactly north-aligned (yaw 0)
+        and share the XY datum to ~1 cm, but their Z datums differ by several metres
+        (uav28 sits 5.39 m below uav81), so skipping this hop is a silent altitude bias.
+        """
+        cached = self._datum_cache.get(source_frame)
+        if cached is not None:
+            return cached
+
+        source_drone = source_frame.split('/', 1)[0]
+        source_utm = f'{source_drone}/utm_origin'
+        target_utm = f'{self.observer1_name}/utm_origin'
+        lookup_time = Time(seconds=stamp_ns // 1_000_000_000, nanoseconds=stamp_ns % 1_000_000_000)
+
+        def _look(target_frame: str, src_frame: str):
+            try:
+                return self.tf_buffer.lookup_transform(
+                    target_frame, src_frame, lookup_time, Duration(seconds=self.tf_timeout_sec))
+            except Exception:
+                return self.tf_buffer.lookup_transform(
+                    target_frame, src_frame, Time(), Duration(seconds=self.tf_timeout_sec))
+
+        try:
+            tf_to_utm = _look(source_utm, source_frame)
+            tf_from_utm = _look(self.target_frame_id, target_utm)
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Cannot datum-align {label or source_frame} {source_frame} -> '
+                f'{self.target_frame_id} via utm: {exc}',
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        def _rt(tf_msg):
+            q = tf_msg.transform.rotation
+            t = tf_msg.transform.translation
+            return (quat_to_rotmat(q.x, q.y, q.z, q.w),
+                    np.array([t.x, t.y, t.z], dtype=np.float64))
+
+        rot1, trans1 = _rt(tf_to_utm)
+        rot2, trans2 = _rt(tf_from_utm)
+        rot = rot2 @ rot1
+        trans = rot2 @ trans1 + trans2
+        # The datum between two origin frames is a survey constant, not a per-frame quantity:
+        # cache it so the GT path (76 Hz) does not pay two tf lookups per message.
+        self._datum_cache[source_frame] = (rot, trans)
+        self.get_logger().info(
+            f'Datum alignment {source_frame} -> {self.target_frame_id}: '
+            f'offset=({trans[0]:+.3f},{trans[1]:+.3f},{trans[2]:+.3f}) m'
+        )
+        return rot, trans
+
+    def _apply_bearing_bias(self, obs: SpatialObservation) -> SpatialObservation:
+        """Cancel this observer's known constant bearing bias, if one is configured."""
+        az_deg, el_deg = self.bearing_bias.get(obs.source_name, (0.0, 0.0))
+        if not az_deg and not el_deg:
+            return obs
+        return dataclasses.replace(obs, ray=derotate_bearing(obs.ray, az_deg, el_deg))
+
+    def _collect_bias_sample(self, obs: SpatialObservation) -> None:
+        """Record one ray's error against GT. Needs no pair, so it works on any bag."""
+        p_gt = self.gt_position_in_target_frame()
+        if p_gt is None:
+            return
+        az, el = bearing_error_az_el_deg(obs.origin, obs.ray, p_gt)
+        # The true bearing to GT is the regressor fit_field_slope needs; storing it here
+        # costs one arctan2 per observation and keeps the fit free of any tf lookup.
+        # Range comes along because it is what separates an angular fault from a metric one:
+        # a wrong camera pitch holds its degrees at every range, a wrong origin height holds
+        # its metres and its angle decays as 1/range. See differential_bias().
+        self._bias_samples[obs.source_name].append(
+            (obs.stamp_ns, az, el, *_bearing_az_el_deg(obs.origin, p_gt),
+             float(np.linalg.norm(p_gt - obs.origin))))
+        # Refit on a stride: the log is throttled but the fit is not, and it is O(n) over a
+        # list that now grows per observation rather than per pair.
+        self._bias_sample_count += 1
+        if self._bias_sample_count % 50 == 0:
+            self._log_bias_fit()
+
+    def _log_bias_fit(self) -> None:
+        """Report the constant az/el bias each observer's rays carry against GT.
+
+        Copy `az`/`el` straight into bearing_bias.<role> in the config to cancel a
+        miscalibrated compass. Only meaningful while the offset is genuinely constant, which
+        the held-out `res` verifies: a res near zero means constant, a large one means drift.
+        """
+        parts = []
+        for name, samples in sorted(self._bias_samples.items()):
+            fit = fit_bias_offsets(samples)
+            if fit is None:
+                continue
+            az_fit, el_fit, az_res, el_res, n = fit
+            parts.append(
+                f'{name} n={n} az={az_fit:+.2f}deg el={el_fit:+.2f}deg '
+                f'(holdout res az={az_res:+.2f} el={el_res:+.2f})'
+            )
+            field = fit_field_slope(samples)
+            if field is not None:
+                el, az = field['el'], field['az']
+                parts[-1] += (
+                    f"""\n           el_err: d/d(el)={el['d_el']:+.3f} """
+                    f"""d/d(az)={el['d_az']:+.3f}<-ROLL drift={el['drift']:+.2f}/min """
+                    f"""range=[{el['lo']:+.1f},{el['hi']:+.1f}]deg\n"""
+                    f"""           az_err: d/d(el)={az['d_el']:+.3f} """
+                    f"""d/d(az)={az['d_az']:+.3f} drift={az['drift']:+.2f}/min """
+                    f"""range=[{az['lo']:+.1f},{az['hi']:+.1f}]deg\n"""
+                    f"""           leverage: el span={field['el_span']:.1f}deg """
+                    f"""(corr w/ t {field['corr_el_t']:.2f}), az span={field['az_span']:.1f}deg """
+                    f"""(corr w/ t {field['corr_az_t']:.2f})"""
+                )
+            # Same angular-vs-metric question asked of this observer alone. The differential
+            # only answers it when the two observers disagree; when one of them carries the
+            # whole fault, as uav81 does on the v3 flight, the difference is the wrong probe.
+            arr = np.array(samples, dtype=np.float64)
+            m = metric_or_angular(arr[:, 2], arr[:, 5])
+            parts[-1] += (
+                f'\n           shape: el={m[0]:+.2f}deg = {m[1]:+.2f} m at target | '
+                f'residual angular={m[2]:.2f} m metric={m[3]:.2f} m '
+                f'over range [{m[4]:.1f},{m[5]:.1f}] m -> '
+                + verdict_metric_or_angular(m[2], m[3], m[4], m[5], m[1], name)
+            )
+        # The absolute el error above is contaminated by the GT's own altitude error, which
+        # both observers share. Differencing the two cancels it whenever they sit at nearly
+        # the same range, so a metric GT error subtracts out and the RELATIVE geometry
+        # survives. Measured on the v3 flight: baseline 9.09 m, range 6..49 m, parallax 29 deg
+        # median -- a healthy geometry, but the range ratio swings 0.53..2.08, so the
+        # same-range precondition holds only in the middle and is enforced in the difference.
+        # Samples are now one per observation, so the two lists differ in length and are
+        # matched by nearest timestamp within the same window the pairer uses.
+        s1 = self._bias_samples.get(self.observer1_name) or []
+        s2 = self._bias_samples.get(self.observer2_name) or []
+        if parts:
+            d = differential_bias(s1, s2, self.max_pair_age_ns)
+            if d is not None:
+                n_d, d_az, d_el, d_m, res_ang, res_met, r_lo, r_hi = d
+                # Name the better-fitting model, but only once the range span is wide enough
+                # for the two to be distinguishable at all.
+                verdict = verdict_metric_or_angular(res_ang, res_met, r_lo, r_hi, d_m, 'obs2 vs obs1')
+                parts.append(
+                    f'diff(obs2-obs1) n={n_d} az={d_az:+.2f}deg el={d_el:+.2f}deg '
+                    f'({d_m:+.2f} m at target) <- GT-free\n'
+                    f'           residual on same axis: angular={res_ang:.2f} m '
+                    f'metric={res_met:.2f} m over range [{r_lo:.1f},{r_hi:.1f}] m'
+                    f' -> {verdict}')
+        if parts:
+            # One log call for every observer: throttling is keyed on the call site, so a
+            # per-observer call would let the first name starve all the others.
+            self.get_logger().info(f'[BIASFIT] ' + ' || '.join(parts), throttle_duration_sec=15.0)
+
+    def gt_position_in_target_frame(self) -> Optional[np.ndarray]:
+        """Latest target ground truth expressed in the triangulation target frame.
+
+        The GT odometry is published in the TARGET drone's own origin frame, which carries a
+        different Z datum than observer1's. Comparing it raw put a fixed several-metre bias on
+        every altitude metric and on the bearing check, so it goes through the same utm hop
+        as the remote observations.
+        """
+        if self.target_gt_odom is None:
+            return None
+        p = self.target_gt_odom.pose.pose.position
+        pos = np.array([p.x, p.y, p.z], dtype=np.float64)
+        frame_id = self.target_gt_odom.header.frame_id
+        if not frame_id or frame_id == self.target_frame_id:
+            return pos
+        datum = self._datum_rt(frame_id, stamp_to_ns(self.target_gt_odom.header.stamp), 'target GT')
+        if datum is None:
+            return None
+        rot, trans = datum
+        return rot @ pos + trans + np.array([0.0, 0.0, self.target_gt_z_offset_m])
 
     def _transform_observation_to_target_frame(self, obs: SpatialObservation) -> Optional[SpatialObservation]:
         """Express one frozen observation in the triangulation target frame without changing its timestamp."""
@@ -2036,56 +2553,25 @@ class TriangulationNode(Node):
                 depth_sigma_m=obs.depth_sigma_m,
             )
 
-        if self._shares_common_world_origin(obs.frame_id):
-            return SpatialObservation(
-                stamp_ns=obs.stamp_ns,
-                origin=obs.origin,
-                ray=obs.ray,
-                frame_id=self.target_frame_id,
-                source_name=obs.source_name,
-                observation_id=obs.observation_id,
-                confidence=obs.confidence,
-                tf_delta_ns=obs.tf_delta_ns,
-                tf_status=obs.tf_status,
-                depth_valid=obs.depth_valid,
-                depth_m=obs.depth_m,
-                depth_sigma_m=obs.depth_sigma_m,
-            )
-
-        try:
-            sec = obs.stamp_ns // 1_000_000_000
-            nanosec = obs.stamp_ns % 1_000_000_000
-            lookup_time = Time(seconds=sec, nanoseconds=nanosec)
-            transform = self.tf_buffer.lookup_transform(
-                self.target_frame_id,
-                obs.frame_id,
-                lookup_time,
-                Duration(seconds=self.tf_timeout_sec),
-            )
-        except Exception:
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.target_frame_id,
-                    obs.frame_id,
-                    Time(),
-                    Duration(seconds=self.tf_timeout_sec),
-                )
-            except Exception as exc:
-                self.get_logger().warn(
-                    f'Cannot transform {obs.source_name} observation from {obs.frame_id} to {self.target_frame_id}: {exc}',
-                    throttle_duration_sec=2.0,
-                )
-                return None
-
-        t = transform.transform.translation
-        q = transform.transform.rotation
-        rot = quat_to_rotmat(q.x, q.y, q.z, q.w)
-        trans = np.array([t.x, t.y, t.z], dtype=np.float64)
+        # Route a remote observer through utm_origin. Its <uav>/world_origin shares orientation with the
+        # target frame (all MRS origin frames are north-aligned) but carries a per-flight position/Z datum
+        # offset: each drone inits its own takeoff altitude, so the two world_origins can sit several metres
+        # apart in z (measured 5.4 m in one flight, 0.19 m in another). A direct target<-source lookup fails
+        # because the two drones' tf trees are disconnected (each rooted at its own fcu). So hop through utm,
+        # the globally-consistent grid, in two INTRA-tree lookups.
+        # ponytail: assumes both drones share one UTM zone (same physical utm grid); a cross-zone flight
+        # would need an explicit utm-to-utm bridge transform.
+        datum = self._datum_rt(obs.frame_id, obs.stamp_ns, obs.source_name)
+        if datum is None:
+            return None
+        rot, trans = datum
+        origin = rot @ obs.origin + trans
+        ray = normalize(rot @ obs.ray)
 
         return SpatialObservation(
             stamp_ns=obs.stamp_ns,
-            origin=rot @ obs.origin + trans,
-            ray=normalize(rot @ obs.ray),
+            origin=origin,
+            ray=ray,
             frame_id=self.target_frame_id,
             source_name=obs.source_name,
             observation_id=obs.observation_id,
@@ -2116,6 +2602,92 @@ class TriangulationNode(Node):
         while self.debug_matched_pairs and self.debug_matched_pairs[0].local_obs.stamp_ns < cutoff_ns:
             self.debug_matched_pairs.popleft()
 
+    def _probe_reset(self) -> None:
+        self._probe = {
+            'best_gap': None, 'best_gap_dt_ms': None, 'best_gap_baseline': None,
+            'min_dt_ms': None, 'min_dt_gap': None,
+            'feasible_pairs': 0, 'cycles': 0,
+        }
+
+    def _probe_reject_geometry(self) -> None:
+        """Measure raw ray geometry of a failing cycle's time-feasible pairs.
+
+        For every candidate pair within the time window, compute the RAW ray-gap
+        (no time-alignment, so it reflects pure ray geometry) and its dt. Keep the
+        window's smallest achievable gap and the smallest-dt pair's gap. Reading:
+        best_gap large even at small dt => geometry/calibration; a small gap only
+        at small dt => time-sync (rays for different target instants). Runs only on
+        failing cycles and the buffers are small, so the O(n*m) scan is cheap.
+        """
+        best_gap = min_dt_ms = None
+        best_gap_dt_ms = best_gap_baseline = min_dt_gap = None
+        n_feasible = 0
+        for obs1 in self.observer1_observations:
+            for obs2 in self.observer2_observations:
+                dt_ns = abs(obs1.stamp_ns - obs2.stamp_ns)
+                if dt_ns > self.max_pair_age_ns:
+                    continue
+                n_feasible += 1
+                dt_ms = dt_ns / 1e6
+                baseline = float(np.linalg.norm(obs2.origin - obs1.origin))
+                _, gap = triangulate_midpoint(obs1.origin, obs1.ray, obs2.origin, obs2.ray)
+                if best_gap is None or gap < best_gap:
+                    best_gap, best_gap_dt_ms, best_gap_baseline = gap, dt_ms, baseline
+                if min_dt_ms is None or dt_ms < min_dt_ms:
+                    min_dt_ms, min_dt_gap = dt_ms, gap
+        if n_feasible == 0:
+            return
+        p = self._probe
+        if p['best_gap'] is None or best_gap < p['best_gap']:
+            p['best_gap'], p['best_gap_dt_ms'], p['best_gap_baseline'] = (
+                best_gap, best_gap_dt_ms, best_gap_baseline)
+        if p['min_dt_ms'] is None or min_dt_ms < p['min_dt_ms']:
+            p['min_dt_ms'], p['min_dt_gap'] = min_dt_ms, min_dt_gap
+        p['feasible_pairs'] += n_feasible
+        p['cycles'] += 1
+
+    def _log_pairing_diagnostics(self, now_ns: int) -> None:
+        """Emit a one-line pairing/gating summary every 2 s, then reset counters.
+
+        Answers at a glance: are rays arriving (rx), is the second observer
+        starved (nopair_starved_*), do rays arrive but never overlap/cross
+        (nopair_no_overlap_or_geom), or are formed pairs rejected downstream
+        (drop_baseline / drop_raygap / drop_wls / drop_maha) vs accepted.
+        """
+        if self._diag_last_log_ns == 0:
+            self._diag_last_log_ns = now_ns
+            return
+        if (now_ns - self._diag_last_log_ns) < 2_000_000_000:
+            return
+        self._diag_last_log_ns = now_ns
+        d = self._diag
+        self.get_logger().info(
+            'PAIRING 2s | rx: {o1}={a} {o2}={b} | nopair: starved_{o1}={c} '
+            'starved_{o2}={e} no_overlap_or_geom={f} | drops: baseline={g} '
+            'raygap={h} wls={i} maha={j} | accepted={k}'.format(
+                o1=self.observer1_name, o2=self.observer2_name,
+                a=d['rx_' + self.observer1_name], b=d['rx_' + self.observer2_name],
+                c=d['nopair_starved_obs1'], e=d['nopair_starved_obs2'],
+                f=d['nopair_no_overlap_or_geom'], g=d['drop_baseline'],
+                h=d['drop_raygap'], i=d['drop_wls_error'], j=d['drop_mahalanobis'],
+                k=d['accepted'],
+            )
+        )
+        p = self._probe
+        if p['cycles']:
+            self.get_logger().info(
+                'GEOM-PROBE 2s | feasible_pairs={fp} over {cy} failing cycles | '
+                'best_gap={bg:.2f} m @ dt={bd:.1f} ms (baseline={bb:.2f} m) | '
+                'smallest_dt={md:.1f} ms @ gap={mg:.2f} m | gate={gate:.2f} m'.format(
+                    fp=p['feasible_pairs'], cy=p['cycles'],
+                    bg=p['best_gap'], bd=p['best_gap_dt_ms'], bb=p['best_gap_baseline'],
+                    md=p['min_dt_ms'], mg=p['min_dt_gap'],
+                    gate=self.max_triangulation_error_m,
+                )
+            )
+        self._diag.clear()
+        self._probe_reset()
+
     def processing_timer_callback(self) -> None:
         """Timer callback: handles single-ray fallback and coasting only.
 
@@ -2133,6 +2705,7 @@ class TriangulationNode(Node):
         """
         now_ns = self.get_clock().now().nanoseconds
         self._prune_stale_observations(now_ns)
+        self._log_pairing_diagnostics(now_ns)
 
         # Guard: if stereo has fired very recently, the filter is healthy —
         # skip fallback evaluation to avoid double-updating.
@@ -2282,6 +2855,17 @@ class TriangulationNode(Node):
             self.observer1_observations.remove(best_obs1)
             self.observer2_observations.remove(best_obs2)
             all_pairs.append((best_obs1, best_obs2, best_diff))
+
+        if not all_pairs:
+            # No feasible pair this cycle — record why so the periodic summary can
+            # separate "second observer starved" from "rays present but never overlap".
+            if not self.observer1_observations:
+                self._diag['nopair_starved_obs1'] += 1
+            elif not self.observer2_observations:
+                self._diag['nopair_starved_obs2'] += 1
+            else:
+                self._diag['nopair_no_overlap_or_geom'] += 1
+                self._probe_reject_geometry()
 
         # Sort pairs by aligned timestamp to ensure strictly forward-in-time updates
         all_pairs.sort(key=lambda x: max(x[0].stamp_ns, x[1].stamp_ns))
@@ -2436,16 +3020,53 @@ class TriangulationNode(Node):
 
         baseline = float(np.linalg.norm(origin2 - origin1))
         if baseline < self.triangulation_min_baseline_m:
+            self._diag['drop_baseline'] += 1
             return False
 
         # ── Geometry pre-check (still uses midpoint for the ray-gap test) ────
         # We keep the cheap midpoint solely to gate on max_triangulation_error_m.
         # The WLS call below provides the true MLE estimate and covariance.
         midpoint_check, ray_gap_m = triangulate_midpoint(origin1, dir1, origin2, dir2)
+
+        # DIAGNOSTIC (throttled 5 s): separates a frame/rotation fault from a noise fault.
+        #   s,t   = depth of the closest point along each ray. NEGATIVE => the rays meet
+        #           BEHIND that observer, i.e. the ray direction is mirrored/rotated.
+        #   e1,e2 = angle between each ray and the true bearing observer->GT target.
+        #           Both ~0 => geometry is sound. One large => that observer's extrinsics.
+        #           Both large and similar => a shared world-frame/heading error.
+        s_depth = float(np.dot(midpoint_check - origin1, dir1) / max(np.dot(dir1, dir1), 1e-9))
+        t_depth = float(np.dot(midpoint_check - origin2, dir2) / max(np.dot(dir2, dir2), 1e-9))
+        gt_txt = ''
+        p_gt = self.gt_position_in_target_frame()
+        if p_gt is not None:
+            # Split each bearing error into azimuth and elevation: a heading bias shows up
+            # purely in azimuth, a Z-datum or mount-pitch fault purely in elevation.
+            az1, el1 = bearing_error_az_el_deg(origin1, dir1, p_gt)
+            az2, el2 = bearing_error_az_el_deg(origin2, dir2, p_gt)
+            # NB: bias samples are NOT collected here. Sampling only accepted pairs made the
+            # fit unable to bootstrap: a bag whose heading bias is large enough to stop the
+            # rays meeting yields no pairs, hence no samples, hence no bias to correct it
+            # with. Collection lives in _collect_bias_sample(), one per observation.
+            gt_txt = (
+                f' | e1={bearing_error_deg(origin1, dir1, p_gt):.1f}deg(az{az1:+.1f},el{el1:+.1f}) '
+                f'e2={bearing_error_deg(origin2, dir2, p_gt):.1f}deg(az{az2:+.1f},el{el2:+.1f}) '
+                f'gt_d1={np.linalg.norm(p_gt - origin1):.1f}m '
+                f'err_mid={np.linalg.norm(midpoint_check - p_gt):.1f}m'
+            )
+        self.get_logger().info(
+            f'[RAYDBG] {obs1.source_name} o=({origin1[0]:.1f},{origin1[1]:.1f},{origin1[2]:.1f}) '
+            f'r=({dir1[0]:.3f},{dir1[1]:.3f},{dir1[2]:.3f}) | '
+            f'{obs2.source_name} o=({origin2[0]:.1f},{origin2[1]:.1f},{origin2[2]:.1f}) '
+            f'r=({dir2[0]:.3f},{dir2[1]:.3f},{dir2[2]:.3f}) | '
+            f's={s_depth:.1f}m t={t_depth:.1f}m base={baseline:.1f}m gap={ray_gap_m:.2f}m{gt_txt}',
+            throttle_duration_sec=5.0,
+        )
+
         if ray_gap_m > self.max_triangulation_error_m:
             self.get_logger().warn(
                 f'Triangulation rejected: ray mismatch {ray_gap_m:.2f} m exceeds {self.max_triangulation_error_m:.2f} m'
             )
+            self._diag['drop_raygap'] += 1
             return False
 
         # ── Observer odometry covariance (for WLS EIV model) ─────────────────
@@ -2491,6 +3112,7 @@ class TriangulationNode(Node):
             )
         except ValueError as exc:
             self.get_logger().warn(str(exc), throttle_duration_sec=2.0)
+            self._diag['drop_wls_error'] += 1
             return False
 
         # Publish raw WLS estimate (MLE, before IMM smoothing)
@@ -2527,6 +3149,7 @@ class TriangulationNode(Node):
                 )
 
                 if not accepted:
+                    self._diag['drop_mahalanobis'] += 1
                     self.get_logger().warn(
                         'Outlier measurement rejected by Mahalanobis gating! Filter coasting purely on kinetics.'
                     )
@@ -2598,13 +3221,14 @@ class TriangulationNode(Node):
             stamp_ns,
         )
         self.publish_ground_truth_error(self.filtered_position, stamp_ns)
+        self._diag['accepted'] += 1
 
         # Publish evaluation packet for CMA-ES offline tuning
         if self.triangulation_evaluation_pub is not None:
             payload = {
                 'schema_version': 1,
                 'frame_stamp_ns': stamp_ns,
-                'triangulation_residual_m': 0.0,
+                'triangulation_residual_m': float(ray_gap_m),
                 'num_observers': 2,
                 'estimated_position_xyz': self.filtered_position.tolist(),
                 'estimated_velocity_xyz': self.filtered_velocity.tolist(),
@@ -2842,7 +3466,8 @@ class TriangulationNode(Node):
         est.lifetime.sec = 1
         marker_array.markers.append(est)
 
-        if self.target_gt_odom is not None:
+        gt_position = self.gt_position_in_target_frame()
+        if gt_position is not None:
             gt_stamp_ns = stamp_to_ns(self.target_gt_odom.header.stamp)
             if abs(stamp_ns - gt_stamp_ns) <= self.max_target_gt_age_ns:
                 gt = Marker()
@@ -2853,9 +3478,9 @@ class TriangulationNode(Node):
                 gt.id = 1
                 gt.type = Marker.SPHERE
                 gt.action = Marker.ADD
-                gt.pose.position.x = float(self.target_gt_odom.pose.pose.position.x)
-                gt.pose.position.y = float(self.target_gt_odom.pose.pose.position.y)
-                gt.pose.position.z = float(self.target_gt_odom.pose.pose.position.z)
+                gt.pose.position.x = float(gt_position[0])
+                gt.pose.position.y = float(gt_position[1])
+                gt.pose.position.z = float(gt_position[2])
                 gt.pose.orientation.w = 1.0
                 gt.scale.x = gt.scale.y = gt.scale.z = 0.4
                 gt.color.r = 0.0
@@ -2875,14 +3500,9 @@ class TriangulationNode(Node):
         if abs(stamp_ns - gt_stamp_ns) > self.max_target_gt_age_ns:
             return
 
-        gt_position = np.array(
-            [
-                self.target_gt_odom.pose.pose.position.x,
-                self.target_gt_odom.pose.pose.position.y,
-                self.target_gt_odom.pose.pose.position.z,
-            ],
-            dtype=np.float64,
-        )
+        gt_position = self.gt_position_in_target_frame()
+        if gt_position is None:
+            return
         error = estimated_position - gt_position
         sec = stamp_ns // 1_000_000_000
         nanosec = stamp_ns % 1_000_000_000
