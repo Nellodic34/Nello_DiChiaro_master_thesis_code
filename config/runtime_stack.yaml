@@ -5,7 +5,7 @@ launcher:
 
 vision:
   publish_annotated_image: true  # detection boxes image on /detection... ; useful for debug, costs bandwidth
-  publish_debug_annotated_image: false  # ((RAYS)) publish observer debug overlays and triangulation-side ray overlays on separate topics
+  publish_debug_annotated_image: true  # ((RAYS)) publish observer debug overlays and triangulation-side ray overlays on separate topics
   publish_detector_evaluation_packets: true  # when false the observer skips all evaluator telemetry and adds no extra evaluation workload
   publish_camera_static_tf: true  # MUST stay true on these drones. Verified against the 22-7 bag's /tf_static:
                                   # the RealSense driver publishes its chain UN-namespaced (rgbd_link->rgbd_color_frame->
@@ -20,7 +20,7 @@ vision:
   allow_tf_fallback: true  # if true, observer publishes a measurement using latest TF when exact frame-time TF is unavailable
   max_tf_delta_ms: 40.0  # local image/TF skew budget in ms; observer drops stale ray-freeze TFs and triangulation rejects packets exceeding it
   observer_image_topic: "/uav8/rgbd/color/image_raw/compressed"   # observer2 = uav8 (22-7 bag); camera_info derived as /uav8/rgbd/color/camera_info
-  main_image_topic: "/uav81/rgbd/color/image_raw/compressed"      # observer1 = uav81 (22-7 bag); camera_info derived as /uav81/rgbd/color/camera_info
+  main_image_topic: "/uav11/rgbd/color/image_raw/compressed"      # observer1 = uav81 (22-7 bag); camera_info derived as /uav81/rgbd/color/camera_info
   observer_camera_info_topic: ""  # role-specific CameraInfo override for observer2; empty = derive from observer_image_topic
   main_camera_info_topic: ""  # role-specific CameraInfo override for observer1/main; empty = derive from main_image_topic
   # ROI logic: at margin=1.0 the node chooses a base crop whose resize to roi_reference_imgsz
@@ -119,9 +119,30 @@ simulation:
   drone_count: 3  # allowed values: 1, 2, 3
 
 uav_roles:
-  observer1: uav81  # main/triangulating drone (22-7 bag)
+  observer1: uav11  # main/triangulating drone (22-7 bag)
   observer2: uav8   # secondary observer drone (22-7 bag)
   target: uav28     # TARGET drone name edit to match your real drone
+
+# ---------------------------------------------------------------------------
+# Shared heading (STATIC BENCH ONLY -- leave false to fly)
+# ---------------------------------------------------------------------------
+# Rotates uav11's rays so they are built with uav8's yaw instead of their own, live, every
+# frame. What it buys: the two compasses stop disagreeing, and it is the DIFFERENTIAL
+# azimuth error that inflates range as R^2/base (8.1 m/deg at 50 m on a 5.4 m base) while
+# the common-mode error that survives only rotates the solution (0.87 m/deg). On the v5 bag
+# the two magnetometers sat parallel on a table and disagreed by 17.7 deg.
+#
+# It assumes the two airframes' TRUE headings are equal. That holds only while they sit
+# parallel on the ground. Airborne, any real heading difference goes straight into uav11's
+# bearing as an error -- set this back to false before flying. The node prints a WARN at
+# startup for as long as it is on, and logs the live delta every 5 s.
+#
+# Only yaw is shared: roll/pitch come from the IMU, not the compass, and two hovering
+# drones genuinely differ there. Composes additively with bag_profiles.*.bearing_bias
+# (both are rotations about world Z), so it is safe alongside bag_profile: none.
+# Forces the observer odom subscriptions on even with use_odom_uncertainty: false;
+# staleness uses odom_max_age_sec and a stale frame falls back to uav11's own heading.
+shared_heading: false
 
 ekf:
   kf_process_noise_acc: 13.28   # CA jerk std-dev (m/s³) — raised to track aggressive maneuvers
@@ -154,7 +175,7 @@ ekf:
   #   Too low (<0.15): filter "locks on" to ghost acceleration after curves end
   imm_p_return_to_cv: 0.30
   # ---------------------------------------------------------------------------
-  kf_measurement_noise: 0.0019  # Visual angular variance seed (rad²) = sigma 2.5 deg.
+  kf_measurement_noise: 0.0002  # Visual angular variance seed (rad²) = sigma 2.5 deg.
                                  # SOTA mode: V_vis = kf_measurement_noise * d² * I (bearing cone).
                                  # MUST match tuning.yaml fixed_kf_measurement_noise.
                                  # Was 0.00020 (sigma 0.81 deg), sized from the DETECTOR alone

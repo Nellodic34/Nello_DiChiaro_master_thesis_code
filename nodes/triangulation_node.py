@@ -85,6 +85,17 @@ def _bearing_az_el_deg(origin, point):
             float(np.degrees(np.arctan2(v[2], np.hypot(v[0], v[1])))))
 
 
+def yaw_deg(q) -> float:
+    """Heading of a quaternion's body x-axis in the world XY plane, degrees.
+
+    This is the component a magnetometer sets, and the one that differs between two drones
+    sitting parallel on the ground. Roll/pitch are deliberately dropped: they come from the
+    IMU, not the compass.
+    """
+    rot = quat_to_rotmat(q.x, q.y, q.z, q.w)
+    return float(np.degrees(np.arctan2(rot[1, 0], rot[0, 0])))
+
+
 def derotate_bearing(ray, az_deg, el_deg):
     """Remove a constant (azimuth, elevation) bias from a world-frame ray.
 
@@ -1472,6 +1483,7 @@ class TriangulationNode(Node):
         _default_odom_max_age_sec = 0.5          # s:  stale odometry → fall back to pixel-only
         _default_distance_dependent_noise = True  # WLS: scale visual sigma by d^2
         _default_odom_max_variance = 1.0          # m²: diagonal clamp on P_odom (protects against sim baro Z~1286)
+        _default_shared_heading = False           # observer1 adopts observer2's yaw (bench only)
         _bag_profile_name = 'none'                # which bag_profiles block was applied
         _bearing_bias_cfg = {}                    # per-role constant (az, el) ray bias, degrees
         _target_gt_z_offset_m = 0.0               # m: residual z the utm datum hop leaves on the GT
@@ -1600,6 +1612,8 @@ class TriangulationNode(Node):
                             _default_df_range_chi2 = float(
                                 _df.get('fusion_range_chi2', _default_df_range_chi2)
                             )
+                        _default_shared_heading = bool(
+                            _cfg.get('shared_heading', _default_shared_heading))
                         if 'observer_odom_uncertainty' in _cfg:
                             _oou = _cfg['observer_odom_uncertainty']
                             _default_use_odom_uncertainty = bool(
@@ -1649,6 +1663,7 @@ class TriangulationNode(Node):
         self.declare_parameter('single_obs_min_confidence', _default_single_obs_min_confidence)
         self.declare_parameter('df_use_range_constraint', _default_df_use_range_constraint)
         self.declare_parameter('df_range_chi2', _default_df_range_chi2)
+        self.declare_parameter('shared_heading', _default_shared_heading)
         self.declare_parameter('use_odom_uncertainty', _default_use_odom_uncertainty)
         self.declare_parameter('odom_fallback_variance', _default_odom_fallback_variance)
         self.declare_parameter('min_bearing_distance', _default_min_bearing_distance)
@@ -1724,6 +1739,7 @@ class TriangulationNode(Node):
         self.single_obs_min_confidence = float(self.get_parameter('single_obs_min_confidence').value)
         self.df_use_range_constraint = bool(self.get_parameter('df_use_range_constraint').value)
         self.df_range_chi2 = float(self.get_parameter('df_range_chi2').value)
+        self.shared_heading = bool(self.get_parameter('shared_heading').value)
         self.use_odom_uncertainty = bool(self.get_parameter('use_odom_uncertainty').value)
         self.odom_fallback_variance = float(self.get_parameter('odom_fallback_variance').value)
         self.min_bearing_distance = float(self.get_parameter('min_bearing_distance').value)
@@ -1828,6 +1844,12 @@ class TriangulationNode(Node):
                 self.bearing_bias[_uav] = (_az, _el)
                 self.get_logger().info(
                     f'Bearing bias correction for {_uav}: az={_az:+.2f} deg el={_el:+.2f} deg')
+        if self.shared_heading:
+            self.get_logger().warn(
+                f'SHARED HEADING ACTIVE: {self.observer1_name} rays are rotated to use '
+                f'{self.observer2_name} heading instead of their own. This is valid ONLY while '
+                'both airframes are physically parallel (static bench experiments). In free '
+                'flight it injects the real heading difference as a bearing error -- turn it off.')
         # Residual z the utm datum hop leaves on the target GT (see config for why it is on the GT).
         self.target_gt_z_offset_m = _target_gt_z_offset_m
         if self.target_gt_z_offset_m:
@@ -1881,7 +1903,9 @@ class TriangulationNode(Node):
         # ── Observer odometry subscribers (for pose uncertainty propagation) ────
         # Topic pattern mirrors the MRS UAV System standard: /{uav_name}/estimation_manager/odom_main
         # QoS BEST_EFFORT to match the drone's odometry publisher (avoids queue backpressure).
-        if self.use_odom_uncertainty:
+        # shared_heading needs both yaws every frame, so it forces the subscriptions on even
+        # when the uncertainty path is off.
+        if self.use_odom_uncertainty or self.shared_heading:
             _odom_qos = QoSProfile(
                 depth=5,
                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1899,8 +1923,9 @@ class TriangulationNode(Node):
                 self._observer2_odom_callback,
                 _odom_qos,
             )
+            _why = 'uncertainty propagation' if self.use_odom_uncertainty else 'shared_heading'
             self.get_logger().info(
-                f'Observer odometry uncertainty enabled. '
+                f'Observer odometry enabled for {_why}. '
                 f'Subscribing to /{self.observer1_name}/estimation_manager/odom_main '
                 f'and /{self.observer2_name}/estimation_manager/odom_main'
             )
@@ -2204,7 +2229,7 @@ class TriangulationNode(Node):
         # transform_wc comes straight from tf and still carries this camera's compass bias, while
         # the rays have had theirs removed. Undo the correction for drawing only, or the local
         # (green) ray lands a full bias away from the target it was measured on.
-        az_deg, el_deg = self.bearing_bias.get(source_name, (0.0, 0.0))
+        az_deg, el_deg = self._bearing_bias_for(source_name, local_obs.stamp_ns)
         if az_deg or el_deg:
             rot_wc = quat_to_rotmat(transform_wc.transform.rotation.x, transform_wc.transform.rotation.y,
                                     transform_wc.transform.rotation.z, transform_wc.transform.rotation.w)
@@ -2417,9 +2442,56 @@ class TriangulationNode(Node):
         )
         return rot, trans
 
+    def _shared_heading_az_deg(self, stamp_ns: int) -> float:
+        """Azimuth offset that makes observer1's ray behave as if built with observer2's yaw.
+
+        A world ray is R_z(psi) * ray_body, so swapping psi_1 for psi_2 means rotating by
+        (psi_2 - psi_1); derotate_bearing SUBTRACTS its argument, hence (psi_1 - psi_2).
+
+        Returns 0.0 when the mode is off, or when either odometry is missing or stale -- that
+        frame simply keeps its own compass rather than being dropped, which is the right call
+        for a bench run where odom arrives at ~100 Hz and a gap is a transport hiccup.
+        """
+        if not self.shared_heading:
+            return 0.0
+        if self._observer1_odom is None or self._observer2_odom is None:
+            self.get_logger().warn(
+                'shared_heading: observer odometry not received yet, rays left uncorrected',
+                throttle_duration_sec=5.0)
+            return 0.0
+        age_ns = max(abs(stamp_ns - self._observer1_odom_stamp_ns),
+                     abs(stamp_ns - self._observer2_odom_stamp_ns))
+        if age_ns > self.odom_max_age_ns:
+            self.get_logger().warn(
+                f'shared_heading: odometry stale by {age_ns / 1e9:.2f} s '
+                f'(max {self.odom_max_age_ns / 1e9:.2f}), rays left uncorrected',
+                throttle_duration_sec=5.0)
+            return 0.0
+        d_psi = (yaw_deg(self._observer1_odom.pose.pose.orientation)
+                 - yaw_deg(self._observer2_odom.pose.pose.orientation))
+        d_psi = (d_psi + 180.0) % 360.0 - 180.0
+        self.get_logger().info(
+            f'shared_heading: {self.observer1_name} yaw slaved to {self.observer2_name}, '
+            f'delta={d_psi:+.2f} deg',
+            throttle_duration_sec=5.0)
+        return d_psi
+
+    def _bearing_bias_for(self, source_name: str, stamp_ns: int) -> Tuple[float, float]:
+        """Total (az, el) bias removed from this observer's rays, degrees.
+
+        The configured per-boot bias, plus for observer1 under shared_heading the live yaw
+        difference to observer2. Azimuth offsets about world Z compose additively, so a single
+        derotate_bearing call applies both. One accessor, because the debug overlay has to
+        rebias by exactly what was removed or the drawn ray lands a bias away from the target.
+        """
+        az_deg, el_deg = self.bearing_bias.get(source_name, (0.0, 0.0))
+        if source_name == self.observer1_name:
+            az_deg += self._shared_heading_az_deg(stamp_ns)
+        return az_deg, el_deg
+
     def _apply_bearing_bias(self, obs: SpatialObservation) -> SpatialObservation:
         """Cancel this observer's known constant bearing bias, if one is configured."""
-        az_deg, el_deg = self.bearing_bias.get(obs.source_name, (0.0, 0.0))
+        az_deg, el_deg = self._bearing_bias_for(obs.source_name, obs.stamp_ns)
         if not az_deg and not el_deg:
             return obs
         return dataclasses.replace(obs, ray=derotate_bearing(obs.ray, az_deg, el_deg))
