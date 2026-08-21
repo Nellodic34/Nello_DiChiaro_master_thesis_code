@@ -1302,7 +1302,7 @@ class ObserverNode(Node):
             or _camera_info_topic_by_role.get(self.observer_role, '')
             or f'{_img_base}/camera_info'
         )
-        self.detection_topic = f'/{self.uav_name}/detection3'
+        self.detection_topic = f'/{self.uav_name}/detection2'
         self.detector_evaluation_topic = f'/{self.uav_name}/detector_evaluation'
         self.observation_topic = f'/{self.uav_name}/{self.observation_topic_name}'
         self.world_frame_id = f'{self.uav_name}/{self.world_frame_suffix}'

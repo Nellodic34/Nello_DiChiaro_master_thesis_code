@@ -801,6 +801,11 @@ def triangulate_wls(
 
 
 
+# A bearing carries no range information. 10x the range is "I know nothing along this ray"
+# while staying far from the numerical noise floor of the information fusion below.
+_RANGE_IGNORANCE_FACTOR = 10.0
+
+
 def compute_triangulation_measurement_covariance(
     midpoint: np.ndarray,
     origin1: np.ndarray,
@@ -840,7 +845,7 @@ def compute_triangulation_measurement_covariance(
         midpoint:             Triangulated 3-D midpoint (best estimate of target).
         origin1/2:            3-D origins of the two bearing rays (camera centres).
         dir1/2:               Unit bearing directions.
-        kf_measurement_noise: Angular variance seed (m²); same as current param.
+        kf_measurement_noise: Bearing angular variance (rad²), e.g. 0.0019 = sigma 2.5 deg.
         P_odom1/2:            Optional 3×3 position covariance of each observer.
                               Pass ``None`` to fall back to pixel-only noise.
         min_bearing_distance: Clamp passed to Jacobian helper (m).
@@ -852,17 +857,26 @@ def compute_triangulation_measurement_covariance(
     """
     d1 = float(max(np.linalg.norm(midpoint - origin1), 0.1))
     d2 = float(max(np.linalg.norm(midpoint - origin2), 0.1))
-    d_ref = max(np.sqrt(d1 * d2), 0.5)
-    angular_var = max(float(kf_measurement_noise) / (d_ref ** 2), 1e-8)
+    # kf_measurement_noise is an ANGULAR variance (rad²), same convention as
+    # compute_single_ray_measurement_covariance. Dividing it by the current range before
+    # multiplying by d_i² cancelled out, pinning the lateral sigma to a fixed ~4 cm at any
+    # range: the filter was told a 49 m shot was centimetre-accurate while it sat 25 m off.
+    angular_var = max(float(kf_measurement_noise), 1e-8)
     var1 = (d1 ** 2) * angular_var
     var2 = (d2 ** 2) * angular_var
 
     proj1 = np.eye(3, dtype=np.float64) - np.outer(dir1, dir1)
     proj2 = np.eye(3, dtype=np.float64) - np.outer(dir2, dir2)
 
-    # Base pixel-only information matrices
-    R_pix1 = proj1 * var1  # (3×3) — angular noise for ray 1
-    R_pix2 = proj2 * var2  # (3×3) — angular noise for ray 2
+    # Base pixel-only information matrices. proj_i alone is rank-2 (zero variance ALONG the
+    # ray), so the eps below used to invert to 1e6 of fictitious range information — a single
+    # bearing constrains nothing along its own ray. Seed that axis with a deliberately huge
+    # variance instead, so the fused R keeps the real bearing-only ellipsoid: tight across
+    # both rays, elongated along the bisector when the parallax is weak.
+    var_along1 = (_RANGE_IGNORANCE_FACTOR * d1) ** 2
+    var_along2 = (_RANGE_IGNORANCE_FACTOR * d2) ** 2
+    R_pix1 = proj1 * var1 + np.outer(dir1, dir1) * var_along1  # (3×3) — ray 1
+    R_pix2 = proj2 * var2 + np.outer(dir2, dir2) * var_along2  # (3×3) — ray 2
 
     # Propagate observer position uncertainty (if available)
     # R_total_i = R_pixel_i + J_i @ P_odom_i @ J_iᵀ
@@ -1652,6 +1666,18 @@ class TriangulationNode(Node):
         self.declare_parameter('triangulation_min_baseline_m', _default_triangulation_min_baseline_m)
         self.declare_parameter('max_triangulation_error_m', _default_max_triangulation_error_m)
         self.declare_parameter('max_target_gt_age_sec', 0.75)
+        # Field scale, not a guess at "big": the observers sit ~9 m apart on one field and
+        # their world origins agree to ~1 cm in XY and a few metres in Z, so a 120 m datum
+        # (seen on v6 while GNSS was still converging) is unphysical by three orders of
+        # magnitude. Raise this only if the drones genuinely boot far apart.
+        self.declare_parameter('datum_max_offset_m', 50.0)
+        self.declare_parameter('datum_settle_tol_m', 0.05)
+        # Each refresh costs two tf lookups that can block for tf_timeout_sec, and they sit
+        # on the 76 Hz GT path: refreshing every 0.5 s starved the pipeline to a fifth of
+        # its estimate rate on v6. 2 s keeps throughput while still filling a 15-sample
+        # median window inside the first 30 s, which is where the datum is worst.
+        self.declare_parameter('datum_refresh_sec', 2.0)
+        self.declare_parameter('datum_window', 15)
         self.declare_parameter('processing_rate_hz', _default_processing_rate_hz)
         self.declare_parameter('pairing_prediction_enabled', _default_pairing_prediction_enabled)
         self.declare_parameter('pairing_weight_time', _default_pairing_weight_time)
@@ -1710,6 +1736,10 @@ class TriangulationNode(Node):
         self.triangulation_min_baseline_m = float(self.get_parameter('triangulation_min_baseline_m').value)
         self.max_triangulation_error_m = float(self.get_parameter('max_triangulation_error_m').value)
         self.max_target_gt_age_ns = int(float(self.get_parameter('max_target_gt_age_sec').value) * 1_000_000_000.0)
+        self.datum_max_offset_m = float(self.get_parameter('datum_max_offset_m').value)
+        self.datum_settle_tol_m = float(self.get_parameter('datum_settle_tol_m').value)
+        self.datum_refresh_ns = int(float(self.get_parameter('datum_refresh_sec').value) * 1e9)
+        self.datum_window = int(self.get_parameter('datum_window').value)
         self.processing_rate_hz = max(0.5, float(self.get_parameter('processing_rate_hz').value))
         self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
         self.world_frame_suffix = str(self.get_parameter('world_frame_suffix').value)
@@ -1826,7 +1856,11 @@ class TriangulationNode(Node):
 
         self.target_gt_odom: Optional[Odometry] = None
         # Origin-frame datum offsets are survey constants; resolve once per source frame.
-        self._datum_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        # source_frame -> (rot, trans, resolved_at_stamp_ns); expires after datum_refresh_sec.
+        self._datum_cache: Dict[str, Tuple[np.ndarray, np.ndarray, int]] = {}
+        # Recent accepted lookups per source_frame, median-filtered into the datum estimate.
+        self._datum_samples: Dict[str, Deque[np.ndarray]] = collections.defaultdict(
+            lambda: collections.deque(maxlen=self.datum_window))
         # Per-observer (stamp, az_err, el_err) history, for fitting a constant heading bias.
         # Bounded: the fit is re-run every 50 samples and is O(n), so an unbounded list makes
         # a long flight pay for its own history. 20k samples is ~11 min at 30 Hz per observer,
@@ -2154,20 +2188,24 @@ class TriangulationNode(Node):
 
         local_obs = self._find_closest_debug_observation(source_name, stamp_ns, self.debug_image_match_ns)
         if local_obs is None:
+            self._diag['dbg_no_obs'] += 1
             return
 
         debug_frame = self._find_closest_debug_image(source_name, local_obs.stamp_ns, self.debug_image_match_ns)
         if debug_frame is None:
+            self._diag['dbg_no_frame'] += 1
             return
 
         matched_pair = self._find_closest_matched_pair(local_obs.stamp_ns, self.max_pair_age_ns)
         remote_stamp_ns = matched_pair.remote_obs.stamp_ns if matched_pair is not None else -1
         publish_key = (local_obs.stamp_ns, remote_stamp_ns)
         if self.last_debug_publish_key.get(source_name) == publish_key:
+            self._diag['dbg_dedup'] += 1
             return
 
         if self.publish_debug_image(source_name, debug_frame, camera_info, local_obs, matched_pair):
             self.last_debug_publish_key[source_name] = publish_key
+            self._diag['dbg_pub_mono' if matched_pair is None else 'dbg_pub_stereo'] += 1
 
     def publish_debug_image(
         self,
@@ -2247,6 +2285,7 @@ class TriangulationNode(Node):
             color_list=colors,
             length=150.0,
         )
+        self._draw_stereo_hud(debug_img, local_obs, matched_pair)
 
         debug_msg = CompressedImage()
         debug_msg.header = debug_frame.header
@@ -2254,6 +2293,37 @@ class TriangulationNode(Node):
         debug_msg.data = bytes(cv2.imencode('.jpg', debug_img, [cv2.IMWRITE_JPEG_QUALITY, 75])[1])
         debug_pub.publish(debug_msg)
         return True
+
+    def _draw_stereo_hud(self, img, local_obs, matched_pair) -> None:
+        """Say in the frame why the red ray is or is not there, and how much to trust the fix.
+
+        A missing red ray looks exactly like a broken overlay, but on this bag it just means
+        the second observer had no detection at that instant. Spell it out, and flag the
+        range/baseline dilution that turns a ~2 deg bearing error into a huge depth error.
+        """
+        if matched_pair is None:
+            line, color = 'MONO: no {} observation'.format(self.observer2_name), (0, 165, 255)
+        else:
+            local_a = matched_pair.aligned_local_obs
+            remote_a = matched_pair.aligned_remote_obs
+            dt_ms = abs(matched_pair.remote_obs.stamp_ns - local_obs.stamp_ns) / 1e6
+            baseline = float(np.linalg.norm(remote_a.origin - local_a.origin))
+            midpoint, gap = triangulate_midpoint(
+                local_a.origin, local_a.ray, remote_a.origin, remote_a.ray)
+            rng = float(np.linalg.norm(midpoint - local_a.origin))
+            line = 'STEREO {} dt={:.0f}ms base={:.1f}m range={:.1f}m gap={:.2f}m'.format(
+                self.observer2_name, dt_ms, baseline, rng, gap)
+            color = (0, 255, 0)
+            # Depth error ~ range^2 * bearing_sigma / baseline: past ~2 m of it the fix is a guess.
+            # The ray gap does NOT catch this — a shared bearing bias slides the intersection
+            # along the bisector without opening the gap at all.
+            if baseline > 1e-3:
+                depth_sigma = (rng ** 2) * np.sqrt(self.kf_measurement_noise) / baseline
+                if depth_sigma > 2.0:
+                    line += ' | WEAK GEOM sigma_depth={:.0f}m'.format(depth_sigma)
+                    color = (0, 165, 255)
+        cv2.putText(img, line, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, line, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
     def _find_closest_debug_image(
         self,
@@ -2396,8 +2466,8 @@ class TriangulationNode(Node):
         (uav28 sits 5.39 m below uav81), so skipping this hop is a silent altitude bias.
         """
         cached = self._datum_cache.get(source_frame)
-        if cached is not None:
-            return cached
+        if cached is not None and abs(stamp_ns - cached[2]) < self.datum_refresh_ns:
+            return cached[0], cached[1]
 
         source_drone = source_frame.split('/', 1)[0]
         source_utm = f'{source_drone}/utm_origin'
@@ -2433,14 +2503,67 @@ class TriangulationNode(Node):
         rot2, trans2 = _rt(tf_from_utm)
         rot = rot2 @ rot1
         trans = rot2 @ trans1 + trans2
-        # The datum between two origin frames is a survey constant, not a per-frame quantity:
-        # cache it so the GT path (76 Hz) does not pay two tf lookups per message.
-        self._datum_cache[source_frame] = (rot, trans)
-        self.get_logger().info(
-            f'Datum alignment {source_frame} -> {self.target_frame_id}: '
-            f'offset=({trans[0]:+.3f},{trans[1]:+.3f},{trans[2]:+.3f}) m'
-        )
-        return rot, trans
+
+        # The utm_origin of a drone whose GNSS has not converged yet is published anyway, and
+        # composing through it yields a datum kilometres off. On the v6 bag with start-offset 95
+        # this latched uav28 GT at (+674,-2197,-1003) m, which silently turned every GT-relative
+        # number (bearing residuals, BIASFIT, ANEES) into noise while the node logged no error.
+        # Drones flying the same field share a datum to ~1 cm in XY and a few metres in Z, so
+        # anything beyond datum_max_offset_m is a bad lookup: refuse it and retry next message
+        # rather than cache it for the rest of the flight.
+        offset_m = float(np.linalg.norm(trans))
+        if offset_m > self.datum_max_offset_m:
+            self.get_logger().warn(
+                f'Rejecting datum {source_frame} -> {self.target_frame_id}: offset '
+                f'({trans[0]:+.1f},{trans[1]:+.1f},{trans[2]:+.1f}) m is {offset_m:.0f} m > '
+                f'datum_max_offset_m={self.datum_max_offset_m:.0f} m; utm_origin not converged.',
+                throttle_duration_sec=5.0,
+            )
+            return None
+
+        # This datum is NOT a one-shot constant to be latched. It is composed from the two
+        # drones' utm_origin frames, which are GNSS/RTK anchored and CONVERGE during the
+        # flight: early in the v6 bag the same lookup returns 6118 m, then 1509 m, then
+        # 120 m, and only later the true sub-metre value. Caching the first success froze
+        # whichever garbage happened to arrive first and silently displaced every
+        # triangulation for the rest of the run -- 2506 m on one start offset, 1.4 m on
+        # another (which is worse, because nothing flags it).
+        #
+        # Guarding the latch does not work: a wrong value can sit perfectly still for
+        # seconds while GNSS is still converging, so "hold still then latch" latched the
+        # 120 m one. The fix is to stop latching. Re-resolve on a timer and always use the
+        # freshest value, so the datum tracks convergence and self-corrects instead of
+        # freezing. The cache still spares the 76 Hz GT path a tf lookup per message; it
+        # just expires.
+        # Accepted lookups still scatter by ~1 m about the truth (measured on v6: uav8 came
+        # back -0.085, -1.207, -0.285, -0.076 m in Z within seconds), so neither the first
+        # nor the freshest single sample is the datum. Using the freshest made the raw
+        # midpoint error WORSE than the old frozen latch -- freezing a lucky good value
+        # beats tracking a noisy one, and the old code was simply a lottery on which
+        # sample it froze. The datum is physically a survey constant, so treat the scatter
+        # as noise and estimate it: component-wise median over a short window of accepted
+        # samples. Median rather than mean so one metre-scale outlier cannot drag it.
+        samples = self._datum_samples[source_frame]
+        samples.append(trans)
+        estimate = np.median(np.stack(samples), axis=0) if len(samples) > 1 else trans
+
+        previous = self._datum_cache.get(source_frame)
+        self._datum_cache[source_frame] = (rot, estimate, stamp_ns)
+        if previous is None:
+            self.get_logger().info(
+                f'Datum alignment {source_frame} -> {self.target_frame_id}: '
+                f'offset=({estimate[0]:+.3f},{estimate[1]:+.3f},{estimate[2]:+.3f}) m'
+            )
+        elif float(np.linalg.norm(estimate - previous[1])) > self.datum_settle_tol_m:
+            prev_trans = previous[1]
+            self.get_logger().info(
+                f'Datum alignment {source_frame} -> {self.target_frame_id} moved: '
+                f'({prev_trans[0]:+.3f},{prev_trans[1]:+.3f},{prev_trans[2]:+.3f}) -> '
+                f'({estimate[0]:+.3f},{estimate[1]:+.3f},{estimate[2]:+.3f}) m '
+                f'(n={len(samples)})',
+                throttle_duration_sec=5.0,
+            )
+        return rot, estimate
 
     def _shared_heading_az_deg(self, stamp_ns: int) -> float:
         """Azimuth offset that makes observer1's ray behave as if built with observer2's yaw.
@@ -2743,6 +2866,12 @@ class TriangulationNode(Node):
                 f=d['nopair_no_overlap_or_geom'], g=d['drop_baseline'],
                 h=d['drop_raygap'], i=d['drop_wls_error'], j=d['drop_mahalanobis'],
                 k=d['accepted'],
+            )
+        )
+        self.get_logger().info(
+            'DBGIMG 2s | pub: stereo={s} mono={m} | skip: no_obs={a} no_frame={b} dedup={c}'.format(
+                s=d['dbg_pub_stereo'], m=d['dbg_pub_mono'],
+                a=d['dbg_no_obs'], b=d['dbg_no_frame'], c=d['dbg_dedup'],
             )
         )
         p = self._probe

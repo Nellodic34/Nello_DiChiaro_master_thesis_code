@@ -175,7 +175,13 @@ ekf:
   #   Too low (<0.15): filter "locks on" to ghost acceleration after curves end
   imm_p_return_to_cv: 0.30
   # ---------------------------------------------------------------------------
-  kf_measurement_noise: 0.0002  # Visual angular variance seed (rad²) = sigma 2.5 deg.
+  kf_measurement_noise: 0.0019  # Visual angular variance seed (rad²) = sigma 2.5 deg.
+                                 # ERA 0.0002 (= sigma 0.81 deg), che non corrispondeva al
+                                 # commento qui accanto. Allineato al workspace insieme al
+                                 # triangulation_node: il nodo nuovo consuma questo valore
+                                 # come var_lateral = d² * questo, senza la divisione per il
+                                 # range che nel nodo vecchio si cancellava e fissava sigma
+                                 # laterale a ~4 cm a qualsiasi distanza.
                                  # SOTA mode: V_vis = kf_measurement_noise * d² * I (bearing cone).
                                  # MUST match tuning.yaml fixed_kf_measurement_noise.
                                  # Was 0.00020 (sigma 0.81 deg), sized from the DETECTOR alone
