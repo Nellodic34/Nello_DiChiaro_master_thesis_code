@@ -569,6 +569,98 @@ def _validate_covariance_matrix(
 
     return R
 
+# World "up" used to define the azimuth direction of a bearing ray.
+_WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+# Below this the ray is within ~0.06 deg of vertical and (z x d) is numerically
+# meaningless: azimuth is undefined there, so an arbitrary horizontal axis is used.
+_VERTICAL_RAY_EPS = 1e-6
+
+
+def bearing_frame(direction: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Local azimuth/elevation basis of a bearing ray, in the world frame.
+
+    Given a unit bearing ``d`` with elevation ``el = asin(d_z)``:
+
+        a = normalise(z_world x d)     horizontal, tangent to the azimuth circle
+        e = d x a                      completes the right-handed triad
+
+    ``a`` and ``e`` are orthonormal and span the plane perpendicular to ``d`` --
+    exactly the plane in which a bearing error displaces the target.  Moving the
+    ray by ``d_az`` in azimuth displaces the target by ``r * cos(el) * d_az``
+    along ``a``; moving it by ``d_el`` displaces it by ``r * d_el`` along ``e``.
+    The ``cos(el)`` factor is the Jacobian of the spherical parametrisation and
+    is returned so the caller can apply it.
+
+    Degenerate case: for a near-vertical ray azimuth is not defined; world X is
+    used as the auxiliary axis so the triad stays orthonormal (with cos(el) ~ 0
+    the azimuth term is annihilated anyway).
+    """
+    d = np.asarray(direction, dtype=np.float64)
+    a = np.cross(_WORLD_UP, d)
+    n = float(np.linalg.norm(a))
+    if n < _VERTICAL_RAY_EPS:
+        a = np.cross(np.array([1.0, 0.0, 0.0]), d)
+        n = float(np.linalg.norm(a))
+        if n < _VERTICAL_RAY_EPS:          # d is not unit-norm: cannot recover
+            return np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0]), 1.0
+    a = a / n
+    e = np.cross(d, a)
+    cos_el = float(np.clip(np.hypot(d[0], d[1]), 0.0, 1.0))   # = cos(asin(d_z))
+    return a, e, cos_el
+
+
+def bearing_noise_cov(
+    direction: np.ndarray,
+    var_az: float,
+    var_el: float,
+    range_scale: float,
+) -> np.ndarray:
+    """Anisotropic visual noise covariance V_vis (3x3, world frame) of one ray.
+
+    Replaces the isotropic ``var_px * d^2 * I_3`` by a covariance with distinct
+    azimuth and elevation variances::
+
+        V_vis = range_scale * ( var_az * cos^2(el) * a a^T      (azimuth axis)
+                              + var_el                * e e^T   (elevation axis)
+                              + var_r                 * d d^T ) (radial filler)
+
+    with ``(a, e, cos_el)`` from :func:`bearing_frame`.  The three axes are
+    orthonormal, so this *is* the eigen-decomposition of ``V_vis``: the
+    eigenvalues are literally the per-axis variances, in m^2 after multiplication
+    by ``range_scale = d_i^2``.
+
+    Frame check (verified numerically, see test_anisotropic_bearing_noise.py): a
+    yaw error about world z lands on ``a`` with weight cos(el) and on ``e`` with
+    weight EXACTLY zero; a body-pitch error lands on ``e`` with weight one and on
+    ``a`` with weight exactly zero.  The only cross-term is a tilt error along the
+    line of sight, which leaks into azimuth with factor sin(el) -- negligible for a
+    target at the observer's altitude, 34% at el = 20 deg.
+
+    Why this matters physically: on this airframe the camera is bolted to the FCU
+    with identity rotation, so attitude error enters the bearing 1:1.  Yaw error
+    is dominated by the dual-antenna RTK heading baseline (sigma ~ sigma_rel / L,
+    typically ~1 deg for L = 0.55 m) while pitch/roll error is dominated by the
+    per-boot level reference latched at power-up (measured 1.5-3.9 deg on the
+    22-7 bags).  These two budgets differ by a factor of a few, and an isotropic
+    R cannot express that: it must inflate the good axis or shrink the bad one.
+
+    The radial term is a rank-completing regulariser -- a bearing carries no
+    range information -- set to the mean of the two angular variances so V stays
+    well conditioned.  It is *exactly* cancelled by the outer projectors Pi_i in
+    the Fisher accumulation of :func:`triangulate_wls`, so its value never
+    reaches ``R_out``.
+    """
+    a, e, cos_el = bearing_frame(direction)
+    d = np.asarray(direction, dtype=np.float64)
+    var_r = 0.5 * (float(var_az) + float(var_el))
+    V = (
+        float(var_az) * (cos_el ** 2) * np.outer(a, a)
+        + float(var_el) * np.outer(e, e)
+        + var_r * np.outer(d, d)
+    )
+    return float(range_scale) * V
+
 
 def triangulate_wls(
     origin1: np.ndarray,
@@ -581,6 +673,9 @@ def triangulate_wls(
     use_odom_uncertainty: bool = True,
     distance_dependent_noise: bool = True,
     odom_max_variance: float = 1.0,
+    anisotropic_bearing_noise: bool = False,
+    bearing_var_az: float = 0.0,   # TOTAL azimuth variance   [rad^2] (yaw + detector)
+    bearing_var_el: float = 0.0,   # TOTAL elevation variance [rad^2] (tilt + detector)
     prior_target_pos: Optional[np.ndarray] = None,
     normalize_crlb: bool = True,
     logger=None,
@@ -651,6 +746,15 @@ def triangulate_wls(
                                 ``kf_measurement_noise`` parameter from YAML.
         use_odom_uncertainty:   When True, include P_odom_i in V_i.
         distance_dependent_noise: When True, visual sigma = var_px * d_i^2.
+        anisotropic_bearing_noise: When True the visual term uses separate
+                                azimuth/elevation variances (see
+                                :func:`bearing_noise_cov`) instead of the
+                                isotropic ``var_px * I_3``.  ``var_px`` is
+                                then unused for the visual term.
+        bearing_var_az:         Azimuth (yaw-like) angular variance [rad^2].
+                                Only read when anisotropic_bearing_noise=True.
+        bearing_var_el:         Elevation (pitch-like) angular variance [rad^2].
+                                Only read when anisotropic_bearing_noise=True.
         odom_max_variance:      Diagonal clamp [m^2] applied to P_odom before
                                 projection. Prevents barometric Z-blowup
                                 (e.g. sim publishes sigma_z ~ 35 m) from
@@ -708,8 +812,15 @@ def triangulate_wls(
     d_scale_1 = (d1 ** 2) if distance_dependent_noise else 1.0
     d_scale_2 = (d2 ** 2) if distance_dependent_noise else 1.0
 
-    V1 = float(var_px) * d_scale_1 * I3   # Visual-only base
-    V2 = float(var_px) * d_scale_2 * I3
+    if anisotropic_bearing_noise:
+        # Separate azimuth / elevation variances: the ray's uncertainty is an
+        # elliptical cone, not a circular one.  Rank is completed along the
+        # radial axis inside bearing_noise_cov (cancelled by Pi_i below).
+        V1 = bearing_noise_cov(dir1, bearing_var_az, bearing_var_el, d_scale_1)
+        V2 = bearing_noise_cov(dir2, bearing_var_az, bearing_var_el, d_scale_2)
+    else:
+        V1 = float(var_px) * d_scale_1 * I3   # Visual-only base
+        V2 = float(var_px) * d_scale_2 * I3
 
     if use_odom_uncertainty:
         # Clamp diagonal of P_odom to odom_max_variance before projection
@@ -1466,6 +1577,14 @@ class TriangulationNode(Node):
         _default_process_noise_vel = 0.5
         _default_imm_transition_prob = 0.95
         _default_measurement_noise = 0.05
+        # Anisotropic bearing noise: OFF by default, so the isotropic
+        # kf_measurement_noise path stays bit-for-bit unchanged until enabled.
+        _default_anisotropic_bearing_noise = False
+        # TOTAL per-axis budget, attitude and detector added in quadrature:
+        #   az = sqrt(1.04^2 + 0.81^2)  yaw from RTK baseline (+) detector jitter
+        #   el = sqrt(2.50^2 + 0.81^2)  tilt from boot level ref (+) detector jitter
+        _default_bearing_sigma_az_deg = 1.32
+        _default_bearing_sigma_el_deg = 2.63
         _default_adaptive_cov_max_multiplier = 50.0
         _default_initial_covariance = 10.0
         _default_mahalanobis_threshold = 9.0
@@ -1561,6 +1680,16 @@ class TriangulationNode(Node):
                             )
                             _default_measurement_noise = float(
                                 _ekf.get('kf_measurement_noise', _default_measurement_noise)
+                            )
+                            _abn = _ekf.get('anisotropic_bearing_noise', {}) or {}
+                            _default_anisotropic_bearing_noise = bool(
+                                _abn.get('enabled', _default_anisotropic_bearing_noise)
+                            )
+                            _default_bearing_sigma_az_deg = float(
+                                _abn.get('sigma_az_deg', _default_bearing_sigma_az_deg)
+                            )
+                            _default_bearing_sigma_el_deg = float(
+                                _abn.get('sigma_el_deg', _default_bearing_sigma_el_deg)
                             )
                             _default_adaptive_cov_max_multiplier = float(
                                 _ekf.get(
@@ -1707,6 +1836,13 @@ class TriangulationNode(Node):
         # normalize_crlb: True = rescale CRLB trace to 3*kf_measurement_noise (legacy, backward-compat).
         # False = pass raw Lambda^{-1} to IMM (SOTA; requires CMA-ES re-run with wider Q bounds).
         self.declare_parameter('normalize_crlb', True)
+        # Anisotropic bearing noise (ekf.anisotropic_bearing_noise in runtime_stack.yaml).
+        # enabled=False  -> visual term is var_px * d^2 * I_3          (isotropic cone)
+        # enabled=True   -> visual term has separate az/el variances   (elliptical cone)
+        # Sigmas are given in DEGREES in the YAML and converted to rad^2 below.
+        self.declare_parameter('anisotropic_bearing_noise', _default_anisotropic_bearing_noise)
+        self.declare_parameter('bearing_sigma_az_deg', _default_bearing_sigma_az_deg)
+        self.declare_parameter('bearing_sigma_el_deg', _default_bearing_sigma_el_deg)
         self.declare_parameter('kf_adaptive_cov_max_multiplier', _default_adaptive_cov_max_multiplier)
         self.declare_parameter('kf_initial_covariance', _default_initial_covariance)
         self.declare_parameter('kf_mahalanobis_threshold', _default_mahalanobis_threshold)
@@ -1754,6 +1890,16 @@ class TriangulationNode(Node):
         # Set to False only after re-running CMA-ES with wider Q bounds and without
         # kf_measurement_noise in the optimisation vector.
         self.normalize_crlb = bool(self.get_parameter('normalize_crlb').value)
+
+        # Anisotropic bearing noise: convert sigma [deg] -> variance [rad^2] once here,
+        # so triangulate_wls() only ever deals with rad^2 like var_px does.
+        self.anisotropic_bearing_noise = bool(
+            self.get_parameter('anisotropic_bearing_noise').value
+        )
+        self.bearing_sigma_az_deg = float(self.get_parameter('bearing_sigma_az_deg').value)
+        self.bearing_sigma_el_deg = float(self.get_parameter('bearing_sigma_el_deg').value)
+        self.bearing_var_az = float(np.deg2rad(self.bearing_sigma_az_deg)) ** 2
+        self.bearing_var_el = float(np.deg2rad(self.bearing_sigma_el_deg)) ** 2
         self.kf_adaptive_cov_max_multiplier = float(self.get_parameter('kf_adaptive_cov_max_multiplier').value)
         self.kf_initial_covariance = float(self.get_parameter('kf_initial_covariance').value)
         self.kf_mahalanobis_threshold = float(self.get_parameter('kf_mahalanobis_threshold').value)
@@ -2024,6 +2170,19 @@ class TriangulationNode(Node):
         self.get_logger().info(f'Observer 1 camera info topic: {self.observer1_camera_info_topic}')
         self.get_logger().info(f'Target frame: {self.target_frame_id}')
         self.get_logger().info(f'Observation buffer: {self.observation_buffer_ns / 1e9:.2f} s')
+        if self.anisotropic_bearing_noise:
+            self.get_logger().info(
+                f'Bearing noise: ANISOTROPIC  '
+                f'sigma_az={self.bearing_sigma_az_deg:.2f} deg '
+                f'sigma_el={self.bearing_sigma_el_deg:.2f} deg  '
+                f'(kf_measurement_noise={self.kf_measurement_noise:.2e} rad^2 unused for V_vis)'
+            )
+        else:
+            self.get_logger().info(
+                f'Bearing noise: ISOTROPIC  '
+                f'kf_measurement_noise={self.kf_measurement_noise:.2e} rad^2 '
+                f'(sigma={np.rad2deg(np.sqrt(self.kf_measurement_noise)):.2f} deg)'
+            )
         if self.publish_debug_annotated_image:
             self.get_logger().info(
                 f'Triangulation debug overlay topic: '
@@ -3307,6 +3466,9 @@ class TriangulationNode(Node):
                 use_odom_uncertainty=self.use_odom_uncertainty,
                 distance_dependent_noise=self.distance_dependent_noise,
                 odom_max_variance=self.odom_max_variance,
+                anisotropic_bearing_noise=self.anisotropic_bearing_noise,
+                bearing_var_az=self.bearing_var_az,
+                bearing_var_el=self.bearing_var_el,
                 prior_target_pos=prior_pos,
                 normalize_crlb=self.normalize_crlb,
                 logger=self.get_logger(),

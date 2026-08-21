@@ -193,6 +193,73 @@ ekf:
                                  # NOTE: kf_process_noise_* and kf_mahalanobis_threshold below were
                                  # CMA-ES-tuned against 0.00020. Re-run the tuner; until then the
                                  # gate is effectively looser than it was tuned to be.
+
+  # ---------------------------------------------------------------------------
+  # Anisotropic Bearing Noise  (elliptical bearing cone)
+  # ---------------------------------------------------------------------------
+  # kf_measurement_noise above is a SINGLE angular variance: it models the ray
+  # uncertainty as a CIRCULAR cone, identical in azimuth and elevation. On this
+  # airframe that is not what the error budget looks like. The camera is bolted
+  # to the FCU with identity rotation, so attitude error enters the bearing 1:1,
+  # and the two attitude axes have completely different sources:
+  #
+  #   azimuth   (yaw-like)  <- dual-antenna RTK heading. sigma ~ sigma_rel / L;
+  #                            with L = 0.55 m and sigma_rel ~ 1 cm this is ~1.0 deg.
+  #                            Rotation about the antenna baseline is unobservable.
+  #   elevation (pitch-like) <- per-boot level reference latched at power-up.
+  #                            Measured 1.5-3.9 deg on the 22-7 bags (uav81 sat at
+  #                            -9.07 deg pitch bias on the ground before calibration).
+  #
+  # With enabled=true the visual term of V_i becomes, on the ray's own triad,
+  #
+  #   V_vis = d_i^2 * diag( sigma_az^2 * cos^2(el),  sigma_el^2,  radial filler )
+  #
+  # where the triad is (a, e, d) with a = normalise(z_world x d) the horizontal
+  # azimuth axis and e = d x a the elevation axis. The cos^2(el) factor is the
+  # Jacobian of the spherical parametrisation (a yaw error d_az displaces the
+  # target by r*cos(el)*d_az, not r*d_az). The radial entry never reaches R_out:
+  # it is cancelled exactly by the outer projectors Pi_i in the Fisher sum, and
+  # exists only to keep V_i invertible.
+  #
+  # These two sigmas are the TOTAL per-axis budget of the ray, not the attitude
+  # part alone. Detector jitter and attitude error are independent, so they add
+  # in quadrature, and the detector term (~0.81 deg, i.e. the 0.00020 rad^2 that
+  # kf_measurement_noise used to hold before it was inflated) is NOT negligible
+  # against the RTK yaw term:
+  #
+  #   sigma_az = sqrt(yaw_rtk^2  + detector^2) = sqrt(1.04^2 + 0.81^2) = 1.32 deg
+  #   sigma_el = sqrt(tilt_boot^2 + detector^2) = sqrt(2.50^2 + 0.81^2) = 2.63 deg
+  #
+  # Re-derive both if you re-measure either term (new antenna baseline, ground
+  # calibration procedure, retrained detector).
+  #
+  # enabled: false -> kf_measurement_noise is used isotropically (previous
+  #                   behaviour, bit-for-bit identical). Sigmas below ignored.
+  # enabled: true  -> kf_measurement_noise is NOT used for the visual term; the
+  #                   two sigmas below define it completely.
+  #
+  # What it buys, measured on the 9.3 m baseline at 49 m range: the vertical axis
+  # of R_out is unchanged (1.52 -> 1.60 m, the elevation budget really is 2.5 deg)
+  # while the RANGE axis halves (16.07 -> 8.48 m). Azimuth error is amplified into
+  # range by r^2/B ~ 258 m/rad; elevation error is not amplified at all. The
+  # isotropic 2.5 deg was paying the pitch-bias budget on the axis governed by the
+  # much better RTK yaw. That factor 1.90 is the whole point of this block.
+  #
+  # Validity: the az/el split is EXACT for a target at the observer's altitude.
+  # The only cross-term is a tilt error along the line of sight leaking into
+  # azimuth with factor sin(el) -- 8.7% at el=5 deg, 34% at el=20 deg. If you
+  # start flying well above or below the target, raise sigma_az accordingly.
+  #
+  # Caveat: the per-boot tilt is a BIAS, not white noise. Putting it in R stops
+  # the filter being instantly overconfident, but it does not stop P from
+  # shrinking below the bias floor over a long lock. The real fix is estimating
+  # it (BIASFIT) or augmenting the state; this block is the honest-R fallback.
+  # ---------------------------------------------------------------------------
+  anisotropic_bearing_noise:
+    enabled: false        # master switch; false = exact previous isotropic behaviour
+    sigma_az_deg: 1.32    # TOTAL azimuth budget [deg]:   RTK yaw 1.04 (+) detector 0.81
+    sigma_el_deg: 2.63    # TOTAL elevation budget [deg]: boot tilt 2.50 (+) detector 0.81
+
   kf_adaptive_cov_max_multiplier: 50.0
   kf_initial_covariance: 2.0
   kf_mahalanobis_threshold: 34.0  # chi²(3, 0.999): RAISED massively. With normalize_crlb=false, R is tight.
@@ -382,6 +449,9 @@ depth_fusion:
 # ray has a composite noise covariance:
 #
 #   V_i = (kf_measurement_noise * d_i^2 * I_3)  +  (Pi_i @ P_odom_i @ Pi_i^T)
+#
+# The first term is isotropic only while ekf.anisotropic_bearing_noise.enabled
+# is false; when enabled it becomes the elliptical cone described in that block.
 #
 # where Pi_i = I - b_i*b_i^T is the orthogonal projector onto the plane
 # perpendicular to the bearing (bearing-null-space). The Fisher Information
