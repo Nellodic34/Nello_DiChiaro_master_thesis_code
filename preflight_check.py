@@ -103,12 +103,30 @@ def check_config(c):
         warn('ekf.normalize_crlb is present but is a NO-OP: triangulate_wls never reads it '
              'and always returns the raw CRLB. Ignore the value.')
 
+    df = c.get('depth_fusion', {})
+    if not df.get('enabled'):
+        print('         depth_fusion.enabled = false (bearing-only, no depth subscriber)')
+    else:
+        suffix = df.get('depth_topic_suffix', '')
+        print(f"         depth_fusion: gating={df.get('gating_enabled')}  "
+              f"range_constraint={df.get('fusion_use_range_constraint')}  "
+              f"suffix={suffix!r}")
+        if any(suffix.endswith(t) for t in ('/compressed', '/compressedDepth', '/theora', '/zstd')):
+            bad(f'depth_topic_suffix = {suffix!r}: observer_node subscribes to raw '
+                f'sensor_msgs/Image only, there is no image_transport plugin in the node. '
+                f'Use the .../image_raw topic.')
+        else:
+            ok(f'depth_topic_suffix {suffix!r} is a raw Image topic')
+
 
 def check_live(c, seconds):
     import math
+    import numpy as np
     import rclpy
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+    from sensor_msgs.msg import CameraInfo, Image
 
     roles = c.get('uav_roles', {})
     uavs = [roles.get('observer1'), roles.get('observer2'), roles.get('target')]
@@ -138,6 +156,22 @@ def check_live(c, seconds):
     for u in uavs:
         node.create_subscription(Odometry, f'/{u}/estimation_manager/odom_main', mk(u), 10)
 
+    # Depth fusion: only subscribe when the master switch is on, mirroring observer_node.
+    df = c.get('depth_fusion', {})
+    depth_frames, color_info = [], {}
+    if df.get('enabled'):
+        sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+                                history=HistoryPolicy.KEEP_LAST)
+        for u in (roles.get('observer1'), roles.get('observer2')):
+            if not u:
+                continue
+            topic = f"/{u}/{df.get('depth_topic_suffix', '')}"
+            node.create_subscription(
+                Image, topic, lambda m, u=u: depth_frames.append((u, m)), sensor_qos)
+            node.create_subscription(
+                CameraInfo, f'/{u}/rgbd/color/camera_info',
+                lambda m, u=u: color_info.__setitem__(u, (m.width, m.height)), 10)
+
     end = node.get_clock().now().nanoseconds + int(seconds * 1e9)
     while rclpy.ok() and node.get_clock().now().nanoseconds < end:
         rclpy.spin_once(node, timeout_sec=0.1)
@@ -166,6 +200,51 @@ def check_live(c, seconds):
         if abs(dy) > 2.0:
             warn(f'yaw disagreement {dy:+.2f} deg. With dual-antenna RTK heading this should '
                  f'be under ~1.5 deg; if it is not, one heading solution is not fixed yet.')
+
+    if df.get('enabled'):
+        print(f"\n      depth fusion on {df.get('depth_topic_suffix')}")
+        for u in (roles.get('observer1'), roles.get('observer2')):
+            if not u:
+                continue
+            frames = [m for uu, m in depth_frames if uu == u]
+            if not frames:
+                bad(f"no depth on /{u}/{df.get('depth_topic_suffix')} while "
+                    f"depth_fusion.enabled = true. The node will publish V1 bearing-only "
+                    f"packets and the range constraint will never fire.")
+                continue
+            last = frames[-1]
+            hz = len(frames) / seconds
+            if last.encoding not in ('16UC1', '32FC1'):
+                bad(f'{u} depth encoding {last.encoding!r}: observer_node handles 16UC1 '
+                    f'(mm) and 32FC1 (m) only, anything else is read as raw metres.')
+            cw_ch = color_info.get(u)
+            if cw_ch and cw_ch != (last.width, last.height):
+                bad(f'{u} depth {last.width}x{last.height} != color {cw_ch[0]}x{cw_ch[1]}: '
+                    f'YOLO bboxes are full-frame COLOR pixels and are indexed straight into '
+                    f'the depth array. Use the aligned_depth_to_color stream.')
+            elif cw_ch:
+                ok(f'{u} depth {last.encoding} {last.width}x{last.height} @ {hz:.1f} Hz, '
+                   f'resolution matches color')
+            else:
+                warn(f'{u} depth {last.encoding} {last.width}x{last.height} @ {hz:.1f} Hz, '
+                     f'color camera_info silent so resolution unverified')
+
+            scale = 1e-3 if last.encoding == '16UC1' else 1.0
+            dt = np.uint16 if last.encoding == '16UC1' else np.float32
+            arr = np.frombuffer(last.data, dtype=dt).astype(np.float32) * scale
+            v = arr[np.isfinite(arr) & (arr > 0.05)]
+            lo, hi = float(df.get('min_range_m', 0.3)), float(df.get('max_range_m', 10.0))
+            if v.size == 0:
+                bad(f'{u} depth frame is entirely empty (all holes)')
+            else:
+                frac = float(((v >= lo) & (v <= hi)).mean())
+                print(f'      {u} range p05={np.percentile(v, 5):.2f}  '
+                      f'median={np.median(v):.2f}  p95={np.percentile(v, 95):.2f} m  '
+                      f'-> {frac:.0%} inside [{lo:g}, {hi:g}]')
+                if frac < 0.5:
+                    warn(f'{u}: most of the scene is outside [{lo:g}, {hi:g}] m. Depth will '
+                         f'be dropped for a target beyond max_range_m; raise it or accept '
+                         f'bearing-only at range.')
 
     node.destroy_node()
     rclpy.shutdown()

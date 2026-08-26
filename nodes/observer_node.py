@@ -1251,7 +1251,10 @@ class ObserverNode(Node):
         self.df_sigma_base: float = _default_df_sigma_base
         self.df_sigma_coeff: float = _default_df_sigma_coeff
         # Depth frame cache: deque of (stamp_ns, np.ndarray) tuples, maxlen keeps last ~10 frames
-        self._depth_cache: collections.deque = collections.deque(maxlen=10)
+        # maxlen=4 covers ~133 ms at 30 Hz, well over depth_max_align_ms (40 ms).
+        # At 1920x1080 each cached float32 frame is 8.3 MB, so 10 frames was 83 MB
+        # of resident buffer to hold a window nothing ever looks that far back into.
+        self._depth_cache: collections.deque = collections.deque(maxlen=4)
         # [L3-bug2 fix] Dedicated IMM odometry state for the depth consistency gate.
         # Populated by _df_gate_odom_callback; independent of _tc_latest_odom so that
         # the gate works even when tc_enabled=False.
@@ -3578,9 +3581,14 @@ class ObserverNode(Node):
                 obs.center_v + obs.bbox_h * 0.5,
             )
             if _dv:
+                # [L3-bug1] Same correction as _check_depth_gate: the depth pixel is
+                # Zc (along the optical axis), while triangulation_node consumes
+                # depth_m as range ALONG THE RAY (origin + ray * depth_m).
+                # r = Zc / cos(theta), cos(theta) = ray_optical[2] for a unit ray.
+                _cos_theta = float(ray_optical[2])
                 pkt_depth_valid = True
-                pkt_depth_m = _dm
-                pkt_depth_sigma = _ds
+                pkt_depth_m = _dm / _cos_theta if _cos_theta > 1e-6 else _dm
+                pkt_depth_sigma = _ds / _cos_theta if _cos_theta > 1e-6 else _ds
 
         # Publish V2 when depth available, V1 otherwise (backward compatible)
         observation_id = self._next_observation_id()

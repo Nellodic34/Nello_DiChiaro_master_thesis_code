@@ -407,10 +407,10 @@ evaluation:
 # ---------------------------------------------------------------------------
 depth_fusion:
   # Master switch. false = no depth subscriber, no depth code path, identical to bearing-only.
-  enabled: false
+  enabled: true
   # Topic suffix relative to uav_name: full topic = /{uav_name}/{depth_topic_suffix}
   # Supports sensor_msgs/Image with encoding 16UC1 (millimetres) or 32FC1 (metres).
-  depth_topic_suffix: "rgb/depth_aligned"
+  depth_topic_suffix: "rgbd/aligned_depth_to_color/image_raw"
   # Maximum time skew between depth frame and RGB frame (milliseconds).
   # Uses the same spirit as vision.max_tf_delta_ms.
   depth_max_align_ms: 40.0
@@ -428,7 +428,7 @@ depth_fusion:
   # Rejects near occluder when |z_meas - z_pred| > gate_k * sqrt(sigma_z_meas² + sigma_z_pred²).
   # Reference: Bar-Shalom, Li & Kirubarajan — "Estimation with Applications to
   # Tracking and Navigation" (2001), Sec. 3.4 (scalar gating).
-  gating_enabled: true
+  gating_enabled: false
   gate_k: 3.0
   max_odom_age_sec: 0.5          # same spirit as tight_coupling.max_3d_age_sec
   max_odom_covariance_trace: 100.0  # disable depth gate if 3D positional uncertainty is too large
