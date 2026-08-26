@@ -298,6 +298,14 @@ triangulation:
   triangulation_min_baseline_m: 0.25  # reject pairs whose camera centers are too close for stable geometry
   max_triangulation_error_m: 2.0  # reject midpoint solutions when the two rays remain too far apart
   processing_rate_hz: 100.0  # node timer rate for pruning buffers, coast prediction, and debug housekeeping
+  coast_after_sec: 0.15   # how long the filter may go unfed before the timer coasts.
+                          # Measured against the WALLCLOCK of the last accepted update,
+                          # not against the image capture stamp, so it is a real starvation
+                          # timeout and not a latency measurement. Tie it to the DETECTION
+                          # rate: ~1.5x the detector period (10 fps on CPU -> 0.15 s).
+                          # Lower it only if the ~10 Hz output rate is too coarse, and know
+                          # that below one detection period fusion_mode reverts to reporting
+                          # COAST over a healthy STEREO track.
   publish_evaluation_packets: true # set to true to publish /target/triangulation_evaluation for CMA-ES
 
   # ---------------------------------------------------------------------------

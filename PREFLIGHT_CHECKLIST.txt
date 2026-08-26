@@ -1,0 +1,472 @@
+===============================================================================
+ CHECKLIST DI VOLO - VISION STACK DUE DRONI (bearing-only + triangolazione)
+ Copia sul desktop della ground station:  cp PREFLIGHT_CHECKLIST.txt ~/Desktop/
+ Il file vive nel repo: se lo modifichi in campo, ricopialo indietro e pusha.
+===============================================================================
+
+ Ruoli fissati in config/runtime_stack.yaml -> uav_roles:
+     observer1 = uav11   (esegue anche il nodo di triangolazione)
+     observer2 = uav8
+     target    = uav28
+
+ Legenda:  [ ] da spuntare     ___ da riempire a penna     STOP = non si vola
+
+ Data volo: ____________   Operatore: ____________   Sito: ________________
+
+
+===============================================================================
+ 1. PRIMA DI USCIRE  (in laboratorio, rete buona)
+===============================================================================
+
+[ ] git pull su GROUND STATION, su uav11 e su uav8. Devono essere allo stesso
+    commit. Verifica:   git rev-parse --short HEAD     su tutti e tre.
+    GS: ________   uav11: ________   uav8: ________   (devono coincidere)
+
+[ ] Se requirements.txt e' cambiato dall'ultima volta, su ENTRAMBI i droni:
+        bash setup_env.sh
+    Ricrea .venv e reinstalla. Salta se non e' cambiato nulla.
+
+[ ] Test offline, su GS o su uav11:
+        python3 -m py_compile nodes/*.py
+        python3 nodes/test_coast_guard.py             -> deve stampare OK
+        python3 nodes/test_anisotropic_bearing_noise.py -> deve stampare OK
+
+[ ] Spazio disco per i bag su chi registra:
+        df -h .
+    Spazio libero: ________ GB. Un bag con immagini compresse cresce in fretta.
+
+[ ] Batterie cariche + almeno un set di riserva. Le due batterie observer
+    devono durare TUTTO il volo: se uav8 atterra prima, resta solo il fallback
+    a raggio singolo e il dataset perde la parte stereo.
+
+
+===============================================================================
+ 2. CONFIG - A TERRA, DRONI ANCORA SPENTI
+===============================================================================
+
+[ ] Sulla GS (non serve ROS, e' solo lettura dello YAML):
+        python3 preflight_check.py
+
+    Deve finire con "config gates clear". Se stampa NOT READY TO FLY -> STOP,
+    leggi cosa blocca e correggi lo YAML prima di accendere qualsiasi cosa.
+
+    I quattro gate bloccanti che controlla, e perche':
+      - bag_profile deve essere 'none'. Diverso da none inietta un bearing_bias
+        stimato su UN'ALTRA accensione. Il riferimento di livello si rifa' a
+        ogni boot: 4-8 gradi di errore di puntamento, 0.31 m per grado a 18 m.
+      - shared_heading deve essere false. True riscrive i raggi di observer1
+        con lo yaw di observer2: valido solo con i due droni fermi e paralleli.
+      - launcher.use_sim_time deve essere false, altrimenti i nodi restano
+        fermi ad aspettare un /clock che nessun drone reale pubblica.
+      - i topic immagine devono nominare i droni giusti. uav_roles e i topic
+        immagine si impostano in DUE punti diversi dello YAML: se ne cambi uno
+        devi cambiare anche l'altro.
+
+    I WARN non bloccano ma vanno letti. I tre che compaiono adesso sono noti:
+      - publish_camera_static_tf: true -> lo verifichi al punto 5
+      - allow_tf_fallback: true con max_tf_delta_ms 40 -> accettato
+      - normalize_crlb e' un NO-OP -> ignora il valore, non e' letto da nessuno
+
+[ ] DUE CONTROLLI CHE IL PREFLIGHT NON PUO' FARE - vanno fatti a occhio:
+
+    a) QUALI PESI STIAMO VOLANDO
+       config/runtime_stack.yaml -> vision.model_path
+       Ora punta a:   dataset_tools/weights6/best_openvino_model
+       In dataset_tools/ ci sono anche weights7_ e weights8, e l'ultimo commit
+       si chiama "...weights7_/weights8". Il preflight verifica SOLO che il
+       path esista, non che sia quello giusto.
+       Il README parla ancora di weights2: il README e' vecchio, non seguirlo.
+       Pesi scelti consapevolmente per questo volo: ______________________
+
+    b) odom_topic_suffix
+       config/runtime_stack.yaml:361 -> "estimation_manager/odom_main"
+       Il commento inline dice che e' CORRETTO per questi droni (i bag 22-7
+       contengono /uav28/estimation_manager/odom_main) e che hw_api/ground_truth
+       e' quello di simulazione. Il README dice il contrario ed e' SBAGLIATO:
+       il README va corretto, non lo YAML. Non toccare questa riga.
+
+[ ] Due impostazioni che costano CPU/banda su un detector che gira a ~10 fps
+    su CPU. Confermale o mettile a false PRIMA di volare, non dopo:
+        vision.publish_annotated_image        attualmente: true
+        vision.publish_debug_annotated_image  attualmente: true
+    Se ti servono le overlay per il debriefing lasciale; se ti serve il frame
+    rate, spegnile.   Decisione: ______________________
+
+[ ] ekf.anisotropic_bearing_noise.enabled e' attualmente FALSE
+    (sigma_az 1.32 deg, sigma_el 2.63 deg sono configurati ma non usati).
+    Il rumore di bearing resta il cono circolare. E' una scelta, non un bug,
+    ma sappi quale delle due configurazioni stai misurando.
+    Volo con anisotropic = ________
+
+[ ] PROMEMORIA sul filtro: i valori ekf.* e kalman_filter.* vengono dall'ultima
+    passata CMA-ES/CRLB e NON sono ancora validati su hardware reale. Tratta
+    questo volo come una validazione del filtro, non come un deploy di routine.
+
+
+===============================================================================
+ 3. OROLOGI - chrony
+===============================================================================
+
+ Perche' conta: i due observer marcano ogni misura con il tempo di CATTURA
+ dell'immagine. La triangolazione appaia raggi di uav11 e uav8 in base a quegli
+ stamp (max_pair_age_sec = 0.20 s). Se i due orologi divergono di 50 ms, il
+ nodo appaia raggi che guardano il bersaglio in due istanti diversi e la
+ geometria e' sbagliata senza che nessun controllo se ne accorga.
+
+[ ] Su uav11 e su uav8:
+        chronyc tracking
+    Guarda:
+      Leap status  : deve essere  Normal   (non "Not synchronised")
+      System time  : offset dal riferimento
+    uav11 offset: ____________ s     uav8 offset: ____________ s
+    Sotto i 10 ms va bene. Sopra i 50 ms -> STOP finche' non converge.
+
+[ ] Su entrambi:
+        chronyc sources -v
+    La sorgente scelta deve avere '*' davanti (sincronizzata), non '?' o '+'.
+
+[ ] Controprova diretta dalla GS, i due comandi uno dopo l'altro:
+        ssh uav11 'date +%s.%N' ; ssh uav8 'date +%s.%N'
+    La differenza include il tempo di ssh, quindi e' un limite superiore
+    grossolano: serve solo a intercettare un errore da secondi interi.
+    uav11: ______________   uav8: ______________
+
+
+===============================================================================
+ 4. ACCENSIONE E LIVELLAMENTO
+===============================================================================
+
+ Perche' conta: il riferimento di livello dell'FCU si stabilisce a ogni boot.
+ Un'inclinazione COMUNE ai due droni ruota solo la soluzione; e' la DIFFERENZA
+ fra i due observer che gonfia la stima di distanza.
+
+[ ] Metti i due droni sulla STESSA superficie piana. Non uno sull'erba e uno
+    sull'asfalto, non uno su una custodia.
+
+[ ] Accendi. Aspetta il fix RTK su entrambi prima di misurare.
+
+[ ] Dalla GS (serve ROS sourced):
+        python3 preflight_check.py --live
+    (opzionale: --seconds 10 per una finestra piu' lunga)
+
+    Soglie effettive nel file:
+      roll o pitch oltre 1.0 deg          -> stampa "<-- OFF LEVEL" (avviso)
+      tilt DIFFERENZIALE obs2-obs1 > 1.0  -> FAIL, bloccante
+      disaccordo di yaw oltre 2.0 deg     -> WARN
+
+    Trascrivi:
+      uav11  roll ______  pitch ______  yaw ______
+      uav8   roll ______  pitch ______  yaw ______
+      differenziale  d_roll ______  d_pitch ______  d_yaw ______
+
+    Se il tilt differenziale e' oltre 1.0 deg -> STOP. Rimedio documentato nel
+    codice: RIAVVIA l'FCU peggiore su terreno piano finche' non legge livello.
+    NON compensare via software: il bias non e' ripetibile fra un boot e l'altro
+    ed e' esattamente quello che rende inutilizzabili i bag_profile vecchi.
+
+    Sul disaccordo di yaw: con heading RTK a doppia antenna dovrebbe stare sotto
+    ~1.5 deg. Se e' sopra, una delle due soluzioni di heading non e' ancora
+    fixed - aspetta e rimisura invece di partire.
+
+[ ] Se preflight_check.py --live dice "no odometry from <uav>": il drone non
+    sta pubblicando /<uav>/estimation_manager/odom_main. Rete o estimation
+    manager. -> STOP, non e' un problema del vision stack.
+
+
+===============================================================================
+ 5. TF E CAMERA
+===============================================================================
+
+[ ] publish_camera_static_tf e' true: observer_node trasmette lui stesso
+    uavN/fcu -> uavN/rgbd_link leggendo camera_tf dallo YAML. Se anche il driver
+    della camera pubblica la stessa coppia hai DUE broadcaster statici sullo
+    stesso arco e TF risolve in modo non deterministico (a volte uno, a volte
+    l'altro, senza errori). Verifica su entrambi i droni, con lo stack SPENTO:
+        ros2 run tf2_ros tf2_echo uav11/fcu uav11/rgbd_link
+        ros2 run tf2_ros tf2_echo uav8/fcu  uav8/rgbd_link
+    Con lo stack spento NON deve arrivare nulla. Se arriva qualcosa, il driver
+    lo pubblica gia' -> metti publish_camera_static_tf: false.
+    uav11 driver pubblica? ______    uav8 driver pubblica? ______
+
+[ ] Stream immagini vivi, dalla GS:
+        ros2 topic hz /uav11/rgbd/color/image_raw/compressed
+        ros2 topic hz /uav8/rgbd/color/image_raw/compressed
+    uav11: ______ Hz     uav8: ______ Hz
+    Se uno dei due e' molto sotto l'altro, il problema e' la rete o la camera:
+    risolvilo adesso, non in volo.
+
+
+===============================================================================
+ 6. MISURA DEL DATUM IN Z   (da fare, serve per dopo)
+===============================================================================
+
+ Ogni drone ha il suo albero TF separato e la sua origine world_origin, fissata
+ alla sua accensione. Le due origini NON coincidono, in particolare in Z (su un
+ bag precedente la differenza era 5.4 m). Il nodo di triangolazione compone le
+ due passando per utm_origin; questa misura serve a sapere di quanto stiamo
+ parlando OGGI, e a decidere se implementare il fix del fallback ROI su uav8.
+
+[ ] Con i droni accesi e fissi RTK, dalla GS:
+        ros2 run tf2_ros tf2_echo uav11/utm_origin uav11/world_origin
+        ros2 run tf2_ros tf2_echo uav8/utm_origin  uav8/world_origin
+
+    uav11 -> translation  x ________  y ________  z ________
+    uav8  -> translation  x ________  y ________  z ________
+
+    Differenza in Z fra i due (uav8 - uav11): ________ m
+
+[ ] Riscontro a nodi accesi (punto 7): nel log del nodo di triangolazione cerca
+        Datum alignment ... offset=(x,y,z) m
+    Le componenti X/Y dovrebbero essere piccole, la Z vicina al numero qui
+    sopra. Se compare anche "Datum alignment ... moved:" ripetutamente, il
+    datum non si e' ancora assestato: aspetta prima di decollare.
+    offset visto nel log: ______________________
+
+
+===============================================================================
+ 7. ORDINE DI AVVIO DEI NODI
+===============================================================================
+
+ Rispetta l'ordine: la triangolazione si sottoscrive ai due observer e i primi
+ secondi servono a riempire i buffer e a stabilizzare il datum.
+
+[ ] 7.1  Su uav8 (observer2), terminale suo:
+             bash launch_observer_detection_node.sh
+         Aspetta nel log:
+             YOLO model path: ...            <- controlla che sia weights giusti
+             Observer config role: observer2
+         e poi la riga periodica:
+             Observer node: FPS=..., inference_avg=...ms
+         FPS uav8: ________ (atteso ~10 su CPU). Se e' molto sotto, il resto
+         della catena non ha senso: risolvi qui.
+
+[ ] 7.2  Su uav11 (observer1), terminale suo:
+             bash launch_main_detection_node.sh
+         Stesse verifiche.  FPS uav11: ________
+         I due FPS devono essere simili: se uav8 gira a meta' di uav11 le coppie
+         stereo si formano di rado.
+
+[ ] 7.3  Su uav11, SECONDO terminale, solo dopo che entrambi gli observer
+         stampano FPS:
+             bash launch_triangulation_node.sh
+         Aspetta nel log:
+             Triangulation node initialization complete.
+             Observer 1 topic: ...   Observer 2 topic: ...
+         e la riga "Datum alignment ..." del punto 6.
+
+[ ] 7.4  Sulla ground station:
+             bash launch_live_monitor.sh
+         (live_monitor_mode = classic)
+
+
+===============================================================================
+ 8. VERIFICA PRE-BAG   -- IL CANCELLO VERO, NON SALTARLO
+===============================================================================
+
+ Da fare a TERRA, con il target (uav28) fisicamente visibile da ENTRAMBE le
+ camere. Se non e' visibile da entrambe, mettilo in vista prima di misurare.
+
+[ ] Modalita' di fusione:
+        ros2 topic echo /tracker/fusion_mode
+    Deve dire  STEREO  in modo stabile.
+      STEREO       = triangolazione a due raggi, e' quello che vogliamo
+      SINGLE_DEPTH = solo un drone vede il target (o non si formano coppie)
+      COAST        = nessuna misura, il filtro sta estrapolando
+    Se non arriva MAI a STEREO con il target in vista da entrambi -> STOP.
+    Non decollare sperando che si aggiusti in aria.
+    Modalita' osservata: ______________
+
+[ ] Frequenza di uscita:
+        ros2 topic hz /target/odometry_estimate
+    Atteso ~10 Hz (segue il detection rate).
+    Se leggi ~100 Hz e fusion_mode dice COAST fisso, stai girando con il codice
+    PRIMA del fix del coast guard: hai il commit sbagliato su uav11. -> torna
+    al punto 1 e allinea i commit. Questo e' il modo piu' rapido per capire se
+    il fix e' attivo.
+    Letto: ________ Hz
+
+[ ] Traiettoria predetta viva:
+        ros2 topic hz /target/predicted_trajectory      -> ~10 Hz
+
+[ ] Latenza reale della catena (serve a giustificare coast_after_sec = 0.15 s):
+        ros2 topic delay /uav11/target_observation
+        ros2 topic delay /uav8/target_observation
+    uav11: ________ ms     uav8: ________ ms
+    Se la latenza media supera ~150 ms, alza triangulation.coast_after_sec a
+    circa 1.5 volte il periodo di detection e rilancia la triangolazione.
+
+[ ] Prova del coast: copri UNA camera.
+    fusion_mode deve lasciare STEREO. Passa a SINGLE_DEPTH solo se il drone
+    rimasto ha una misura di profondita' RGB-D valida e confidenza sopra 0.60;
+    altrimenti va direttamente a COAST. Entrambe le uscite sono corrette qui.
+    Copri ENTRAMBE: deve passare a COAST entro ~0.15 s.
+    Scopri: deve tornare a STEREO.
+    Se non torna a STEREO, il target non e' stato riagganciato: vedi la sezione
+    "cosa sappiamo gia' che e' rotto" in fondo.
+    Prova superata? ______
+
+[ ] Ground truth allineata presente:
+        ros2 topic hz /target/ground_truth_aligned
+    E' la GT del target riportata nello stesso frame della stima. Senza questa
+    la valutazione post-volo confronta due frame diversi e misura il datum
+    invece dell'errore.
+
+
+===============================================================================
+ 9. REGISTRAZIONE BAG
+===============================================================================
+
+[ ] Avvia il bag PRIMA del decollo, con i nodi gia' a regime e fusion_mode
+    STEREO. Registra dalla macchina che ha spazio e rete: ______________
+
+    Topic minimi per rifare la valutazione offline:
+        /tracker/fusion_mode
+        /target/odometry_estimate
+        /target/predicted_trajectory
+        /target/triangulation_raw
+        /target/ground_truth_aligned
+        /uav11/target_observation
+        /uav8/target_observation
+        /uav11/estimation_manager/odom_main
+        /uav8/estimation_manager/odom_main
+        /uav28/estimation_manager/odom_main
+        /tf   /tf_static
+    Aggiungi le immagini compresse SOLO se ti servono davvero: raddoppiano la
+    dimensione e possono far perdere frame alla registrazione.
+
+    Comando esatto usato: ________________________________________________
+    ______________________________________________________________________
+
+[ ] Dopo 10 secondi di registrazione, verifica che il file STIA CRESCENDO:
+        du -sh <cartella_bag>
+    Un bag da 0 byte a fine volo e' il modo classico di buttare una giornata.
+    Dimensione a t+10s: ________
+
+[ ] Annota l'ora di inizio bag: ________   (serve per riallineare le note)
+
+
+===============================================================================
+ 10. CRITERI DI ABORT   -- tre condizioni, nessuna negoziabile
+===============================================================================
+
+ STOP 1  python3 preflight_check.py stampa NOT READY TO FLY,
+         oppure --live segnala FAIL sul tilt differenziale.
+
+ STOP 2  /tracker/fusion_mode non raggiunge MAI STEREO a terra con il target
+         in vista da entrambe le camere. Vuol dire che le coppie di raggi non
+         si formano: in volo sara' peggio, non meglio.
+
+ STOP 3  chrony non sincronizzato su uno dei due droni (Leap status diverso da
+         Normal, o offset oltre ~50 ms). Gli stamp dei due observer non sono
+         confrontabili e l'appaiamento stereo e' geometricamente sbagliato.
+
+ In tutti e tre i casi si risolve a terra. Nessuno dei tre migliora volando.
+
+
+===============================================================================
+ 11. DOPO IL VOLO
+===============================================================================
+
+[ ] Valutazione:
+        bash run_prediction_evaluation.sh
+    Artefatti in:  debug/evaluation/<timestamp>/
+    Scorciatoia al piu' recente:  debug/evaluation/latest
+
+[ ] Numeri da trascrivere subito, finche' ricordi il volo:
+      offset del datum dal log "Datum alignment": ______________________
+      ripartizione dei campioni:
+          STEREO       ______ %
+          SINGLE_DEPTH ______ %
+          COAST        ______ %
+      RMSE riportato: ____________
+
+[ ] ATTENZIONE nel confrontare con i report PRECEDENTI a questo volo: prima del
+    fix del coast guard TUTTI i campioni finivano nel bucket COAST e le metriche
+    "active" restavano a zero. I report vecchi e i nuovi NON sono confrontabili
+    campo per campo. Confronta solo da questo volo in poi.
+
+[ ] Note libere sul volo (occlusioni, perdite di target, meteo, vento):
+    ______________________________________________________________________
+    ______________________________________________________________________
+    ______________________________________________________________________
+
+
+===============================================================================
+ COSA SAPPIAMO GIA' CHE E' ROTTO  -- non inseguirlo in campo
+===============================================================================
+
+ * RIACQUISIZIONE ASIMMETRICA DOPO UNA PERDITA DEL TARGET.
+   Quando il track visivo si perde, l'observer ha un fallback che ritaglia una
+   ROI stretta attorno alla stima 3D corrente invece di rifare la detection a
+   tutto frame. Quel fallback funziona SOLO su uav11. Su uav8 la trasformata
+   necessaria attraversa due alberi TF disgiunti, solleva sempre eccezione, e
+   l'eccezione viene ingoiata in silenzio: nessun log, nessun contatore.
+   Effetto atteso in volo: dopo un'occlusione uav8 riaggancia il target piu'
+   lentamente di uav11, in modo sistematico. Non e' un guasto e non blocca il
+   volo - e' una degradazione nota, gia' analizzata, con il fix scritto e
+   rimandato di proposito a dopo questo volo (serve la misura del datum del
+   punto 6 per completarlo).
+   Se vedi uav8 lento a riagganciare: e' questo. Non cercare altro.
+
+ * Il README di questo repo e' in parte obsoleto: parla di weights2 e definisce
+   odom_topic_suffix un "placeholder non risolto". Entrambe le affermazioni sono
+   superate dai commenti nello YAML, che sono piu' recenti. In caso di conflitto
+   fra README e config/runtime_stack.yaml, vince lo YAML.
+
+ * ekf.normalize_crlb e' presente nello YAML ma non e' letto da nessuna riga di
+   codice. Cambiarlo non ha alcun effetto.
+
+===============================================================================
+
+
+===============================================================================
+ VERSIONE RAPIDA  -- se hai fretta leggi solo questa, i dettagli sono sopra
+===============================================================================
+
+ PRIMA DI USCIRE
+ - [ ] git rev-parse --short HEAD  uguale su GS, uav11, uav8
+ - [ ] python3 nodes/test_coast_guard.py           -> OK
+ - [ ] df -h .   spazio per i bag
+
+ A TERRA, DRONI SPENTI
+ - [ ] python3 preflight_check.py                  -> "config gates clear"
+ - [ ] guarda quali pesi:  vision.model_path       (ora weights6)
+
+ OROLOGI
+ - [ ] chronyc tracking su uav11 e uav8  -> Leap status: Normal, offset < 50 ms
+
+ ACCESI, SULLA STESSA SUPERFICIE PIANA, RTK FIXED
+ - [ ] python3 preflight_check.py --live  -> nessun FAIL
+       tilt differenziale > 1.0 deg = riavvia l'FCU peggiore, non correggere
+ - [ ] tf2_echo uav11/utm_origin uav11/world_origin   (idem uav8)
+       annota la Z:  uav11 ______   uav8 ______
+
+ AVVIO, IN QUEST'ORDINE
+ - [ ] uav8   bash launch_observer_detection_node.sh   -> aspetta riga FPS
+ - [ ] uav11  bash launch_main_detection_node.sh       -> aspetta riga FPS
+ - [ ] uav11  bash launch_triangulation_node.sh
+              aspetta "Triangulation node initialization complete."
+ - [ ] GS     bash launch_live_monitor.sh
+
+ CANCELLO PRE-BAG  (target in vista da ENTRAMBE le camere)
+ - [ ] ros2 topic echo /tracker/fusion_mode        -> STEREO
+ - [ ] ros2 topic hz /target/odometry_estimate     -> ~10 Hz
+       se leggi ~100 Hz + COAST fisso = commit sbagliato su uav11, fermati
+ - [ ] copri entrambe le camere -> COAST entro ~0.15 s -> scopri -> STEREO
+
+ BAG
+ - [ ] avvia PRIMA del decollo, poi du -sh <bag> a t+10s: deve crescere
+
+ NON SI VOLA SE
+ - preflight NOT READY TO FLY, o FAIL sul tilt differenziale
+ - fusion_mode non arriva MAI a STEREO a terra
+ - chrony non sincronizzato
+
+ DOPO
+ - [ ] bash run_prediction_evaluation.sh   -> debug/evaluation/latest
+ - [ ] annota: offset datum, % STEREO / SINGLE_DEPTH / COAST, RMSE
+
+ GIA' NOTO, NON INDAGARE: uav8 riaggancia il target piu' lentamente di uav11
+ dopo un'occlusione. Fix scritto e rimandato di proposito a dopo questo volo.
+
+===============================================================================

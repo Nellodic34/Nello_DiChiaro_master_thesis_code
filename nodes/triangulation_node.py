@@ -1607,6 +1607,7 @@ class TriangulationNode(Node):
 
         _default_single_obs_max_age_sec = 0.15
         _default_single_obs_min_confidence = 0.60
+        _default_coast_after_sec = 0.15
 
         # Observer odometry uncertainty propagation defaults
         # Reference: Dogancay (2005/2015), Xu et al. (2017), Bishop et al. (2010).
@@ -1747,6 +1748,9 @@ class TriangulationNode(Node):
                             _default_single_obs_min_confidence = float(
                                 _tri.get('single_obs_min_confidence', _default_single_obs_min_confidence)
                             )
+                            _default_coast_after_sec = float(
+                                _tri.get('coast_after_sec', _default_coast_after_sec)
+                            )
                         if 'depth_fusion' in _cfg:
                             _df = _cfg['depth_fusion']
                             _default_df_use_range_constraint = bool(
@@ -1816,6 +1820,7 @@ class TriangulationNode(Node):
         self.declare_parameter('pairing_log_best_cost', _default_pairing_log_best_cost)
         self.declare_parameter('single_obs_max_age_sec', _default_single_obs_max_age_sec)
         self.declare_parameter('single_obs_min_confidence', _default_single_obs_min_confidence)
+        self.declare_parameter('coast_after_sec', _default_coast_after_sec)
         self.declare_parameter('df_use_range_constraint', _default_df_use_range_constraint)
         self.declare_parameter('df_range_chi2', _default_df_range_chi2)
         self.declare_parameter('shared_heading', _default_shared_heading)
@@ -1913,6 +1918,7 @@ class TriangulationNode(Node):
         self.pairing_log_best_cost = bool(self.get_parameter('pairing_log_best_cost').value)
         self.single_obs_max_age_ns = int(float(self.get_parameter('single_obs_max_age_sec').value) * 1_000_000_000.0)
         self.single_obs_min_confidence = float(self.get_parameter('single_obs_min_confidence').value)
+        self.coast_after_sec = float(self.get_parameter('coast_after_sec').value)
         self.df_use_range_constraint = bool(self.get_parameter('df_use_range_constraint').value)
         self.df_range_chi2 = float(self.get_parameter('df_range_chi2').value)
         self.shared_heading = bool(self.get_parameter('shared_heading').value)
@@ -1993,6 +1999,11 @@ class TriangulationNode(Node):
         self.imm = IMMFilter(pi, mu0)
         self.imm_initialized = False
         self.imm_last_stamp_ns: Optional[int] = None
+        # Wallclock instant at which the filter last consumed a measurement.
+        # Distinct from imm_last_stamp_ns (image capture time) on purpose: the
+        # two live on different clocks and must never be subtracted from each
+        # other.  Only the timer guard uses this one.
+        self._last_measurement_wall_ns: int = 0
         self.filtered_position = np.zeros(3)
         self.filtered_velocity = np.zeros(3)
         self.filtered_acceleration = np.zeros(3)
@@ -3067,17 +3078,24 @@ class TriangulationNode(Node):
         self._prune_stale_observations(now_ns)
         self._log_pairing_diagnostics(now_ns)
 
-        # Guard: if stereo has fired very recently, the filter is healthy —
-        # skip fallback evaluation to avoid double-updating.
-        if self.imm_last_stamp_ns is not None:
-            dt_since_last = (now_ns - self.imm_last_stamp_ns) / 1e9
+        # Guard: if the filter has consumed a measurement very recently it is
+        # healthy — skip fallback evaluation to avoid double-updating.
+        #
+        # Both terms MUST be on the same clock.  imm_last_stamp_ns is the image
+        # CAPTURE time; differencing it against the wallclock 'now' folds the
+        # whole pipeline latency (JPEG -> WiFi -> YOLO on CPU -> WiFi) into the
+        # age, which alone exceeds any sane threshold and makes this guard fire
+        # on every tick.  _last_measurement_wall_ns records when the update was
+        # consumed, so the subtraction below is wallclock - wallclock.
+        if self._last_measurement_wall_ns:
+            dt_since_last = (now_ns - self._last_measurement_wall_ns) / 1e9
         else:
             dt_since_last = float('inf')
 
-        # Only evaluate fallback if we have not received a stereo update recently.
-        # 0.05 s ≈ half a camera frame at 30 Hz — tight enough to catch genuine
-        # dropouts without masking a momentarily delayed stereo pair.
-        if dt_since_last < 0.05:
+        # Only evaluate fallback if no measurement has been consumed recently.
+        # The threshold is tied to the DETECTION rate, not the camera rate: the
+        # filter is starved only once a detection period has gone by unfed.
+        if dt_since_last < self.coast_after_sec:
             return
 
         # Priority 2: SINGLE RGB-D FALLBACK
@@ -3097,7 +3115,7 @@ class TriangulationNode(Node):
 
         # Priority 3: COAST — only when no sensor data is available at all.
         if self.imm_initialized and self.imm_last_stamp_ns is not None:
-            if dt_since_last > 0.05:
+            if dt_since_last > self.coast_after_sec:
                 self._coast_predict(now_ns)
                 self.last_fusion_mode = "COAST"
                 self._publish_fusion_mode()
@@ -3353,6 +3371,7 @@ class TriangulationNode(Node):
                 self.filtered_acceleration = x_comb[6:9].copy()
 
         self.imm_last_stamp_ns = stamp_ns
+        self._last_measurement_wall_ns = self.get_clock().now().nanoseconds
         self.last_fusion_mode = "SINGLE_DEPTH"
 
         raw_msg = PointStamped()
@@ -3492,6 +3511,7 @@ class TriangulationNode(Node):
             self.imm.initialize(measurement, self.kf_initial_covariance)
             self.imm_initialized = True
             self.imm_last_stamp_ns = stamp_ns
+            self._last_measurement_wall_ns = self.get_clock().now().nanoseconds
             self.combined_cov = np.eye(9) * self.kf_initial_covariance
             self.filtered_position = measurement.copy()
             self.filtered_velocity = np.zeros(3)
@@ -3564,6 +3584,7 @@ class TriangulationNode(Node):
                     x_comb[3:6] = self.filtered_velocity
                     
                 self.imm_last_stamp_ns = stamp_ns
+                self._last_measurement_wall_ns = self.get_clock().now().nanoseconds
 
                 cov_trace = float(np.trace(self.combined_cov))
                 if cov_trace > self._imm_cov_trace_reset_thresh:
