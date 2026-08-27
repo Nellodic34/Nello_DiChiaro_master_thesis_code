@@ -197,30 +197,66 @@
 
 
 ===============================================================================
- 6. MISURA DEL DATUM IN Z   (da fare, serve per dopo)
+ 6. DATUM IN Z  --  CANCELLO, decide shared_world_origin
 ===============================================================================
 
- Ogni drone ha il suo albero TF separato e la sua origine world_origin, fissata
- alla sua accensione. Le due origini NON coincidono, in particolare in Z (su un
- bag precedente la differenza era 5.4 m). Il nodo di triangolazione compone le
- due passando per utm_origin; questa misura serve a sapere di quanto stiamo
- parlando OGGI, e a decidere se implementare il fix del fallback ROI su uav8.
+ Ogni drone ha il suo albero TF e la sua world_origin. Storicamente le due NON
+ coincidevano (5.4 m di scarto in Z su un bag, 0.19 m su un altro) e il nodo di
+ triangolazione le componeva passando per utm_origin. Quel salto ha bisogno di
+ /tf_static fra i droni, che sulla rete zenoh attuale NON passa: senza, ogni
+ osservazione di uav8 viene SCARTATA e non esiste nessuna coppia di raggi.
 
-[ ] Con i droni accesi e fissi RTK, dalla GS:
-        ros2 run tf2_ros tf2_echo uav11/utm_origin uav11/world_origin
-        ros2 run tf2_ros tf2_echo uav8/utm_origin  uav8/world_origin
+ Il world file ora dovrebbe fissare la stessa origine (x, y e z) su tutti.
+ Questo punto serve a MISURARLO, non a fidarsene, e a decidere il flag
+ evaluation.shared_world_origin.
+
+[ ] IMPORTANTE: questi comandi vanno lanciati SU OGNI DRONE via ssh, NON dalla
+    GS. Senza /tf_static in rete la GS non vede quei frame e tf2_echo resta
+    muto per sempre -- non e' un guasto, e' la allowlist.
+
+        ssh uav11:  ros2 run tf2_ros tf2_echo uav11/utm_origin uav11/world_origin
+        ssh uav8 :  ros2 run tf2_ros tf2_echo uav8/utm_origin  uav8/world_origin
 
     uav11 -> translation  x ________  y ________  z ________
     uav8  -> translation  x ________  y ________  z ________
 
-    Differenza in Z fra i due (uav8 - uav11): ________ m
+    Differenza  (uav8 - uav11):   x ______  y ______  z ______ m
 
-[ ] Riscontro a nodi accesi (punto 7): nel log del nodo di triangolazione cerca
-        Datum alignment ... offset=(x,y,z) m
-    Le componenti X/Y dovrebbero essere piccole, la Z vicina al numero qui
-    sopra. Se compare anche "Datum alignment ... moved:" ripetutamente, il
-    datum non si e' ancora assestato: aspetta prima di decollare.
-    offset visto nel log: ______________________
+    Questa e' la misura buona: vale anche con i droni su quote diverse, perche'
+    utm e' la griglia comune. Se tf2_echo dice che il frame non esiste, prima
+    controlla il NOME dell'origine: lo YAML usa world_frame_suffix=world_origin
+    ma alcune configurazioni usano f9p_origin. Riscontro:
+        ros2 topic echo /uav11/estimation_manager/odom_main --field header.frame_id --once
+    Il frame_id stampato DEVE combaciare con evaluation.world_frame_suffix.
+    frame_id visto: uav11 ______________  uav8 ______________
+
+[ ] DECISIONE, da prendere qui e non in volo:
+
+    differenza in Z sotto ~0.30 m  -> evaluation.shared_world_origin: true
+                                      (uav8 entra in triangolazione senza tf_static)
+    differenza in Z sopra ~0.30 m  -> LASCIA false e NON VOLARE in due droni:
+                                      senza tf_static uav8 non contribuisce, e
+                                      con true quello scarto diventa un bias
+                                      costante e muto su ogni raggio.
+
+    scelto: shared_world_origin = ____________
+
+[ ] Riscontro incrociato, droni accesi sulla STESSA superficie piana:
+        python3 preflight_check.py --live
+    stampa la z di odom_main dei tre droni e lo spread. E' il proxy rapido della
+    misura qui sopra e richiede stesso terreno; se contraddice il flag, blocca.
+
+[ ] Riscontro a nodi accesi (punto 7), nel log del nodo di triangolazione:
+
+    con shared_world_origin = false  ->  "Datum alignment ... offset=(x,y,z) m"
+        X/Y piccole, Z vicina al numero misurato sopra. Se compare di continuo
+        "Datum alignment ... moved:" il datum non si e' assestato: aspetta.
+
+    con shared_world_origin = true   ->  "shared_world_origin=true: utm datum hop
+        SKIPPED". La riga "Datum alignment" NON comparira' piu': e' corretto,
+        non e' un guasto. Se invece vedi ancora "Cannot datum-align", il flag
+        non e' stato letto -- hai modificato lo YAML sbagliato.
+    log visto: ______________________
 
 
 ===============================================================================
@@ -430,7 +466,7 @@
 
  A TERRA, DRONI SPENTI
  - [ ] python3 preflight_check.py                  -> "config gates clear"
- - [ ] guarda quali pesi:  vision.model_path       (ora weights6)
+ - [ ] guarda quali pesi:  vision.model_path       (ora weights8)
 
  OROLOGI
  - [ ] chronyc tracking su uav11 e uav8  -> Leap status: Normal, offset < 50 ms
@@ -438,8 +474,15 @@
  ACCESI, SULLA STESSA SUPERFICIE PIANA, RTK FIXED
  - [ ] python3 preflight_check.py --live  -> nessun FAIL
        tilt differenziale > 1.0 deg = riavvia l'FCU peggiore, non correggere
- - [ ] tf2_echo uav11/utm_origin uav11/world_origin   (idem uav8)
-       annota la Z:  uav11 ______   uav8 ______
+ - [ ] SU OGNI DRONE via ssh (non dalla GS: /tf_static non passa in zenoh):
+         ros2 run tf2_ros tf2_echo uav11/utm_origin uav11/world_origin
+         ros2 run tf2_ros tf2_echo uav8/utm_origin  uav8/world_origin
+       annota la Z:  uav11 ______   uav8 ______   differenza ______ m
+       diff < 0.30 m -> evaluation.shared_world_origin: true   (senza questo
+       uav8 non entra in triangolazione e resti fermo su COAST)
+       diff > 0.30 m -> lascia false e non volare in due
+ - [ ] verifica il nome del frame, deve combaciare con world_frame_suffix:
+         ros2 topic echo /uav8/estimation_manager/odom_main --field header.frame_id --once
 
  AVVIO, IN QUEST'ORDINE
  - [ ] uav8   bash launch_observer_detection_node.sh   -> aspetta riga FPS
@@ -461,6 +504,7 @@
  - preflight NOT READY TO FLY, o FAIL sul tilt differenziale
  - fusion_mode non arriva MAI a STEREO a terra
  - chrony non sincronizzato
+ - shared_world_origin: true ma la differenza in Z misurata supera 0.30 m
 
  DOPO
  - [ ] bash run_prediction_evaluation.sh   -> debug/evaluation/latest

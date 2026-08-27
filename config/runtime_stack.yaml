@@ -369,6 +369,18 @@ evaluation:
   odom_topic_suffix: "estimation_manager/odom_main"  # CORRECT for real drones: the 22-7 bags contain /uav28/estimation_manager/odom_main etc. The old comment calling this "simulation ground truth" and pointing at odometry/odom_main was wrong -- that topic does not exist on these drones. hw_api/ground_truth is the SIM-only one.
   world_frame_suffix: "world_origin"  # real drone RTK origin, V2 uses f9p_origin
 
+  # Set true ONLY when every drone is configured with the same world origin (x, y AND z)
+  # in the world file. The triangulation node then treats all <uav>/world_origin frames as
+  # one frame and skips the utm datum hop in _datum_rt, which is the only thing that needs
+  # /tf_static to cross the network between drones.
+  # With false and no /tf_static, _transform_observation_to_target_frame returns None for
+  # every remote observation and the second observer contributes NOTHING: no stereo pair,
+  # no triangulation. With true and origins that do NOT actually coincide, the offset
+  # becomes a silent constant bias on every ray. Measure before trusting: park the drones
+  # on the same flat ground and compare the z of their estimation_manager/odom_main
+  # (preflight_check.py --live prints exactly this).
+  shared_world_origin: false
+
   # GT re-published by the triangulation node after the utm datum hop, in the same frame as
   # /target/odometry_estimate. The raw <target>/odom topic is in the TARGET drone's own origin
   # frame, whose z datum differs by several metres (5.4 m in v5), so comparing it against the

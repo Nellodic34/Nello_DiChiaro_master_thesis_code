@@ -1565,6 +1565,7 @@ class TriangulationNode(Node):
         _observer2_name = 'uav2'
         _target_name = 'uav3'
         _world_frame_suffix = 'world_origin'
+        _shared_world_origin = False
         _target_gt_odom_suffix = 'hw_api/ground_truth'
         _default_publish_markers = True
         _default_publish_debug_annotated = False
@@ -1636,6 +1637,7 @@ class TriangulationNode(Node):
                         if 'evaluation' in _cfg:
                             _eval = _cfg['evaluation']
                             _world_frame_suffix = _eval.get('world_frame_suffix', _world_frame_suffix)
+                            _shared_world_origin = bool(_eval.get('shared_world_origin', _shared_world_origin))
                             _target_gt_odom_suffix = _eval.get('odom_topic_suffix', _target_gt_odom_suffix)
                         # Per-flight survey constants live under bag_profiles; bag_profile
                         # picks one and "none" picks nothing, so a new bag replays raw. The
@@ -1832,6 +1834,7 @@ class TriangulationNode(Node):
         self.declare_parameter('odom_max_variance', _default_odom_max_variance)
         self.declare_parameter('tf_timeout_sec', 0.05)
         self.declare_parameter('world_frame_suffix', _world_frame_suffix)
+        self.declare_parameter('shared_world_origin', _shared_world_origin)
         self.declare_parameter('kf_process_noise_acc', _default_process_noise_acc)
         self.declare_parameter('kf_process_noise_vel', _default_process_noise_vel)
         self.declare_parameter('imm_transition_prob', _default_imm_transition_prob)  # legacy, unused
@@ -1884,6 +1887,7 @@ class TriangulationNode(Node):
         self.processing_rate_hz = max(0.5, float(self.get_parameter('processing_rate_hz').value))
         self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
         self.world_frame_suffix = str(self.get_parameter('world_frame_suffix').value)
+        self.shared_world_origin = bool(self.get_parameter('shared_world_origin').value)
         self.kf_process_noise_acc = float(self.get_parameter('kf_process_noise_acc').value)
         self.kf_process_noise_vel = float(self.get_parameter('kf_process_noise_vel').value)
         self.imm_transition_prob = float(self.get_parameter('imm_transition_prob').value)  # legacy
@@ -2169,6 +2173,11 @@ class TriangulationNode(Node):
 
         self.create_timer(1.0 / self.processing_rate_hz, self.processing_timer_callback)
 
+        if self.shared_world_origin:
+            self.get_logger().warn(
+                'shared_world_origin=true: utm datum hop SKIPPED, all <uav>/world_origin '
+                'frames assumed identical. Any real offset between them becomes a silent '
+                'triangulation bias.')
         self.get_logger().info('Triangulation node initialization complete.')
         pairing_mode = 'prediction-guided' if self.pairing_prediction_enabled else 'timestamp-only'
         self.get_logger().info(
@@ -2894,6 +2903,11 @@ class TriangulationNode(Node):
         frame_id = self.target_gt_odom.header.frame_id
         if not frame_id or frame_id == self.target_frame_id:
             return pos
+        if self.shared_world_origin:
+            # Origins declared identical, so no rotation and no translation to apply.
+            # target_gt_z_offset_m stays live: it is the knob for the residual the survey
+            # left behind, and 'declared identical in the config' is not 'measured identical'.
+            return pos + np.array([0.0, 0.0, self.target_gt_z_offset_m])
         datum = self._datum_rt(frame_id, stamp_to_ns(self.target_gt_odom.header.stamp), 'target GT')
         if datum is None:
             return None
@@ -2902,7 +2916,12 @@ class TriangulationNode(Node):
 
     def _transform_observation_to_target_frame(self, obs: SpatialObservation) -> Optional[SpatialObservation]:
         """Express one frozen observation in the triangulation target frame without changing its timestamp."""
-        if not obs.frame_id or obs.frame_id == self.target_frame_id:
+        # shared_world_origin: every drone was configured with the SAME world origin
+        # (x, y AND z) in the world file, so the per-drone <uav>/world_origin frames are
+        # physically the same frame and the utm hop is an identity that only needs
+        # /tf_static to compute.  Without this switch a remote observation whose datum
+        # cannot be resolved returns None below and the ray is DROPPED, i.e. no stereo.
+        if not obs.frame_id or obs.frame_id == self.target_frame_id or self.shared_world_origin:
             return SpatialObservation(
                 stamp_ns=obs.stamp_ns,
                 origin=obs.origin,

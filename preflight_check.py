@@ -139,6 +139,7 @@ def check_live(c, seconds):
     rclpy.init()
     node = Node('preflight_check')
     got = {}
+    got_z = {}
 
     def mk(u):
         def cb(msg):
@@ -151,6 +152,7 @@ def check_live(c, seconds):
             got[u] = (math.degrees(math.atan2(sr_, cr_)),
                       math.degrees(math.asin(sp_)),
                       math.degrees(math.atan2(sy_, cy_)))
+            got_z[u] = msg.pose.pose.position.z
         return cb
 
     for u in uavs:
@@ -200,6 +202,34 @@ def check_live(c, seconds):
         if abs(dy) > 2.0:
             warn(f'yaw disagreement {dy:+.2f} deg. With dual-antenna RTK heading this should '
                  f'be under ~1.5 deg; if it is not, one heading solution is not fixed yet.')
+
+    # World-origin z datum. Only meaningful with the drones on the SAME flat ground: each
+    # reports its height above ITS OWN world_origin, so equal ground + equal z means the
+    # origins share a z datum. This is what evaluation.shared_world_origin asserts, and the
+    # only way to check it without /tf_static crossing the network.
+    shared = c.get('evaluation', {}).get('shared_world_origin', False)
+    if len(got_z) >= 2:
+        print(f'\n      world-origin z datum (drones must be on the SAME flat ground):')
+        for u in uavs:
+            if u in got_z:
+                print(f'      {u:<10}{got_z[u]:>9.3f} m')
+        spread = max(got_z.values()) - min(got_z.values())
+        if shared and spread > 0.30:
+            bad(f'evaluation.shared_world_origin = true but the odom z values spread by '
+                f'{spread:.2f} m. The node is skipping the utm datum hop, so that spread '
+                f'goes straight into every remote ray as a constant bias. Either the world '
+                f'file z is not actually shared, or the drones are not on the same ground.')
+        elif shared:
+            ok(f'shared_world_origin = true and z spread {spread:.2f} m (< 0.30): origins agree')
+        elif spread <= 0.30:
+            print(f'         z spread {spread:.2f} m. Origins look shared; without /tf_static '
+                  f'you need evaluation.shared_world_origin = true or observer2 rays are dropped.')
+        else:
+            print(f'         z spread {spread:.2f} m: origins do NOT share a z datum, the utm '
+                  f'hop (and /tf_static) is doing real work. Do not set shared_world_origin.')
+    elif shared:
+        warn('shared_world_origin = true but fewer than two drones reported odometry, '
+             'so the assertion is unverified.')
 
     if df.get('enabled'):
         print(f"\n      depth fusion on {df.get('depth_topic_suffix')}")
