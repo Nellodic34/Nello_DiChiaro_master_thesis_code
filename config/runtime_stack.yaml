@@ -30,12 +30,16 @@ vision:
   roi_reference_imgsz: 256  # reference ROI-side imgsz used to define the base scale-preserving crop at margin=1; not the final per-frame YOLO imgsz
   roi_crop_imgsz: 320       # legacy alias for older nodes; keep equal to roi_reference_imgsz until all nodes are migrated
   roi_margin_multiplier: 1.40  # expands search area around the predicted center; should change coverage, not nominal target scale
-  roi_min_size_px: 200      # reject ROI mode if the real crop becomes smaller than this in source-image pixels
+  roi_min_size_px: 133      # 720 | 480: 67 | 1080: 200. Reject ROI mode if the real crop becomes smaller
+                            # than this in source-image pixels. The base crop is int(256*H/896)*1.40, i.e.
+                            # 287 px tall at 720 and 191 px at 480 -- the original 200 sat BETWEEN those two,
+                            # so at 480 it rejected the window on every clean-track frame and ROI never ran.
+                            # Keep this comfortably under the base crop height for whatever stream you fly.
   roi_track_timeout_sec: 0.5  # after this time without updates, drop the ROI track and reacquire globally
   roi_full_scan_interval: 20  # every N frames force one full-frame scan to recover from drift or missed target
   roi_init_m: 3               # start an ROI track only if at least M detections are mutually consistent ...
   roi_init_n: 5               # ... within the last N candidate detections
-  roi_init_max_spread_px: 80  # the M detections above must lie within this pixel spread to arm the ROI tracker
+  roi_init_max_spread_px: 53  # 720 | 480: 27 | 1080: 80. The M detections above must lie within this pixel spread to arm the ROI tracker
   roi_selection_lambda: 0.3   # when ROI is active, penalize detections far from the predicted center during candidate selection
   camera_frame_override: ""  # override camera frame_id from CameraInfo for TF lookups (e.g. {uav_name}/rgbd_front/color_optical)
   publish_rviz_markers: false  # predicted trajectory & position markers to RViz (disable to save CPU)
@@ -67,7 +71,7 @@ tight_coupling:
   sigma_v_inflate: 1.5             # (Better if between 1 and 2) [m/s] velocity uncertainty for gate inflation over the prediction horizon dt.
                                    # Gate grows by (sigma_v_inflate * dt)² per axis. Raise this if TC still
                                    # rejects valid detections during aggressive observer maneuvers.
-  r_pixel_sigma_px: 10.0           # [L2-bug2] Std-dev (pixels) of the pinhole measurement noise floor for the
+  r_pixel_sigma_px: 6.7            # 720 | 480: 3.3 | 1080: 10.0. [L2-bug2] Std-dev (pixels) of the pinhole measurement noise floor for the
                                    # TC gate covariance: R_pixel = diag(sigma²,sigma²). Should match kf_sigma_px
                                    # so the local 2D KF and the 3D TC gate share the same noise model.
 
@@ -345,22 +349,33 @@ triangulation:
 # Image-space Kalman filter — false positive rejection layer inside each ObserverNode.
 kalman_filter:
   kf_enabled: true
-  kf_sigma_a: 400.0
-  kf_sigma_px: 11.0
+  kf_sigma_a: 267.0            # 720  | 480: 133.0 | 1080: 400.0   -- px/s^2, scala con k
+  # RESOLUTION-COUPLED KNOBS. These are absolute pixel quantities: they only mean what they
+  # say at the resolution they were tuned at, which was 1920x1080. Active values below are for
+  # 1280x720 (k = 1280/1920 = 2/3); the trailing comment carries the 640x480 (k = 1/3) and the
+  # original 1080 numbers, so switching stream resolution is a copy from the comment.
+  #   lengths (px, px/s^2) scale by k    -- kf_sigma_px, kf_sigma_a, kf_ghost_reentry_spread_px,
+  #                                         roi_init_max_spread_px, tight_coupling.r_pixel_sigma_px
+  #   areas / variances (px^2) by k^2    -- kf_p_max, kf_bbox_area_ref
+  # NOT covered here: _ghost_reentry_anchor_radius_px() in observer_node.py hardcodes 48 px and a
+  # 320 px cap. The cap dominates at every resolution, so that recovery gate is relatively more
+  # permissive the smaller the frame. Left alone on purpose -- it is the re-acquisition path and
+  # generous is the intent -- but it is the one pixel constant this table does not reach.
+  kf_sigma_px: 7.3             # 720  | 480: 3.7  | 1080: 11.0
   kf_conf_beta: 1.0
   kf_conf_min: 0.2
   kf_n_confirm: 3.0
   kf_max_age: 5
-  kf_p_max: 800.0
+  kf_p_max: 356.0              # 720  | 480: 89.0  | 1080: 800.0   -- varianza px^2, scala con k^2
   kf_nis_window: 15
   kf_nis_threshold: 8.0
   kf_ghost_timeout_sec: 0.5
   kf_ghost_reentry_m: 2
   kf_ghost_reentry_n: 3
   kf_ghost_reentry_conf_min: 0.35
-  kf_ghost_reentry_spread_px: 100.0
+  kf_ghost_reentry_spread_px: 67.0  # 720  | 480: 33.0  | 1080: 100.0
   kf_ego_motion_enabled: true
-  kf_bbox_area_ref: 3600.0
+  kf_bbox_area_ref: 1600.0     # 720  | 480: 400.0 | 1080: 3600.0  -- area px^2, scala con k^2
   kf_dist_gamma: 0.2
   kf_cam_aware_gating_enabled: true
 
@@ -379,7 +394,7 @@ evaluation:
   # becomes a silent constant bias on every ray. Measure before trusting: park the drones
   # on the same flat ground and compare the z of their estimation_manager/odom_main
   # (preflight_check.py --live prints exactly this).
-  shared_world_origin: false
+  shared_world_origin: true
 
   # GT re-published by the triangulation node after the utm datum hop, in the same frame as
   # /target/odometry_estimate. The raw <target>/odom topic is in the TARGET drone's own origin
@@ -419,7 +434,12 @@ evaluation:
 # ---------------------------------------------------------------------------
 depth_fusion:
   # Master switch. false = no depth subscriber, no depth code path, identical to bearing-only.
-  enabled: true
+  # FALSE since the USB-C 3.0 cable was swapped for USB 2.1 (RTK interference): that link has no
+  # bandwidth for an aligned depth stream, so there is no /rgbd/aligned_depth_to_color to subscribe
+  # to. Leaving it true makes preflight_check.py FAIL and buys nothing. Cost of turning it off:
+  # triangulation_node's single-observation fallback (line ~3124) requires depth_valid, so with one
+  # observer occluded the filter now only coasts -- there is no single-ray range update any more.
+  enabled: false
   # Topic suffix relative to uav_name: full topic = /{uav_name}/{depth_topic_suffix}
   # Supports sensor_msgs/Image with encoding 16UC1 (millimetres) or 32FC1 (metres).
   depth_topic_suffix: "rgbd/aligned_depth_to_color/image_raw"

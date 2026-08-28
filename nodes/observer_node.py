@@ -2388,6 +2388,56 @@ class ObserverNode(Node):
                 return True
         return False
 
+    def _compute_roi_window(
+        self, pred_u: float, pred_v: float, img_w: int, img_h: int
+    ) -> Optional[Tuple[int, int, int, int, int, str]]:
+        """Crop window for ROI inference as (x1, y1, x2, y2, imgsz, debug), or None if unusable.
+
+        Returning None instead of leaving half-computed coordinates behind is the point:
+        roi_x1/roi_y1 are the crop ORIGIN and every consumer downstream adds them back
+        (KF/TC/OSR/depth gates, draw_predictions, the evaluation packet). A window that
+        was computed and then rejected used to leave that origin non-zero on a full-frame
+        pass, shifting the whole frame's detections by it.
+        """
+        scale_preserving_w = int(self.roi_reference_imgsz * img_w / self.imgsz)
+        scale_preserving_h = int(self.roi_reference_imgsz * img_h / self.imgsz)
+
+        roi_w = int(scale_preserving_w * self.roi_margin)
+        roi_h = int(scale_preserving_h * self.roi_margin)
+
+        if self._roi_last_bbox is not None:
+            bx1, by1, bx2, by2 = self._roi_last_bbox
+            roi_w = max(roi_w, int((bx2 - bx1) * 2.5))
+            roi_h = max(roi_h, int((by2 - by1) * 2.5))
+
+        if self._roi_consecutive_misses >= 3:
+            roi_w = int(roi_w * 2.0)
+            roi_h = int(roi_h * 2.0)
+        elif self._roi_consecutive_misses >= 1:
+            roi_w = int(roi_w * 1.5)
+            roi_h = int(roi_h * 1.5)
+
+        x1 = int(max(0.0, pred_u - roi_w * 0.5))
+        y1 = int(max(0.0, pred_v - roi_h * 0.5))
+        x2 = int(min(float(img_w), x1 + roi_w))
+        y2 = int(min(float(img_h), y1 + roi_h))
+
+        crop_w = x2 - x1
+        crop_h = y2 - y1
+        if crop_w < self.roi_min_size or crop_h < self.roi_min_size:
+            return None
+
+        infer_imgsz = min(
+            self.imgsz,
+            self._round_up_to_stride(self.imgsz * (max(crop_w, crop_h) / float(max(img_w, img_h)))),
+        )
+        details = (
+            f', roi={crop_w}x{crop_h}->{infer_imgsz}'
+            f', base={scale_preserving_w}x{scale_preserving_h}'
+            f', ref={self.roi_reference_imgsz}'
+        )
+        return x1, y1, x2, y2, infer_imgsz, details
+
     def image_callback(self, msg) -> None:
         if self.latest_image is not None:
             self._dropped_frames += 1
@@ -2430,53 +2480,14 @@ class ObserverNode(Node):
 
         if self.roi_crop_enabled and self._roi_last_bbox is not None:
             force_full = self._roi_frame_counter % self.roi_full_scan_interval == 0
-
             roi_center = self._get_roi_center(stamp_ns, img_w, img_h)
-            has_track = roi_center is not None
 
-            if has_track and not force_full:
-                pred_u, pred_v = roi_center
-                scale_preserving_w = int(self.roi_reference_imgsz * img_w / self.imgsz)
-                scale_preserving_h = int(self.roi_reference_imgsz * img_h / self.imgsz)
-
-                roi_w = int(scale_preserving_w * self.roi_margin)
-                roi_h = int(scale_preserving_h * self.roi_margin)
-
-                if self._roi_last_bbox is not None:
-                    bx1, by1, bx2, by2 = self._roi_last_bbox
-                    last_bbox_w = bx2 - bx1
-                    last_bbox_h = by2 - by1
-                    roi_w = max(roi_w, int(last_bbox_w * 2.5))
-                    roi_h = max(roi_h, int(last_bbox_h * 2.5))
-
-                if self._roi_consecutive_misses >= 3:
-                    roi_w = int(roi_w * 2.0)
-                    roi_h = int(roi_h * 2.0)
-                elif self._roi_consecutive_misses >= 1:
-                    roi_w = int(roi_w * 1.5)
-                    roi_h = int(roi_h * 1.5)
-
-                roi_x1 = int(max(0.0, pred_u - roi_w * 0.5))
-                roi_y1 = int(max(0.0, pred_v - roi_h * 0.5))
-                roi_x2 = int(min(float(img_w), roi_x1 + roi_w))
-                roi_y2 = int(min(float(img_h), roi_y1 + roi_h))
-
-                if (roi_x2 - roi_x1) >= self.roi_min_size and (roi_y2 - roi_y1) >= self.roi_min_size:
-                    crop_w = roi_x2 - roi_x1
-                    crop_h = roi_y2 - roi_y1
-                    full_max_dim = float(max(img_w, img_h))
-                    crop_max_dim = float(max(crop_w, crop_h))
-                    infer_imgsz = min(
-                        self.imgsz,
-                        self._round_up_to_stride(self.imgsz * (crop_max_dim / full_max_dim)),
-                    )
+            if roi_center is not None and not force_full:
+                window = self._compute_roi_window(roi_center[0], roi_center[1], img_w, img_h)
+                if window is not None:
+                    roi_x1, roi_y1, roi_x2, roi_y2, infer_imgsz, roi_debug_details = window
                     infer_image = bgr_image[roi_y1:roi_y2, roi_x1:roi_x2]
                     use_roi = True
-                    roi_debug_details = (
-                        f', roi={crop_w}x{crop_h}->{infer_imgsz}'
-                        f', base={scale_preserving_w}x{scale_preserving_h}'
-                        f', ref={self.roi_reference_imgsz}'
-                    )
 
         self._roi_frame_counter += 1
 

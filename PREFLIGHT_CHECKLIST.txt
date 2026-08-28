@@ -210,6 +210,16 @@
  Questo punto serve a MISURARLO, non a fidarsene, e a decidere il flag
  evaluation.shared_world_origin.
 
+[ ] A MONTE DI TUTTO: i tre droni devono caricare LO STESSO world file, e in
+    quel file deve valere
+        world_origin:  use_z_relative_to_home: false
+        world_origin:  origin_z: <numero fisso, es. 462.4>
+    E' questa riga a rendere le origini condivise: con false la z e' ancorata al
+    numero nel file, uguale per tutti. Con true ogni drone ancora la propria
+    origine alla PROPRIA quota di accensione e le origini tornano a divergere,
+    che e' esattamente il caso da 5.4 m dei bag vecchi.
+    stesso file su tutti e tre?  ______   use_z_relative_to_home = ______
+
 [ ] IMPORTANTE: questi comandi vanno lanciati SU OGNI DRONE via ssh, NON dalla
     GS. Senza /tf_static in rete la GS non vede quei frame e tf2_echo resta
     muto per sempre -- non e' un guasto, e' la allowlist.
