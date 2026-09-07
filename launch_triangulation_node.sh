@@ -109,6 +109,9 @@ if [ "$RUN_MODE" = "decentralized_evaluation" ]; then
     cleanup() {
         kill "${TRIANGULATION_PID:-}" 2>/dev/null || true
         kill "${EVALUATION_PID:-}" 2>/dev/null || true
+        # The evaluator writes its plots and report from its shutdown path, which takes seconds.
+        # Returning here without waiting is what truncated every run to json+csv.
+        wait "${EVALUATION_PID:-}" 2>/dev/null || true
     }
 
     trap cleanup INT TERM EXIT

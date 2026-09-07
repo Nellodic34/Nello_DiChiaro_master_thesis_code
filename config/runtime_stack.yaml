@@ -125,7 +125,7 @@ simulation:
 uav_roles:
   observer1: uav11  # main/triangulating drone (22-7 bag)
   observer2: uav8   # secondary observer drone (22-7 bag)
-  target: uav28     # TARGET drone name edit to match your real drone
+  target: uav2     # TARGET drone name edit to match your real drone
 
 # ---------------------------------------------------------------------------
 # Shared heading (STATIC BENCH ONLY -- leave false to fly)
