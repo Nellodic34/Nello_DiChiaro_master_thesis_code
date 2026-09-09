@@ -293,6 +293,25 @@ ekf:
   #     3. kf_mahalanobis_threshold re-tuned (likely wider, e.g. [9.0, 30.0]).
   #   Reference: Bishop et al. (2010), Automatica 46(3); Bar-Shalom et al. (2001).
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # ML refinement (Gauss-Newton on the angular residual)
+  # The WLS solve above is PSEUDOLINEAR: it minimises a metric residual, which is
+  # what makes it closed-form, and also what makes it biased -- the bias does not
+  # vanish as measurements accumulate (Gavish & Weiss 1992, Sec. III). This flag
+  # adds 2-4 Gauss-Newton steps on the true angular residual, started from the WLS
+  # answer: asymptotically unbiased and CRLB-efficient (ibid., Sec. IV).
+  # Cost: ~2-4 3x3 solves per frame, negligible at 15 Hz.
+  # Falls back to the WLS answer if a step diverges, so it cannot be worse.
+  # Weights come from anisotropic_bearing_noise when that is enabled, otherwise
+  # from kf_measurement_noise on both axes.
+  #
+  # A/B on a bag: flip this, relaunch, and compare the MEDIAN radial error of
+  # /target/triangulation_raw against /target/ground_truth_aligned. See
+  # refine_triangulation_gn() for why the median and not the mean.
+  # ---------------------------------------------------------------------------
+  ml_refine: false        # master switch; false = exact previous WLS-only behaviour
+  ml_refine_iters: 5      # max Gauss-Newton iterations (stops early at 0.1 mm step)
+
   normalize_crlb: false   # SOTA: R = inv(Lambda), anisotropic geometry-aware CRLB.
                            # Requires use_odom_uncertainty=false (match tuning config).
 

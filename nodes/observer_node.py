@@ -818,6 +818,58 @@ class ImageSpaceKalmanTracker:
         """Reason emitted when prediction containment had to override the raw state."""
         return self._last_prediction_guard_reason
 
+    def extrapolated_center(
+        self,
+        stamp_ns: int,
+        image_size: Optional[Tuple[int, int]] = None,
+        camera_matrix: Optional[np.ndarray] = None,
+        vel_px_s: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """Constant-velocity extrapolation of the tracked centroid to ``stamp_ns``.
+
+        `predicted_center` is the centroid AT the last update (posterior after a hit,
+        ego-corrected prior after a miss) — it is not extrapolated forward. The ROI
+        crop is chosen BEFORE inference, so it needs the centroid at the *incoming*
+        frame time, hence this method.
+
+        The POSITION is the win here: the KF state has been through
+        _apply_ego_motion, so on a sharp observer pitch it sits where the target
+        really is while a raw pixel-difference tracker still points at the old spot.
+
+        The VELOCITY is not. Measured on a clean 100 px/s synthetic track at 20 Hz,
+        self._x[2] reads 20.5 px/s after 0.55 s, 39.1 after 1 s and only 81.6 after
+        3 s: the DeepSORT-style `std_pos` floor that _build_Q adds to the positional
+        block keeps position uncertain enough that the filter absorbs target motion
+        as process noise instead of learning velocity. A fixed-alpha EMA of raw frame
+        differences is at ~94% of true velocity within three frames. So callers that
+        have a faster velocity estimate should pass it as `vel_px_s`; the KF's own
+        velocity is the fallback, not the preference.
+        # ponytail: the slow velocity is a _build_Q tuning issue, not a structural
+        # one — fixing it there would also move the Mahalanobis gate, so it is left
+        # alone and worked around here.
+
+        Returns None unless the track is CONFIRMED — a TENTATIVE track has at most
+        `n_confirm` hits, so its state is still dominated by the initial condition.
+        """
+        if self._state != self.CONFIRMED or self._x is None:
+            return None
+
+        dt = (stamp_ns - self._prev_stamp_ns) / 1e9
+        if dt < 0.0 or dt > 1.0:      # non-monotonic stamp, or a gap so long the CV model is void
+            return None
+
+        vel_u, vel_v = (float(self._x[2]), float(self._x[3])) if vel_px_s is None else (
+            float(vel_px_s[0]), float(vel_px_s[1])
+        )
+        center = (
+            float(self._x[0] + vel_u * dt),
+            float(self._x[1] + vel_v * dt),
+        )
+        frame_size = self._resolve_frame_size(image_size, camera_matrix)
+        if frame_size is not None:
+            center = self._clip_center_to_frame(center, frame_size)
+        return center
+
     @property
     def ghost_center(self) -> Optional[Tuple[float, float]]:
         """Last known position after KF reset, or None."""
@@ -2233,8 +2285,30 @@ class ObserverNode(Node):
 
     def _get_roi_center(self, stamp_ns: int, img_w: int, img_h: int) -> Optional[Tuple[float, float]]:
         """Predict the ROI center from the image-plane track first, then fall back to target odometry."""
-        
-        # 1. Primary: Use visual track (if recently updated and not missing)
+
+        # 0. Primary: KF centroid (ego-motion corrected) carried forward with the ROI
+        # tracker's EMA velocity. Each estimator supplies the half it is good at —
+        # see extrapolated_center() for the measurements behind the split. The KF
+        # centroid was already the SELECTION reference (see process_image); this makes
+        # the CROP agree with it instead of running on a second, weaker position.
+        if self.kf_enabled:
+            camera_matrix = np.array(self.camera_info.k).reshape(3, 3) if self.camera_info is not None else None
+            ema_vel = (
+                (self._roi_vel_u, self._roi_vel_v)
+                if self._roi_last_center is not None and self._roi_consecutive_misses == 0
+                else None
+            )
+            kf_center = self._kf_tracker.extrapolated_center(
+                stamp_ns,
+                image_size=(img_w, img_h),
+                camera_matrix=camera_matrix,
+                vel_px_s=ema_vel,
+            )
+            if kf_center is not None:
+                return kf_center
+
+        # 1. Fall back to the ROI tracker's own EMA extrapolation (KF disabled, or
+        # track not CONFIRMED yet — during acquisition the EMA is all we have).
         if self._roi_last_center is not None and self._roi_last_stamp_ns > 0 and self._roi_consecutive_misses == 0:
             dt = (stamp_ns - self._roi_last_stamp_ns) / 1_000_000_000.0
             pred_u = self._roi_last_center[0] + self._roi_vel_u * dt

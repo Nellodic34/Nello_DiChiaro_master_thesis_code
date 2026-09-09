@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vision Stack — System Architecture</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --card:#ffffff; --border:#e4e2da; --text:#242320; --muted:#726f66;
+    --obs1:#8e5fc7; --obs2:#c98a12; --fusion:#3b4252; --ground:#128f7d; --target:#2f7fc1;
+    --ok:#1f8a4c; --ok-bg:#e5f6ec;
+    --off:#8a8f99; --off-bg:#eef0f3;
+    --code-bg:#f1efe6;
+    --serif: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+    --sans: -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html{font-size:18px;}
+  body{
+    margin:0; font-family:var(--sans);
+    background:var(--bg); color:var(--text); line-height:1.65;
+  }
+  header.hero{
+    background:linear-gradient(135deg,#1e2537,#2c3550);
+    color:#fff; padding:44px 6vw 34px;
+  }
+  header.hero h1{margin:0 0 10px; font-size:1.9rem; font-family:var(--serif); font-weight:700; max-width:880px;}
+  header.hero p{margin:0; color:#c7cde0; max-width:820px; font-size:1.05rem;}
+  header.hero .meta{margin-top:20px; font-size:.78rem; color:#8f9ac0; display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px;}
+  header.hero .meta .meta-label{color:#6b7599; text-transform:uppercase; letter-spacing:.06em; font-size:.7rem;}
+  header.hero .meta code{background:#151a29; padding:2px 7px; border-radius:4px; color:#dbe0f0; font-size:.75rem;}
+  header.hero .meta .sep{color:#454e70;}
+
+  nav.toc{
+    background:#fff; border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10;
+    padding:10px 6vw; display:flex; gap:18px; flex-wrap:wrap; font-size:.83rem;
+  }
+  nav.toc a{color:var(--text); text-decoration:none; padding:4px 2px; border-bottom:2px solid transparent;}
+  nav.toc a:hover{border-color:var(--obs1);}
+
+  /* article column: comfortable reading width, tables/asides may widen slightly */
+  main{max-width:1080px; margin:0 auto; padding:48px 5vw 90px; font-size:1.06rem;}
+  @media (min-width:1500px){ main{max-width:1220px;} }
+  @media (min-width:900px){ main{padding-left:64px; padding-right:64px;} }
+  section{margin-bottom:50px;}
+  .chapter-num{display:block; font-size:.8rem; letter-spacing:.08em; text-transform:uppercase; color:var(--obs1); font-weight:700; margin-bottom:2px;}
+  h2{font-size:1.65rem; font-family:var(--serif); margin:0 0 16px; padding-bottom:10px; border-bottom:2px solid var(--border);}
+  h3{font-size:1.18rem; margin:30px 0 9px; color:#1c1b18;}
+  h4{font-size:1.02rem; margin:17px 0 5px; color:#3a3833;}
+  p{margin:0 0 15px;}
+  p.lead{color:var(--muted); font-size:1.12rem;}
+  .card{background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0;}
+
+  /* an inline explanatory aside, used sparingly to flag feedback loops / cross-links inside the narrative */
+  .note{
+    margin:14px 0; padding:10px 14px; border-left:3px solid; border-radius:0 8px 8px 0;
+    font-size:.88rem; background:#fff;
+  }
+  .note-osr{border-color:#5b6bc7; background:#f3f4fc;}
+  .note-tc{border-color:#c0524f; background:#fdf2f1;}
+  .note-roi{border-color:#3f8f45; background:#f0f8f1;}
+  .note-warn{border-color:#b8860b; background:#fdf6e3;}
+
+  .pill{display:inline-block; font-size:.72rem; font-weight:600; padding:1px 9px; border-radius:99px; letter-spacing:.01em; vertical-align:1px;}
+  .pill-ok{background:var(--ok-bg); color:var(--ok);}
+  .pill-off{background:var(--off-bg); color:var(--off);}
+
+  table{width:100%; border-collapse:collapse; font-size:.83rem; background:var(--card);}
+  th,td{border:1px solid var(--border); padding:7px 10px; text-align:left; vertical-align:top;}
+  th{background:#f1efe6; font-size:.72rem; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); font-weight:600;}
+  tr:nth-child(even) td{background:#fbfbf8;}
+  td code, p code, li code, .note code{background:var(--code-bg); padding:1px 5px; border-radius:4px; font-size:.87em;}
+  .tbl-wrap{overflow-x:auto; border-radius:10px; border:1px solid var(--border); margin:14px 0;}
+  .tbl-wrap table{border:none;}
+  .tbl-wrap th, .tbl-wrap td{border-left:none; border-right:none; border-top:none;}
+  .tbl-wrap tr:first-child td{border-top:none;}
+  figcaption, .cap{font-size:.78rem; color:var(--muted); margin-top:6px;}
+
+  /* ---------- lightweight "storyline" strip used only in the outline ---------- */
+  .storyline{
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:center;
+    background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px 14px; margin:18px 0 8px;
+  }
+  .storyline .stop{
+    font-size:.78rem; font-weight:600; padding:8px 12px; border-radius:8px; text-align:center; white-space:nowrap;
+  }
+  .storyline .arrow{color:var(--muted); font-size:1rem;}
+  .stop-target{background:#e8f3fc; color:var(--target);}
+  .stop-obs1{background:#f5eefb; color:var(--obs1);}
+  .stop-obs2{background:#fdf3e0; color:var(--obs2);}
+  .stop-fusion{background:#eef0f4; color:var(--fusion);}
+  .stop-ground{background:#e6f7f4; color:var(--ground);}
+
+  .legend{display:flex; gap:16px; flex-wrap:wrap; margin:14px 0; font-size:.78rem; color:var(--muted);}
+  .legend span.dot{display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle;}
+
+  /* ---------- inline mini-diagrams sprinkled through the narrative ---------- */
+  .mini-flow{
+    display:flex; align-items:stretch; gap:6px; flex-wrap:wrap; justify-content:center;
+    background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px 14px; margin:18px 0 20px;
+  }
+  .mini-flow .step{
+    background:#faf9f4; border:1px solid var(--border); border-radius:8px; padding:7px 10px; font-size:.72rem;
+    text-align:center; min-width:88px; display:flex; flex-direction:column; justify-content:center; gap:2px;
+  }
+  .mini-flow .step b{font-size:.68rem; color:var(--obs1); display:block;}
+  .mini-flow .arrow{align-self:center; color:#c7c4b8; font-size:.85rem; padding:0 1px;}
+  .fig-cap{text-align:center; font-size:.78rem; color:var(--muted); margin-top:-10px; margin-bottom:20px;}
+
+  .bearing-fig{
+    background:var(--card); border:1px solid var(--border); border-radius:12px; padding:22px 18px 14px; margin:16px 0 4px;
+    display:flex; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap;
+  }
+  .bearing-fig .node{border-radius:8px; padding:8px 14px; font-size:.76rem; font-weight:600; text-align:center;}
+  .bearing-fig .node.cam{background:#f5eefb; color:var(--obs1); border:1px solid #ddc6f0;}
+  .bearing-fig .node.tgt{background:#e8f3fc; color:var(--target); border:1px solid #bcdcf5;}
+  .bearing-fig .ray{flex:1; min-width:80px; max-width:180px; border-top:2px dashed #b9b6a9; position:relative; margin-top:6px;}
+  .bearing-fig .ray span{position:absolute; top:-22px; left:50%; transform:translateX(-50%); font-size:.68rem; color:var(--muted); white-space:nowrap;}
+
+  .byte-bar{display:flex; border-radius:8px; overflow:hidden; border:1px solid var(--border); margin:16px 0 4px; font-size:.68rem;}
+  .byte-bar .seg{padding:10px 6px; text-align:center; color:#fff; flex-shrink:0;}
+  .byte-bar .seg small{display:block; opacity:.85; font-weight:400; margin-top:2px;}
+
+  .imm-fig{display:flex; align-items:center; justify-content:center; gap:26px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:22px; margin:16px 0 4px;}
+  .imm-fig .model-circle{
+    width:92px; height:92px; border-radius:50%; display:flex; align-items:center; justify-content:center; flex-direction:column;
+    font-size:.78rem; font-weight:700; border:2px solid;
+  }
+  .imm-fig .model-circle.cv{background:#eef4fb; border-color:#8fb8e0; color:#2f6fa3;}
+  .imm-fig .model-circle.ca{background:#fbf1ee; border-color:#e0a98f; color:#a3542f;}
+  .imm-fig .model-circle small{font-weight:400; font-size:.66rem;}
+  .imm-fig .swap{display:flex; flex-direction:column; align-items:center; gap:4px; font-size:.68rem; color:var(--muted); text-align:center;}
+
+  footer{padding:24px 6vw 60px; color:var(--muted); font-size:.78rem; max-width:760px; margin:0 auto;}
+  a{color:#2f6fc1;}
+  ul, ol{padding-left:22px; margin:0 0 14px;}
+  li{margin-bottom:4px;}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>Two Eyes on One Drone: How the Vision Stack Turns Two Bearings Into a Trajectory</h1>
+  <p>A walkthrough of the detection, triangulation and tracking pipeline used to estimate the state of a target drone from two bearings-only observer drones, fused with an IMM (CV/CA) filter and graded offline against RTK ground truth.</p>
+  <div class="meta">
+    <span class="meta-label">Config</span> <code>config/runtime_stack.yaml</code>
+    <span class="sep">/</span>
+    <span class="meta-label">Nodes</span> <code>observer_node.py</code> <code>triangulation_node.py</code> <code>evaluate_prediction_node.py</code> <code>live_monitor.py</code>
+  </div>
+</header>
+
+<nav class="toc">
+  <a href="#outline">Outline</a>
+  <a href="#observer">The Observer</a>
+  <a href="#fusion">The Fusion Node</a>
+  <a href="#evaluation">Evaluation &amp; Monitoring</a>
+  <a href="#repo">Repository &amp; Launch</a>
+</nav>
+
+<main>
+
+  <section id="outline">
+    <span class="chapter-num">1</span>
+    <h2>Outline</h2>
+    <p class="lead">
+      Two drones, <strong>observer1</strong> and <strong>observer2</strong>, each carry an RGB-D camera and watch a third drone, the <strong>target</strong>,
+      whose position and velocity are otherwise unknown to the system. Neither observer alone can tell how far away the target is — a camera only
+      gives a direction, a <em>bearing</em>. What makes the target's 3D position observable is having two of them: as long as both observers can see
+      the target at (nearly) the same instant, the two bearing lines meet, or nearly meet, at a single point in space. Everything described below exists
+      to make that meeting point as accurate, as fast, and as robust to noise and false detections as possible.
+    </p>
+    <p>
+      Concretely, the story runs like this. Each observer, independently and onboard its own drone, turns its camera image into a clean, timestamped
+      bearing ray in a shared world frame — that is the whole job of <code>observer_node.py</code>, and it involves a detector, a pixel-space tracker,
+      a coordinate transform, and a couple of defensive filters that keep the ray honest. Both observers then broadcast that ray as a small binary
+      packet. A third node, the <strong>fusion node</strong> (<code>triangulation_node.py</code>, running onboard observer1), listens to both streams,
+      matches up the rays that belong to the same instant, triangulates a 3D point, and feeds it into an IMM filter that tracks the target's position
+      and velocity through two different motion models. What comes out the other end — an odometry estimate, a predicted trajectory, and a set of
+      RViz markers — is then either watched live on a ground-station PC, or graded offline against RTK ground truth once the flight is over.
+    </p>
+    <div class="storyline">
+      <div class="stop stop-target">TARGET (unknown state)</div>
+      <div class="arrow">→ seen by →</div>
+      <div class="stop stop-obs1">OBSERVER 1</div>
+      <div class="arrow">+</div>
+      <div class="stop stop-obs2">OBSERVER 2</div>
+      <div class="arrow">→</div>
+      <div class="stop stop-fusion">FUSION NODE</div>
+      <div class="arrow">→</div>
+      <div class="stop stop-ground">MONITOR / EVALUATION</div>
+    </div>
+    <p class="cap" style="text-align:center;">The reading path this document follows: first everything that happens on board each observer, one stage at a time; then everything the fusion node does with the two resulting rays; then how the result is watched and graded.</p>
+  </section>
+
+  <section id="observer">
+    <span class="chapter-num">2</span>
+    <h2>The Observer</h2>
+    <p class="lead">
+      <code>observer_node.py</code> runs identically on both drones, configured only by a <code>role</code> parameter (<code>observer1</code> or
+      <code>observer2</code>) that picks the right image topic and camera extrinsics. Its job stops well short of "where is the target in 3D" —
+      that question is deliberately left to the fusion node. What it must deliver, every frame, is a single honest measurement: a ray from the
+      camera's known position, in a known direction, in the world frame, together with a confidence and a timestamp precise enough to be matched
+      against the other observer's ray later. Getting there takes eight stages, each building on the last.
+    </p>
+
+    <div class="mini-flow">
+      <div class="step"><b>1</b>Camera image</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>2</b>YOLO detector</div>
+      <div class="arrow">→</div>
+      <div class="step" style="min-width:130px;"><b>3</b>Candidate gates<br><small style="font-weight:400">OSR → KF → TC → Depth</small></div>
+      <div class="arrow">→</div>
+      <div class="step"><b>4</b>2D Kalman update</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>5</b>Back-projection</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>6</b>Depth range (opt.)</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>7</b>Packet encode</div>
+    </div>
+    <p class="fig-cap">Fig. 2 — the seven stages inside a single observer, in actual run-time order as implemented in <code>process_image()</code> /
+      <code>extract_best_detection()</code> (<code>nodes/observer_node.py</code>).</p>
+    <div class="note note-warn">
+      <strong>Read this before §2.6–2.7:</strong> it is tempting to assume Observer Self-Rejection and the Tight-Coupling gate act on the
+      already-smoothed track, late in the pipeline. They do not. Both are candidate filters that run <em>inside</em>
+      <code>extract_best_detection()</code>, per raw YOLO box, <strong>before</strong> the pixel-space Kalman filter's own confirmed
+      <code>update()</code> call happens in <code>process_image()</code>. The order per candidate, read directly off the source
+      (<code>nodes/observer_node.py</code>, lines ≈3224–3400), is: class filter → OSR veto → KF Mahalanobis pre-gate (or ghost gate) →
+      Tight-Coupling gate → depth consistency gate (only when <code>depth_fusion.gating_enabled=true</code>). Only detections surviving all
+      of that are candidates for <code>choose_best_candidate()</code> to pick from.
+    </div>
+
+    <h3>2.1 &nbsp;Seeing the target: camera and detector</h3>
+    <p>
+      Everything starts from the RGB-D camera's compressed color stream (<code>vision.main_image_topic</code> for observer1,
+      <code>vision.observer_image_topic</code> for observer2) and its matching <code>CameraInfo</code>, from which the node reads the intrinsic
+      matrix <code>K</code>. The callback <code>image_callback()</code> in <code>nodes/observer_node.py</code> does nothing but buffer the
+      latest frame; the actual work runs on a fixed-rate timer, <code>processing_timer_callback()</code>, which hands the frame to
+      <code>process_image()</code>. That function calls <code>self.model.predict(...)</code> — a YOLO/OpenVINO detector loaded from
+      <code>vision.model_path</code> in <code>config/runtime_stack.yaml</code>, running on CPU on the real hardware (<code>vision.device</code>)
+      — which returns bounding boxes with a confidence score.
+    </p>
+
+    <h3>2.2 &nbsp;Keeping the crop tight: ROI-adaptive detection</h3>
+    <p>
+      Running the detector on the full frame every time is wasteful once the target has been found once. So the node keeps a region of interest
+      (ROI) around the last predicted position and only expands back to a full-frame scan periodically (<code>roi_full_scan_interval</code>,
+      every 20 frames) or when the track has been lost for longer than <code>roi_track_timeout_sec</code> (0.5&nbsp;s). A track is only allowed
+      to arm the ROI once a handful of recent detections agree with each other: at least <code>roi_init_m</code> of the last <code>roi_init_n</code>
+      candidates (3 of 5) must fall within <code>roi_init_max_spread_px</code> pixels of one another. The crop itself grows by a
+      <code>roi_margin_multiplier</code> (1.40×) around the predicted center and is rejected outright if it would shrink below
+      <code>roi_min_size_px</code>, which stops the ROI silently starving itself at lower stream resolutions.
+    </p>
+
+    <h3>2.3 &nbsp;Smoothing the pixel track: the 2D Kalman filter</h3>
+    <p>
+      Raw YOLO boxes are noisy and occasionally wrong, so a class named <code>ImageSpaceKalmanTracker</code> (<code>nodes/observer_node.py</code>)
+      tracks the detection <em>in pixel space</em> before anything is turned into a 3D ray. It is used <strong>twice</strong> per frame, not once:
+      first as an approximate Mahalanobis pre-gate (<code>evaluate_gate()</code>) applied to every raw candidate inside
+      <code>extract_best_detection()</code> — this is stage&nbsp;3 in Fig.&nbsp;2 — and again as the real predict+gate+update cycle
+      (<code>update()</code>) applied only to the single winning detection back in <code>process_image()</code> — stage&nbsp;4. The parameter
+      <code>kf_n_confirm</code>, declared under <code>kalman_filter:</code> in <code>config/runtime_stack.yaml</code> and read at node startup,
+      sets how many consecutive hits promote a track from <code>TENTATIVE</code> to <code>CONFIRMED</code>; only a <code>CONFIRMED</code> track
+      is allowed to reach back-projection (§2.4). <code>kf_nis_threshold</code> and <code>kf_nis_window</code> control a separate rolling
+      consistency check (<code>is_nis_consistent</code>) that only logs a warning about a possible persistent false positive — it does not by
+      itself reject anything. A track surviving a short occlusion for up to <code>kf_ghost_timeout_sec</code> is allowed to re-acquire through a
+      dedicated M-of-N ghost re-entry gate rather than the normal init gate. Camera ego-motion compensation
+      (<code>kf_ego_motion_enabled</code>) keeps the pixel-space prediction valid while the observer drone itself is rotating, by rotating the
+      predicted state with <code>R_ego</code>, computed once per frame in <code>process_image()</code> from two TF lookups.
+    </p>
+    <div class="note note-roi">
+      <strong>Feedback loop:</strong> the predicted center coming out of this filter is exactly what feeds back into §2.2 to place next frame's
+      ROI window — the pixel tracker and the ROI cropper close a small loop around each other, frame after frame.
+    </div>
+
+    <h3>2.4 &nbsp;From pixel to bearing: back-projection into the world frame</h3>
+    <p>
+      Once the KF's confirmed track produces a filtered pixel center (<code>x_filtered</code>, stage&nbsp;4), <code>compute_and_publish_ray()</code>
+      in <code>nodes/observer_node.py</code> back-projects <em>that</em> filtered center — not the raw YOLO box center — through the inverse of
+      <code>K</code> into a camera-frame direction vector, then rotates it into the world frame using two pieces of information: a
+      <strong>static extrinsic transform</strong> from the flight controller (FCU) to the camera mount (measured once per airframe, declared under
+      <code>camera_tf:</code> in <code>config/runtime_stack.yaml</code>), and the drone's own <strong>live RTK pose</strong> (its position and
+      attitude in the world). The result is a ray: an origin (the camera's world position) and a unit direction (the bearing). If the exact-time
+      transform isn't available, the same function can fall back to the latest known transform within <code>max_tf_delta_ms</code> (40&nbsp;ms,
+      declared under <code>vision:</code>) — a decision recorded in the packet itself (see §2.8) so the fusion node knows how much to trust it.
+    </p>
+
+    <div class="bearing-fig">
+      <div class="node cam">Camera origin<br><small style="font-weight:400">world-frame position</small></div>
+      <div class="ray"><span>bearing ray (unit direction)</span></div>
+      <div class="node tgt">Detected pixel<br><small style="font-weight:400">back-projected through K⁻¹</small></div>
+    </div>
+    <p class="fig-cap">Fig. 3 — what stage 4 produces: an origin and a direction, nothing else. Range is unknown until §2.5 or triangulation (§3.2).</p>
+
+    <h3>2.5 &nbsp;Adding range: optional depth fusion</h3>
+    <p>
+      <code>depth_fusion</code> in <code>config/runtime_stack.yaml</code> has one master switch, <code>enabled</code>, but it feeds
+      <strong>two distinct roles</strong> that are easy to conflate:
+    </p>
+    <ul>
+      <li><strong>Range annotation</strong> (this section): inside <code>compute_and_publish_ray()</code>, whenever <code>enabled=true</code> and
+        a valid depth reading exists under the bbox, <code>_extract_depth_from_bbox()</code> samples the aligned depth image (median filtering,
+        per Khoshelham &amp; Elberink 2012) and the packet is upgraded from V1 (bearing-only) to V2 (bearing&nbsp;+&nbsp;range) — see §2.8.</li>
+      <li><strong>False-positive rejection</strong> (stage&nbsp;3 in Fig.&nbsp;2, inside <code>extract_best_detection()</code>): only runs when the
+        <em>second</em> switch, <code>depth_fusion.gating_enabled</code>, is also true, and rejects a candidate whose measured depth is
+        inconsistent with the IMM's predicted range along the ray (<code>_check_depth_gate()</code>, gated at <code>gate_k</code> sigma).</li>
+    </ul>
+    <p>
+      On the current hardware, <code>depth_fusion.enabled</code> is <span class="pill pill-off">disabled</span> (so is
+      <code>gating_enabled</code>): the USB link carrying the RGB-D stream was downgraded from USB&nbsp;3.0 to USB&nbsp;2.1 to remove RTK
+      interference, and that link no longer has the bandwidth for an aligned depth stream — the comment above
+      <code>depth_fusion:</code> in the YAML is explicit that leaving it <code>true</code> anyway would make <code>preflight_check.py</code> fail
+      for no benefit.
+    </p>
+
+    <h3>2.6 &nbsp;Not shooting the wingman: observer self-rejection (Layer&nbsp;4)</h3>
+    <p id="osr">
+      Two drones flying a coordinated formation will, sooner or later, fly into each other's field of view. Without a safeguard, an observer would
+      happily report its sibling drone as if it were the target. Observer self-rejection fixes this — and, per the note after Fig.&nbsp;2, it acts
+      early: inside <code>extract_best_detection()</code>, before any candidate reaches the pixel-space Kalman filter's confirmed update. Each
+      observer subscribes to the <em>other</em> observer's own odometry (<code>/{other_uav}/estimation_manager/odom_main</code>), projects that
+      sibling's position onto its own image plane using the pinhole model —
+      <code>gate_px = (rejection_gate_radius_m / Zc) &middot; max(fx, fy)</code>, exactly as documented above <code>observer_self_rejection:</code>
+      in the YAML — and vetoes only the single nearest in-gate raw detection (a Global Nearest Neighbor veto, not a blanket disc rejection, so an
+      unrelated distant detection sharing the same bearing is never collaterally discarded). The gate radius comes from
+      <code>rejection_gate_radius_m</code> (0.8&nbsp;m, the sibling's physical body radius); <code>max_odom_age_sec</code> makes the whole layer
+      fail closed if the sibling's odometry goes stale. This layer is <span class="pill pill-ok">enabled</span> by default on real hardware —
+      unlike every other optional feature described in this document.
+    </p>
+    <div class="note note-osr">
+      This is a genuinely different feedback path from the tight-coupling gate below: it carries <em>the sibling observer's own pose</em>,
+      not the fused target estimate, and it exists purely to suppress a specific, known false-positive source.
+    </div>
+
+    <h3>2.7 &nbsp;Listening to the fusion node: the tight-coupling feedback gate</h3>
+    <p id="tight-coupling">
+      The observer can optionally close the loop the other way, through a second candidate filter in the very same
+      <code>extract_best_detection()</code> pass (immediately after the OSR veto and the KF pre-gate, per Fig.&nbsp;2 stage&nbsp;3): it subscribes
+      to the fusion node's own <code>/target/odometry_estimate</code> and forward-extrapolates it to the current frame time
+      (<code>p(t) = p(t₀) + v·Δt + ½a·Δt²</code>, computed once per frame by <code>_get_tc_projection()</code>), then projects that predicted 3D
+      point back onto its image plane to build a χ²-gated ellipse tested by <code>_is_inside_tc_gate()</code>. Detections that pass the pixel-space
+      Kalman pre-gate but fall outside this 3D-informed gate are rejected before ever reaching the confirmed KF update. Two safety switches keep
+      this from backfiring, both read from <code>tight_coupling:</code> in the YAML: the gate disables itself automatically if the 3D estimate's
+      covariance trace exceeds <code>max_3d_covariance_trace</code>, or if the estimate is older than <code>max_3d_age_sec</code> — otherwise a
+      temporarily wrong 3D estimate could "swallow" a perfectly good detection and never recover. This entire layer is
+      <span class="pill pill-off">disabled</span> by default (<code>tight_coupling.enabled: false</code>).
+    </p>
+
+    <h3>2.8 &nbsp;Packing it up: the observation packet</h3>
+    <p>
+      Everything above collapses into one compact binary payload — packed by <code>pack_observation_packet()</code> /
+      <code>pack_observation_packet_v2()</code> in <code>nodes/observer_node.py</code>, a fixed-layout struct rather than a JSON blob, to keep
+      bandwidth predictable — carrying the image timestamp, an observation id, the confidence, the camera's world-frame origin, the bearing ray,
+      the age of the TF used, and a flag marking whether that TF was an exact match or a fallback. A second, slightly larger packet variant adds a
+      valid-depth flag, the range, and its sigma when depth fusion is active (§2.5). This packet is published on
+      <code>/{uav_name}/target_observation</code>, and that topic is the entire interface between an observer and the fusion node — nothing else
+      about how the ray was produced crosses that boundary.
+    </p>
+
+    <div class="byte-bar">
+      <div class="seg" style="flex:1.4; background:#8e5fc7;">stamp<small>8 B</small></div>
+      <div class="seg" style="flex:1; background:#9a70cf;">obs id<small>4 B</small></div>
+      <div class="seg" style="flex:1; background:#a681d6;">conf<small>4 B</small></div>
+      <div class="seg" style="flex:1.6; background:#3b4252;">origin (x,y,z)<small>12 B</small></div>
+      <div class="seg" style="flex:1.6; background:#556074;">ray (x,y,z)<small>12 B</small></div>
+      <div class="seg" style="flex:1.4; background:#128f7d;">tf&nbsp;Δ<small>8 B</small></div>
+      <div class="seg" style="flex:.7; background:#1aa38f;">status<small>1 B</small></div>
+      <div class="seg" style="flex:1.6; background:#c98a12;">depth (opt.)<small>+9 B</small></div>
+    </div>
+    <p class="fig-cap">Fig. 4 — the observation packet layout, sized by <code>struct.Struct('&lt;qIf3f3fqB')</code> (V1) and
+      <code>struct.Struct('&lt;qIf3f3fqBBff')</code> (V2): <strong>49 bytes</strong> bearing-only, <strong>58 bytes</strong> with the optional
+      depth fields — verified with Python's own <code>struct.calcsize</code>, not counted by eye.</p>
+    <div class="note note-warn">
+      <strong>Source-comment inconsistency found while writing this section:</strong> the block comment directly above
+      <code>OBSERVATION_PACKET_STRUCT</code> in <code>nodes/observer_node.py</code> labels the two formats “42 bytes” and “51 bytes”. Computing
+      <code>struct.calcsize()</code> on the exact same format strings used by the code gives 49 and 58 bytes instead — the comment undercounts
+      both sizes by exactly 7 bytes (likely the 8-byte <code>tf_delta_ns</code> field being left out of an earlier count and never corrected).
+      The struct definitions and the packing/unpacking code are internally consistent with each other; only the comment is wrong. This document
+      uses the measured sizes.
+    </div>
+  </section>
+
+  <section id="fusion">
+    <span class="chapter-num">3</span>
+    <h2>The Fusion Node</h2>
+    <p class="lead">
+      <code>triangulation_node.py</code> runs onboard observer1 and receives both observers' observation packets. Where the observer's job was to
+      turn pixels into one honest ray, the fusion node's job is to turn <em>two</em> rays, arriving asynchronously from two independent clocks,
+      into a single filtered belief about where the target is and where it is going.
+    </p>
+
+    <div class="mini-flow">
+      <div class="step"><b>1</b>Ray pairing</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>2</b>Triangulation</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>3</b>IMM (CV/CA)</div>
+      <div class="arrow">→</div>
+      <div class="step"><b>4</b>Odometry + Path + Markers</div>
+    </div>
+    <p class="fig-cap">Fig. 5 — the four stages inside the fusion node.</p>
+
+    <h3>3.1 &nbsp;Matching rays across two cameras: predictive ray pairing</h3>
+    <p>
+      Before two rays can be triangulated, the node has to decide which observation from observer1 actually corresponds to which observation from
+      observer2 — trivial with one target in frame, ambiguous the moment there are decoys, reflections, or multiple candidate detections. The
+      entry point is <code>try_match_and_triangulate()</code> in <code>nodes/triangulation_node.py</code>, which repeatedly calls
+      <code>_select_best_observation_pair()</code> to drain both observation buffers pair by pair. When
+      <code>triangulation.pairing_prediction_enabled</code> (declared in <code>config/runtime_stack.yaml</code>) is true, that selection runs a
+      Global-Nearest-Neighbor association implemented in <code>score_prediction_guided_pair()</code> / <code>PredictionGuidedPairScore</code>,
+      minimizing a composite cost rather than simply picking the closest timestamps:
+    </p>
+    <div class="card">
+      <code>J&nbsp;=&nbsp;w_time·(|Δt| / max_pair_age_sec)&nbsp;+&nbsp;w_geom·(e / max_triangulation_error_m)&nbsp;+&nbsp;w_innov·(d² / pairing_mahalanobis_chi2)</code>
+      <p style="margin:8px 0 0; font-size:.85rem; color:var(--muted);">
+        <code>Δt</code> is the timestamp gap between the two observations, <code>e</code> is the residual gap between the two 3D rays at their
+        closest approach (from <code>triangulate_midpoint()</code>), and <code>d²</code> is the Mahalanobis innovation of the resulting midpoint
+        against the IMM's current prediction. The three weights — <code>pairing_weight_time</code>, <code>pairing_weight_geom</code>,
+        <code>pairing_weight_innov</code>, all declared under <code>triangulation:</code> and read once at node startup — let the pairing trust
+        temporal synchronization, ray geometry, and filter consistency together rather than any one of them alone. Setting
+        <code>pairing_prediction_enabled: false</code> instead falls back to <code>select_timestamp_only_pair()</code>, the legacy min-|Δt| rule.
+      </p>
+    </div>
+
+    <h3>3.2 &nbsp;Turning two rays into a point: triangulation</h3>
+    <p>
+      A matched pair of rays is triangulated by <code>triangulate_wls()</code> (<code>nodes/triangulation_node.py</code>) as the closest point
+      between two skew lines in 3D, weighted least squares (WLS) under an Errors-In-Variables model so that the observers' own pose uncertainty
+      can (optionally, <code>observer_odom_uncertainty.use_odom_uncertainty</code>) be folded into the solution rather than assumed away. Because
+      the closed-form WLS solution is a <em>pseudolinear</em> estimator — it minimizes a metric residual, not the true angular one — it carries a
+      small asymptotic bias that does not vanish as more measurements accumulate. The optional <code>ekf.ml_refine</code> flag corrects for this
+      with 2–4 Gauss-Newton iterations on the true angular residual (<code>refine_triangulation_gn()</code>), started from the WLS answer and
+      falling back to it if a step ever diverges.
+    </p>
+    <div class="note note-warn">
+      <strong>Logical inconsistency found while cross-checking this section:</strong> <code>preflight_check.py</code> prints a warning that
+      <code>ekf.normalize_crlb</code> "is present but is a NO-OP: <code>triangulate_wls</code> never reads it and always returns the raw CRLB";
+      the same claim appears in <code>PREFLIGHT_CHECKLIST.txt</code> and in <code>README.md</code>. Reading <code>triangulate_wls()</code> itself
+      shows the opposite: it ends with <code>if normalize_crlb: trace_R = float(np.trace(R_out)); R_out = R_out * (3.0 * var_px / trace_R)</code>,
+      and the surrounding comment explains why — the rescaling branch "had been deleted while the flag, its <code>declare_parameter</code>
+      default (True) and this whole comment block survived", and was later restored. In other words: the preflight warning describes a bug that
+      has since been fixed in <code>triangulate_wls()</code> but not corrected in the checker or its accompanying docs. With the current code,
+      <code>ekf.normalize_crlb</code> (currently <code>false</code> in <code>config/runtime_stack.yaml</code>, i.e. the “SOTA”
+      <code>R_out = Λ⁻¹</code> branch) is very much read and does change the covariance handed to the IMM — do not “ignore the value” as the
+      stale warning suggests.
+    </div>
+
+    <h3>3.3 &nbsp;Modeling how the target moves: the IMM estimator</h3>
+    <p>
+      A single motion model is always a compromise: constant-velocity (CV) is smooth and appropriate for hover or straight flight but lags during
+      a sharp turn, while constant-acceleration (CA) reacts quickly to maneuvers but is noisier the rest of the time. The
+      <code>IMMFilter</code> class in <code>nodes/triangulation_node.py</code> runs both in parallel — each backed by its own
+      <code>LinearKalmanFilter</code> built from <code>build_transition_matrix_cv()</code>/<code>build_process_noise_cv()</code> and
+      <code>build_transition_matrix_ca()</code>/<code>build_process_noise_ca()</code> — and blends them, once per frame, inside
+      <code>predict_and_correct()</code>, through a 2×2 Markov switching matrix <code>self.pi</code>, so the filter leans on whichever model
+      currently explains the target's motion better.
+    </p>
+
+    <div class="imm-fig">
+      <div class="model-circle cv">CV<br><small>const. velocity</small></div>
+      <div class="swap">p_stay_cv = 0.75 →<br>← p_return_to_cv = 0.30<br>Markov mixing</div>
+      <div class="model-circle ca">CA<br><small>const. accel.</small></div>
+    </div>
+    <p class="fig-cap">Fig. 6 — the two IMM sub-models and the Markov probabilities that blend them frame to frame.</p>
+
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Parameter</th><th>Value</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>imm_p_stay_cv</code></td><td>0.75</td><td>P(CV→CV): probability of remaining in smooth, straight-line flight</td></tr>
+        <tr><td><code>imm_p_return_to_cv</code></td><td>0.30</td><td>P(CA→CV): how quickly the accelerated model decays back to CV after a maneuver ends</td></tr>
+        <tr><td><code>kf_process_noise_vel</code></td><td>0.05 m/s²</td><td>Process noise of the CV model</td></tr>
+        <tr><td><code>kf_process_noise_acc</code></td><td>13.28 m/s³</td><td>Process noise (jerk) of the CA model</td></tr>
+        <tr><td><code>kf_mahalanobis_threshold</code></td><td>34.0 (χ²₃, 99.9%)</td><td>Gating threshold for rejecting an inconsistent measurement</td></tr>
+        <tr><td><code>coast_after_sec</code></td><td>0.15 s</td><td>Time without an accepted update before the filter starts coasting on prediction alone</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3>3.4 &nbsp;When one eye closes: the single-ray fallback</h3>
+    <p>
+      Mutual occlusion happens: one observer may lose line of sight to the target while the other keeps tracking. When no valid pair exists but
+      one observer's unpaired ray carries a valid depth measurement and a YOLO confidence of at least
+      <code>triangulation.single_obs_min_confidence</code> (0.60), the single-observation fallback in <code>nodes/triangulation_node.py</code>
+      (documented in the YAML directly above <code>depth_fusion:</code> as living around line&nbsp;3124) accepts a one-dimensional range update
+      along that single ray rather than coasting blind. This path <strong>requires</strong> <code>depth_valid</code> on the incoming packet —
+      it is a graceful degradation that only exists at all because depth fusion (§2.5) can, when enabled, still supply a range even with one eye
+      closed; with <code>depth_fusion.enabled=false</code> as on the current hardware, a single-eyed occlusion simply coasts (§3.5).
+    </p>
+
+    <h3>3.5 &nbsp;What comes out</h3>
+    <p>
+      The fused belief is published as a full <code>nav_msgs/Odometry</code> on <code>/target/odometry_estimate</code> — position, velocity, and
+      covariance — alongside a lighter <code>PoseStamped</code>, a forward-looking <code>Path</code> on
+      <code>/target/predicted_trajectory</code>, and RViz <code>MarkerArray</code>s built by <code>_publish_position_markers()</code>. A
+      <code>/tracker/fusion_mode</code> string, written by <code>_publish_fusion_mode()</code>, reports which IMM model currently dominates, or
+      whether <code>_coast_predict()</code> is currently extrapolating without a fresh update because no accepted measurement has arrived within
+      <code>coast_after_sec</code>. When ground truth is available, <code>publish_ground_truth_error()</code> additionally reports the live error
+      against it. It is this same odometry topic that the observer's tight-coupling gate (§2.7) subscribes back to — the one true feedback edge
+      from the fusion node back to the sensing stage.
+    </p>
+  </section>
+
+  <section id="evaluation">
+    <span class="chapter-num">4</span>
+    <h2>Evaluation &amp; Monitoring</h2>
+
+    <h3>4.1 &nbsp;Grading the prediction against the truth</h3>
+    <p class="lead">
+      <code>evaluate_prediction_node.py</code> is run offline, after a flight, and compares the predicted trajectory against the RTK ground truth
+      once both have been aligned into the same frame (the target's raw odometry lives in its own origin, whose z-datum can differ from the
+      observers' by several metres — comparing the two directly would just chart that gap as tracking error). For every run it writes a
+      timestamped report under <code>debug/evaluation/&lt;timestamp&gt;</code> containing:
+    </p>
+    <ul>
+      <li><strong>ADE</strong> — Average Displacement Error across the whole predicted horizon</li>
+      <li><strong>FDE</strong> — Final Displacement Error, the error at the end of the prediction horizon</li>
+      <li><strong>Position &amp; velocity RMSE</strong></li>
+      <li><strong>Distance to the observers</strong> at the moment the prediction was made</li>
+    </ul>
+
+    <h3>4.2 &nbsp;Watching it live</h3>
+    <p>
+      <code>live_monitor.py</code> runs on a ground-station PC on the same ROS graph over WiFi and plots ground truth, estimate, prediction, and
+      both observers' own positions in real time, in one of three layouts:
+    </p>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Mode</th><th>Layout</th></tr></thead>
+      <tbody>
+        <tr><td><code>classic</code></td><td>3 panels: XY bird's-eye, Z altitude, 3D position error norm — the lightest option</td></tr>
+        <tr><td><code>full_3d</code></td><td>2×2 grid: XY, 3D trajectory vs ground truth, Z, 3D error norm</td></tr>
+        <tr><td><code>minimal_3d</code></td><td>a large interactive 3D trajectory plus XY/Z error over time</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <div class="legend">
+      <div><span class="dot" style="background:#4fc3f7"></span>Ground truth</div>
+      <div><span class="dot" style="background:#ff8a65"></span>Estimate (<code>odometry_estimate</code>)</div>
+      <div><span class="dot" style="background:#ef5350"></span>Predicted trajectory</div>
+      <div><span class="dot" style="background:#ce93d8"></span>Observer 1</div>
+      <div><span class="dot" style="background:#ffd54f"></span>Observer 2</div>
+    </div>
+  </section>
+
+  <section id="repo">
+    <span class="chapter-num">5</span>
+    <h2>Repository &amp; Launch Flow</h2>
+    <p class="lead">
+      Putting the whole story back into motion on real hardware takes three processes on the two drones, plus an optional fourth on the ground:
+    </p>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Script</th><th>What it starts</th></tr></thead>
+      <tbody>
+        <tr><td><code>launch_observer_detection_node.sh</code></td><td><code>observer_node.py</code> with role <code>observer2</code></td></tr>
+        <tr><td><code>launch_main_detection_node.sh</code></td><td><code>observer_node.py</code> with role <code>observer1</code></td></tr>
+        <tr><td><code>launch_triangulation_node.sh</code></td><td><code>triangulation_node.py</code> (fusion + IMM)</td></tr>
+        <tr><td><code>launch_live_monitor.sh</code></td><td>the 3D monitor, on the ground-station PC</td></tr>
+        <tr><td><code>run_prediction_evaluation.sh</code></td><td>the offline evaluator, output under <code>debug/evaluation/&lt;timestamp&gt;</code></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>
+      In the typical flow, observer2 runs its own <code>observer_node.py</code>, observer1 runs both its own <code>observer_node.py</code> and
+      <code>triangulation_node.py</code> side by side, and <code>live_monitor.py</code> optionally joins from a PC on the same network. Full setup
+      and troubleshooting details live in <a href="../README.md">README.md</a>.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  Technical documentation for the <code>vision_stack_deploy</code> repository — references: <code>config/runtime_stack.yaml</code>, <code>nodes/observer_node.py</code>, <code>nodes/triangulation_node.py</code>.
+</footer>
+
+</body>
+</html>

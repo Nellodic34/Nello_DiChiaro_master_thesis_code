@@ -16,7 +16,9 @@ last two. At 480 the window was rejected on EVERY clean-track frame.
 _compute_roi_window now returns None instead of a half-built window, so the
 caller cannot pick up an origin belonging to a crop it did not take.
 
-Run: python3 nodes/test_roi_window_origin.py
+Run: python3 <dir>/test_roi_window_origin.py
+     <dir> is nodes/ in the deploy tree, dataset_tools/ in the bagtest tree.
+     The two copies are kept byte-identical, so `diff -q` is the alignment check.
 """
 import importlib.util
 import os

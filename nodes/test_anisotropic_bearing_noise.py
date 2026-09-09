@@ -15,7 +15,9 @@ the two. The three properties that must hold:
   3. The split actually reaches R_out: raising sigma_el alone must inflate the
      vertical axis of the CRLB and nothing else.
 
-Run: python3 dataset_tools/test_anisotropic_bearing_noise.py
+Run: python3 <dir>/test_anisotropic_bearing_noise.py
+     <dir> is nodes/ in the deploy tree, dataset_tools/ in the bagtest tree.
+     The two copies are kept byte-identical, so `diff -q` is the alignment check.
 """
 import importlib.util
 import os
@@ -156,6 +158,9 @@ def test_radial_filler_never_reaches_R_out():
             return tn.triangulate_wls(
                 o1, d1, None, o2, d2, None, var_px=0.0, use_odom_uncertainty=False,
                 anisotropic_bearing_noise=True,
+                # raw CRLB: this test compares the SHAPE of R_out, and the
+                # normalising branch would rescale it to trace = 3 * var_px = 0.
+                normalize_crlb=False,
                 bearing_var_az=var_az, bearing_var_el=var_el)[1]
         finally:
             tn.bearing_noise_cov = real

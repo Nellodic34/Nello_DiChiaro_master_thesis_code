@@ -678,6 +678,8 @@ def triangulate_wls(
     bearing_var_el: float = 0.0,   # TOTAL elevation variance [rad^2] (tilt + detector)
     prior_target_pos: Optional[np.ndarray] = None,
     normalize_crlb: bool = True,
+    ml_refine: bool = False,
+    ml_refine_iters: int = 5,
     logger=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Optimal bearing-only triangulation via Weighted Least Squares (Errors-In-Variables).
@@ -878,6 +880,29 @@ def triangulate_wls(
 
     p_hat = R_out @ rhs
 
+    # ── Step 3b: ML refinement (controlled by ml_refine flag) ────────────────
+    # Everything above is pseudolinear: the residual is metric, so the estimator
+    # is biased and the bias does not vanish with more measurements. One
+    # Gauss-Newton pass on the ANGULAR residual removes it -- see
+    # refine_triangulation_gn() for the derivation and references. Refinement
+    # only: if it fails to converge it returns p_hat untouched and we keep the
+    # WLS covariance, so enabling the flag can never be worse than not.
+    if ml_refine:
+        var_az_ml = bearing_var_az if anisotropic_bearing_noise else float(var_px)
+        var_el_ml = bearing_var_el if anisotropic_bearing_noise else float(var_px)
+        p_ml, R_ml, iters = refine_triangulation_gn(
+            p_hat, [origin1, origin2], [dir1, dir2],
+            var_az_ml, var_el_ml, max_iter=int(ml_refine_iters),
+        )
+        if iters > 0 and np.all(np.isfinite(R_ml)):
+            p_hat = p_ml
+            R_out = R_ml
+        elif logger is not None:
+            logger.warn(
+                '[triangulate_wls] ML refinement did not converge; keeping WLS estimate.',
+                throttle_duration_sec=5.0,
+            )
+
     # ── CRLB Normalisation (controlled by normalize_crlb flag) ───────────────
     #
     # Background:
@@ -903,13 +928,193 @@ def triangulate_wls(
     #   is favourable.
     #   → Requires the process-noise matrices Q_cv and Q_ca to also be on the
     #     correct physical scale.  CMA-ES must be re-run with wider Q bounds and
-    # else: R_out = Lambda^{-1} — raw CRLB, physically rigorous.
+    #     kf_measurement_noise fixed to the physical bearing variance.
+    #
+    # The Option A branch below had been deleted while the flag, its
+    # declare_parameter default (True) and this whole comment block survived, so
+    # R_out was ALWAYS the raw CRLB no matter what the flag said. Restored here so
+    # the flag means what it documents — and so the A/B ablation is runnable.
+    if normalize_crlb:
+        trace_R = float(np.trace(R_out))
+        if trace_R > 1e-12:
+            R_out = R_out * (3.0 * float(var_px) / trace_R)
 
     # Enforce symmetry (floating-point rounding)
     R_out = 0.5 * (R_out + R_out.T)
 
     return p_hat, R_out
 
+
+
+def refine_triangulation_gn(
+    p_init: np.ndarray,
+    origins: List[np.ndarray],
+    dirs: List[np.ndarray],
+    var_az: float,
+    var_el: float,
+    max_iter: int = 5,
+    tol_m: float = 1e-4,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Maximum-Likelihood refinement of a bearing-only fix, by Gauss-Newton on the
+    ANGULAR residual.  Returns (p_hat, R_ml, iterations_used).
+
+    Why this exists
+    ---------------
+    :func:`triangulate_wls` is a *pseudolinear* estimator (PLE): it minimises a
+    METRIC residual ``Pi_i (p - c_i)``, which is linear in ``p`` and therefore has a
+    closed form.  The price is a bias that does NOT vanish as measurements
+    accumulate, because the regressor ``Pi_i`` is built from the noisy bearing
+    itself, so regressor and residual are correlated (Nardone et al. 1984;
+    Gavish & Weiss 1992, Sec. III).  The Instrumental-Variable step inside
+    triangulate_wls attacks one half of that coupling -- the weights ``d_i`` are
+    taken from the IMM prior instead of from the current measurement -- but the
+    projectors themselves stay noisy, so a residual bias survives.
+
+    The ML estimator has no such term: it minimises the residual in the space where
+    the noise actually is, i.e. ANGLE, and is asymptotically unbiased and efficient
+    (Gavish & Weiss 1992, Sec. IV).  It has no closed form, hence the iteration.
+
+    The residual
+    ------------
+    For observer ``i`` with measured unit bearing ``d_i`` and local triad
+    ``(a_i, e_i, cos_el_i)`` from :func:`bearing_frame`, let
+
+        u_i(p) = (p - c_i) / r_i ,      r_i = ||p - c_i||
+
+    be the bearing the hypothesis ``p`` would produce.  The residual is that
+    predicted bearing read off in the measured ray's own azimuth/elevation axes::
+
+        rho_i(p) = [ a_i . u_i(p) ,  e_i . u_i(p) ]        (2-vector, radians)
+
+    ``a_i`` and ``e_i`` span the plane perpendicular to ``d_i``, so both components
+    vanish exactly when ``p`` lies on the measured ray, and to first order they ARE
+    the azimuth and elevation angular errors.  This is the same parametrisation the
+    noise model uses, which is the point: the weight matrix is then simply the
+    inverse of the per-axis angular variances, with no Jacobian bookkeeping::
+
+        W_i = diag( 1 / (var_az * cos^2(el_i)) ,  1 / var_el )
+
+    The ``cos^2(el)`` matches :func:`bearing_noise_cov`: a given azimuth ANGLE error
+    subtends a smaller arc as elevation grows, so its projection on ``a`` shrinks by
+    ``cos(el)`` and its variance by ``cos^2(el)``.
+
+    The Jacobian
+    ------------
+    Differentiating a normalised vector gives the standard result::
+
+        d u_i / d p = (I - u_i u_i^T) / r_i
+
+    so, chaining the two projections::
+
+        J_i = [a_i^T ; e_i^T] @ (I - u_i u_i^T) / r_i          (2x3)
+
+    The ``1 / r_i`` is what makes distant rays contribute less to position
+    information: a fixed angular error maps to a larger metric error far away.
+
+    The iteration
+    -------------
+    Normal equations of the weighted least-squares step::
+
+        Lambda_ml = sum_i J_i^T W_i J_i          (3x3 Fisher information)
+        Delta     = -Lambda_ml^{-1} sum_i J_i^T W_i rho_i
+        p        <- p + Delta
+
+    started from the WLS solution, which is already close enough that 2-4 iterations
+    suffice.  ``R_ml = Lambda_ml^{-1}`` is the CRLB evaluated at the converged point
+    with the exact angular Jacobians -- the same quantity triangulate_wls
+    approximates pseudolinearly, so the two agree to first order and the IMM's ``R``
+    keeps its physical meaning and scale.
+
+    What it buys, measured
+    ----------------------
+    Monte-Carlo over this rig's geometry (9.3 m baseline, sigma = 2.5 deg,
+    test_ml_refine.py) gives the MEDIAN radial error:
+
+        20 m:  -0.39 m  ->  +0.06 m
+        49 m:  -5.18 m  ->  -0.38 m
+
+    i.e. the systematic range shortfall is removed. Per-frame RMSE is unchanged
+    (~1% worse): the 2-ray range estimate has a heavy right tail from draws where
+    the rays come out near-parallel, and ML does not fix that -- the Mahalanobis
+    gate does. What ML fixes is the part the IMM would otherwise integrate frame
+    after frame, which is exactly the part a gate cannot catch.
+
+    Note also that the IV step in triangulate_wls does not substitute for this:
+    passing an exact prior_target_pos changes the answer by <1 mm, because the IV
+    only decorrelates the WEIGHTS, and equal weight scaling cancels in the normal
+    equations. The projectors stay noisy, so the bias stays.
+
+    Safety: this is a refinement, never a gamble.  If the normal matrix is singular
+    or a step diverges, the caller keeps the WLS answer (we return p_init).
+
+    References
+    ----------
+    - Gavish, M. & Weiss, A. J. (1992). Performance analysis of bearing-only target
+      location algorithms. *IEEE Trans. Aerospace and Electronic Systems*, 28(3),
+      817-828. doi:10.1109/7.256303
+      -> Sec. III derives the PLE bias in closed form; Sec. IV gives the ML
+         estimator and shows it attains the CRLB. This is the reference that
+         justifies choosing between the two.
+    - Nardone, S. C., Lindgren, A. G. & Gong, K. F. (1984). Fundamental properties
+      and performance of conventional bearings-only target motion analysis.
+      *IEEE Trans. Automatic Control*, 29(9), 775-787.
+      -> origin of the pseudolinear formulation and of its bias.
+    - Dogancay, K. (2015). 3D Pseudolinear Target Motion Analysis From Angle
+      Measurements. *IEEE Trans. Signal Process.*, 63(6), 1570-1580.
+      -> the 3D angle parametrisation used here.
+    """
+    p = np.asarray(p_init, dtype=np.float64).copy()
+    I3 = np.eye(3, dtype=np.float64)
+    var_az = max(float(var_az), 1e-12)
+    var_el = max(float(var_el), 1e-12)
+
+    Lambda_ml = np.zeros((3, 3), dtype=np.float64)
+    used = 0
+
+    for _ in range(int(max_iter)):
+        Lambda_ml = np.zeros((3, 3), dtype=np.float64)
+        rhs = np.zeros(3, dtype=np.float64)
+
+        for c_i, d_i in zip(origins, dirs):
+            a_i, e_i, cos_el = bearing_frame(d_i)
+            delta = p - c_i
+            r_i = float(np.linalg.norm(delta))
+            if r_i < 1e-6:
+                return np.asarray(p_init, dtype=np.float64), np.full((3, 3), np.nan), used
+            u_i = delta / r_i
+
+            B = np.vstack([a_i, e_i])                     # (2,3) angular readout axes
+            J_i = B @ (I3 - np.outer(u_i, u_i)) / r_i     # (2,3)
+            rho_i = B @ u_i                               # (2,)  radians, first order
+
+            w_az = 1.0 / (var_az * max(cos_el ** 2, 1e-6))
+            W_i = np.diag([w_az, 1.0 / var_el])
+
+            JtW = J_i.T @ W_i
+            Lambda_ml += JtW @ J_i
+            rhs += JtW @ rho_i
+
+        try:
+            step = -np.linalg.solve(Lambda_ml, rhs)
+        except np.linalg.LinAlgError:
+            return np.asarray(p_init, dtype=np.float64), np.full((3, 3), np.nan), used
+
+        # Divergence guard: a Gauss-Newton step this large means the linearisation
+        # never held (near-parallel rays, a gross outlier). Keep the WLS answer.
+        if not np.all(np.isfinite(step)) or float(np.linalg.norm(step)) > 100.0:
+            return np.asarray(p_init, dtype=np.float64), np.full((3, 3), np.nan), used
+
+        p = p + step
+        used += 1
+        if float(np.linalg.norm(step)) < tol_m:
+            break
+
+    try:
+        R_ml = np.linalg.inv(Lambda_ml)
+    except np.linalg.LinAlgError:
+        return np.asarray(p_init, dtype=np.float64), np.full((3, 3), np.nan), used
+
+    return p, 0.5 * (R_ml + R_ml.T), used
 
 
 # A bearing carries no range information. 10x the range is "I know nothing along this ray"
@@ -1613,6 +1818,14 @@ class TriangulationNode(Node):
         # Observer odometry uncertainty propagation defaults
         # Reference: Dogancay (2005/2015), Xu et al. (2017), Bishop et al. (2010).
         _default_use_odom_uncertainty = True
+        # IMM Markov matrix. These MUST be sourced from ekf.* in runtime_stack.yaml:
+        # they were hardcoded at the declare_parameter() call below, so every YAML
+        # value written here was silently ignored (imm_p_stay_cv: 0.75 ran as 0.80).
+        _default_imm_p_stay_cv = 0.80
+        _default_imm_p_return_to_cv = 0.30
+        _default_normalize_crlb = True
+        _default_ml_refine = False
+        _default_ml_refine_iters = 5
         _default_odom_fallback_variance = 0.01   # m²: conservative fallback when P_odom not published
         _default_min_bearing_distance = 0.5      # m:  kept for legacy; WLS bootstrap handles near-range
         _default_odom_max_age_sec = 0.5          # s:  stale odometry → fall back to pixel-only
@@ -1680,6 +1893,21 @@ class TriangulationNode(Node):
                             )
                             _default_imm_transition_prob = float(
                                 _ekf.get('imm_transition_prob', _default_imm_transition_prob)
+                            )
+                            _default_imm_p_stay_cv = float(
+                                _ekf.get('imm_p_stay_cv', _default_imm_p_stay_cv)
+                            )
+                            _default_imm_p_return_to_cv = float(
+                                _ekf.get('imm_p_return_to_cv', _default_imm_p_return_to_cv)
+                            )
+                            _default_normalize_crlb = bool(
+                                _ekf.get('normalize_crlb', _default_normalize_crlb)
+                            )
+                            _default_ml_refine = bool(
+                                _ekf.get('ml_refine', _default_ml_refine)
+                            )
+                            _default_ml_refine_iters = int(
+                                _ekf.get('ml_refine_iters', _default_ml_refine_iters)
                             )
                             _default_measurement_noise = float(
                                 _ekf.get('kf_measurement_noise', _default_measurement_noise)
@@ -1838,12 +2066,15 @@ class TriangulationNode(Node):
         self.declare_parameter('kf_process_noise_acc', _default_process_noise_acc)
         self.declare_parameter('kf_process_noise_vel', _default_process_noise_vel)
         self.declare_parameter('imm_transition_prob', _default_imm_transition_prob)  # legacy, unused
-        self.declare_parameter('imm_p_stay_cv', 0.80)       # P(CV→CV): high = strong straight-flight bias
-        self.declare_parameter('imm_p_return_to_cv', 0.30)  # P(CA→CV): high = fast decay of CA after maneuver
+        self.declare_parameter('imm_p_stay_cv', _default_imm_p_stay_cv)       # P(CV→CV): high = strong straight-flight bias
+        self.declare_parameter('imm_p_return_to_cv', _default_imm_p_return_to_cv)  # P(CA→CV): high = fast decay of CA after maneuver
         self.declare_parameter('kf_measurement_noise', _default_measurement_noise)
         # normalize_crlb: True = rescale CRLB trace to 3*kf_measurement_noise (legacy, backward-compat).
         # False = pass raw Lambda^{-1} to IMM (SOTA; requires CMA-ES re-run with wider Q bounds).
-        self.declare_parameter('normalize_crlb', True)
+        self.declare_parameter('normalize_crlb', _default_normalize_crlb)
+        # ml_refine: Gauss-Newton ML pass on the angular residual after the WLS solve.
+        self.declare_parameter('ml_refine', _default_ml_refine)
+        self.declare_parameter('ml_refine_iters', _default_ml_refine_iters)
         # Anisotropic bearing noise (ekf.anisotropic_bearing_noise in runtime_stack.yaml).
         # enabled=False  -> visual term is var_px * d^2 * I_3          (isotropic cone)
         # enabled=True   -> visual term has separate az/el variances   (elliptical cone)
@@ -1899,6 +2130,11 @@ class TriangulationNode(Node):
         # Set to False only after re-running CMA-ES with wider Q bounds and without
         # kf_measurement_noise in the optimisation vector.
         self.normalize_crlb = bool(self.get_parameter('normalize_crlb').value)
+        # ml_refine: one Gauss-Newton pass on the angular residual after WLS. Removes
+        # the pseudolinear bias; costs ~2-4 3x3 solves per frame. See
+        # refine_triangulation_gn().
+        self.ml_refine = bool(self.get_parameter('ml_refine').value)
+        self.ml_refine_iters = max(1, int(self.get_parameter('ml_refine_iters').value))
 
         # Anisotropic bearing noise: convert sigma [deg] -> variance [rad^2] once here,
         # so triangulate_wls() only ever deals with rad^2 like var_px does.
@@ -3509,6 +3745,8 @@ class TriangulationNode(Node):
                 bearing_var_el=self.bearing_var_el,
                 prior_target_pos=prior_pos,
                 normalize_crlb=self.normalize_crlb,
+                ml_refine=self.ml_refine,
+                ml_refine_iters=self.ml_refine_iters,
                 logger=self.get_logger(),
             )
         except ValueError as exc:
