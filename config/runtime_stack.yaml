@@ -118,6 +118,32 @@ bag_profiles:
 
   none: {}   # no per-flight correction whatsoever -- the only valid deploy value
 
+  # ---------------------------------------------------------------------------
+  # NOT for deploy: bag_profile above stays "none" and this block is reachable
+  # only via BAG_PROFILE=temesvar_A on an offline replay. Fitted to ONE BOOT of
+  # the 2026-08-29 17:21 flight; carrying it to another flight injects 4-9 deg
+  # of pointing error. The fix belongs on the airframe, not here.
+  # ---------------------------------------------------------------------------
+  temesvar_A:  # merged/A_17-21_stereo_ok
+    # Fit on 933 uav11 / 910 uav8 rays against /uav2/estimation_manager/odom_main,
+    # model el_error = tilt + dz/range (separable because range spans 9-55 m),
+    # robust IRLS so the mis-associations do not drag it. The two tilts have
+    # OPPOSITE sign: 9.16 deg of differential is what opens the rays.
+    # Held out: coefficients fitted on the first half, applied to the second ->
+    # ray gap 3.45 -> 0.41 m, gate acceptance 29 -> 100%. Ray gap is GT-free.
+    bearing_bias:
+      observer1:  # uav11 -- tilt el -4.23 deg, residual rms 1.37 -> 0.57 deg
+        az_deg: 0.57
+        el_deg: -4.23
+      observer2:  # uav8 -- tilt el +4.92 deg, residual rms 1.81 -> 0.58 deg
+        az_deg: 0.80
+        el_deg: 4.92
+    # Common term scaling as 1/range, so it is metric, not angular: the datum.
+    # It moves the GT, not the rays -- it fixes the yardstick, not the estimate.
+    # Which side is wrong (uav2's z or the observers') is not decidable from the
+    # bags: uav2 publishes no /tf. -0.90 m is what zeroes the 1/range term.
+    target_gt_z_offset_m: -0.90
+
 
 simulation:
   drone_count: 3  # allowed values: 1, 2, 3
