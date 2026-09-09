@@ -31,6 +31,7 @@ from nav_msgs.msg import Odometry, Path
 # ── Configuration ────────────────────────────────────────────────────────────
 
 MAX_TRAIL = 15000         # max points kept in rolling buffers
+GT_FALLBACK_SEC = 5.0     # wait this long for the aligned GT before falling back to raw odom
 UPDATE_INTERVAL_MS = 150  # plot refresh rate (~7 Hz)
 
 # ── Theme ────────────────────────────────────────────────────────────────────
@@ -112,11 +113,23 @@ class LiveMonitorNode(Node):
         self.lock = threading.Lock()
 
         # ── Subscribers ──────────────────────────────────────────────────
-        self.create_subscription(Odometry, self.target_odom_topic, self._gt_cb, 20)
+        self.create_subscription(Odometry, self.target_odom_topic, self._gt_primary_cb, 20)
         self.create_subscription(Odometry, self.estimate_odom_topic, self._est_cb, 20)
         self.create_subscription(Path, self.predicted_path_topic, self._pred_cb, 10)
         self.create_subscription(Odometry, self.obs1_odom_topic, self._obs1_cb, 10)
         self.create_subscription(Odometry, self.obs2_odom_topic, self._obs2_cb, 10)
+
+        # The aligned GT only exists while the evaluator runs. In flight it usually does not,
+        # and the plot then shows no GT at all with nothing saying why. Listen to the target's
+        # raw odom as well and switch to it if the aligned topic stays quiet: a GT in the wrong
+        # z datum still shows the shape of the flight, an empty panel shows nothing.
+        self.gt_fallback_topic = f'/{target}/{odom_suffix}'
+        self._gt_primary_seen = False
+        self._gt_fallback_active = False
+        if self.gt_fallback_topic != self.target_odom_topic:
+            self.create_subscription(Odometry, self.gt_fallback_topic, self._gt_fallback_cb, 20)
+            self._gt_watchdog_timer = self.create_timer(GT_FALLBACK_SEC, self._gt_watchdog)
+            self.get_logger().info(f'GT fallback:       {self.gt_fallback_topic}')
 
     # ── Callbacks ────────────────────────────────────────────────────────
     def _time_from_msg(self, msg) -> float:
@@ -142,6 +155,31 @@ class LiveMonitorNode(Node):
                 best_position = estimate_position
 
         return None if best_position is None else best_position.copy()
+
+    def _gt_primary_cb(self, msg: Odometry):
+        if not self._gt_primary_seen:
+            self._gt_primary_seen = True
+            if self._gt_fallback_active:
+                self._gt_fallback_active = False
+                self.get_logger().info(
+                    f'{self.target_odom_topic} is alive: back to the aligned GT')
+        self._gt_cb(msg)
+
+    def _gt_fallback_cb(self, msg: Odometry):
+        # Aligned GT wins whenever it exists -- it is the one in the estimate's frame.
+        if self._gt_fallback_active and not self._gt_primary_seen:
+            self._gt_cb(msg)
+
+    def _gt_watchdog(self):
+        self._gt_watchdog_timer.cancel()
+        if self._gt_primary_seen:
+            return
+        self._gt_fallback_active = True
+        self.get_logger().warn(
+            f'No message on {self.target_odom_topic} after {GT_FALLBACK_SEC:.0f} s '
+            f'(evaluator not running?) -- plotting GT from {self.gt_fallback_topic} instead. '
+            'It is in the target drone\'s own origin frame, so any constant z offset you see '
+            'is datum, not tracking error.')
 
     def _gt_cb(self, msg: Odometry):
         pos = self._pos(msg)
