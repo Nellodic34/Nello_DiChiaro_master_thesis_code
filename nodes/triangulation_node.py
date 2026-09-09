@@ -1814,6 +1814,7 @@ class TriangulationNode(Node):
         _default_single_obs_max_age_sec = 0.15
         _default_single_obs_min_confidence = 0.60
         _default_coast_after_sec = 0.15
+        _default_max_coast_sec = 1.0
 
         # Observer odometry uncertainty propagation defaults
         # Reference: Dogancay (2005/2015), Xu et al. (2017), Bishop et al. (2010).
@@ -1981,6 +1982,9 @@ class TriangulationNode(Node):
                             _default_coast_after_sec = float(
                                 _tri.get('coast_after_sec', _default_coast_after_sec)
                             )
+                            _default_max_coast_sec = float(
+                                _tri.get('max_coast_sec', _default_max_coast_sec)
+                            )
                         if 'depth_fusion' in _cfg:
                             _df = _cfg['depth_fusion']
                             _default_df_use_range_constraint = bool(
@@ -2051,6 +2055,7 @@ class TriangulationNode(Node):
         self.declare_parameter('single_obs_max_age_sec', _default_single_obs_max_age_sec)
         self.declare_parameter('single_obs_min_confidence', _default_single_obs_min_confidence)
         self.declare_parameter('coast_after_sec', _default_coast_after_sec)
+        self.declare_parameter('max_coast_sec', _default_max_coast_sec)
         self.declare_parameter('df_use_range_constraint', _default_df_use_range_constraint)
         self.declare_parameter('df_range_chi2', _default_df_range_chi2)
         self.declare_parameter('shared_heading', _default_shared_heading)
@@ -2159,6 +2164,7 @@ class TriangulationNode(Node):
         self.single_obs_max_age_ns = int(float(self.get_parameter('single_obs_max_age_sec').value) * 1_000_000_000.0)
         self.single_obs_min_confidence = float(self.get_parameter('single_obs_min_confidence').value)
         self.coast_after_sec = float(self.get_parameter('coast_after_sec').value)
+        self.max_coast_sec = float(self.get_parameter('max_coast_sec').value)
         self.df_use_range_constraint = bool(self.get_parameter('df_use_range_constraint').value)
         self.df_range_chi2 = float(self.get_parameter('df_range_chi2').value)
         self.shared_heading = bool(self.get_parameter('shared_heading').value)
@@ -3895,7 +3901,7 @@ class TriangulationNode(Node):
         if self.imm_last_stamp_ns is None:
             return
         dt = (now_ns - self.imm_last_stamp_ns) / 1e9
-        if dt <= 0.0 or dt > 5.0:
+        if dt <= 0.0 or dt > self.max_coast_sec:
             return
 
         tau = 0.5  # Singer decay time constant
@@ -3903,13 +3909,19 @@ class TriangulationNode(Node):
 
         # Project position/velocity/acceleration forward by dt, but store the
         # result only in the publishing fields — do NOT advance imm_last_stamp_ns.
+        # Singer propagation integrated consistently with the decay above: the
+        # acceleration fades with tau, so its contribution to position saturates
+        # instead of growing as 0.5*a*dt^2.  The quadratic form threw the estimate
+        # metres past the target across the multi-second gaps this bag contains.
+        coast_acceleration = self.filtered_acceleration * alpha
+        coast_velocity = (
+            self.filtered_velocity + self.filtered_acceleration * tau * (1.0 - alpha)
+        )
         coast_position = (
             self.filtered_position
             + self.filtered_velocity * dt
-            + 0.5 * self.filtered_acceleration * dt * dt
+            + self.filtered_acceleration * tau * (dt - tau * (1.0 - alpha))
         )
-        coast_velocity = self.filtered_velocity + self.filtered_acceleration * dt
-        coast_acceleration = self.filtered_acceleration * alpha
 
         # Clamp maximum speed (e.g., F450 limit ~10m/s)
         speed = np.linalg.norm(coast_velocity)

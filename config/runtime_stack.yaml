@@ -176,7 +176,11 @@ shared_heading: false
 
 ekf:
   kf_process_noise_acc: 13.28   # CA jerk std-dev (m/s³) — raised to track aggressive maneuvers
-  kf_process_noise_vel: 0.05    # CV acceleration std-dev (m/s²) — small enough to be smooth, large enough to not break the gate
+  kf_process_noise_vel: 2.0     # CV acceleration std-dev (m/s²). Was 0.05, which is not an
+                                # acceleration a quadrotor can have: on bag A the target reached
+                                # 7.8 m/s. With Q that small against R ~1.7 m² at 30 m the filter
+                                # moved 4% of the way toward each measurement (measured gain 0.04),
+                                # averaging over ~1.7 s and lagging fast motion by ~0.75 s.
   imm_transition_prob: 0.90    # LEGACY — no longer used. Kept for backward compat only.
 
   # ---------------------------------------------------------------------------
@@ -355,6 +359,13 @@ triangulation:
                           # Lower it only if the ~10 Hz output rate is too coarse, and know
                           # that below one detection period fusion_mode reverts to reporting
                           # COAST over a healthy STEREO track.
+  max_coast_sec: 1.0      # hard horizon for open-loop extrapolation, counted from the last real
+                          # measurement. Past it the node stays silent instead of publishing a
+                          # guess; it was hardcoded at 5.0 s inside _coast_predict. On bag A
+                          # (Temesvar 2026-08-29) 62% of the published output was dead reckoning
+                          # older than 1 s and 24% older than 3 s, with median error 1.76 m and
+                          # 3.12 m against 0.58 m for the triangulations themselves. That
+                          # extrapolation, not the geometry, was the error.
   publish_evaluation_packets: true # set to true to publish /target/triangulation_evaluation for CMA-ES
 
   # ---------------------------------------------------------------------------
