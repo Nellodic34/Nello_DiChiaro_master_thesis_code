@@ -59,11 +59,13 @@ RUN_MODE="${DRONE_RUN_MODE:-$(get_yaml_value "launcher.drone_run_mode")}"
 KF_ACC="${KF_PROCESS_NOISE_ACC:-$(get_yaml_value "ekf.kf_process_noise_acc")}"
 KF_MEAS="${KF_MEASUREMENT_NOISE:-$(get_yaml_value "ekf.kf_measurement_noise")}"
 KF_INIT="${KF_INITIAL_COVARIANCE:-$(get_yaml_value "ekf.kf_initial_covariance")}"
+KF_VEL="${KF_PROCESS_NOISE_VEL:-$(get_yaml_value "ekf.kf_process_noise_vel")}"
 MAX_PAIR_AGE_SEC="${MAX_PAIR_AGE_SEC:-$(get_yaml_value "triangulation.max_pair_age_sec")}"
 OBSERVATION_BUFFER_SEC="${OBSERVATION_BUFFER_SEC:-$(get_yaml_value "triangulation.observation_buffer_sec")}"
 TRIANGULATION_MIN_BASELINE_M="${TRIANGULATION_MIN_BASELINE_M:-$(get_yaml_value "triangulation.triangulation_min_baseline_m")}"
 MAX_TRIANGULATION_ERROR_M="${MAX_TRIANGULATION_ERROR_M:-$(get_yaml_value "triangulation.max_triangulation_error_m")}"
 PROCESSING_RATE_HZ="${PROCESSING_RATE_HZ:-$(get_yaml_value "triangulation.processing_rate_hz")}"
+MAX_COAST_SEC="${MAX_COAST_SEC:-$(get_yaml_value "triangulation.max_coast_sec")}"
 
 if [ -z "$USE_SIM_TIME" ]; then
     USE_SIM_TIME="false"
@@ -97,11 +99,13 @@ start_triangulation_node() {
         -p kf_process_noise_acc:="$KF_ACC" \
         -p kf_measurement_noise:="$KF_MEAS" \
         -p kf_initial_covariance:="$KF_INIT" \
+        -p kf_process_noise_vel:="$KF_VEL" \
         -p max_pair_age_sec:="$MAX_PAIR_AGE_SEC" \
         -p observation_buffer_sec:="$OBSERVATION_BUFFER_SEC" \
         -p triangulation_min_baseline_m:="$TRIANGULATION_MIN_BASELINE_M" \
         -p max_triangulation_error_m:="$MAX_TRIANGULATION_ERROR_M" \
         -p processing_rate_hz:="$PROCESSING_RATE_HZ" \
+        -p max_coast_sec:="$MAX_COAST_SEC" \
         "$@"
 }
 
