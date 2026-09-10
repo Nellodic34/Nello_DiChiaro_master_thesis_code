@@ -80,9 +80,23 @@ cleanup() {
         done
         kill -KILL -- "-$RECORD_PID" 2>/dev/null || true
     fi
+    kill "${PLAY_PID:-}" 2>/dev/null || true
     for pid in "${PIDS[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
     sleep 2
     for pid in "${PIDS[@]}"; do kill -KILL -- "-$pid" 2>/dev/null || true; done
+
+    # And then check, because none of the above is reliable on its own: a launcher
+    # that traps TERM sits in wait() while its children shut down, and the pid bash
+    # reports for a backgrounded setsid is not always the group leader, so the group
+    # kill can miss. A node that outlives its run becomes a second publisher on
+    # /target/odometry_estimate in the NEXT run - which is what made the monitor
+    # look like it was teleporting. Matched on this worktree's own paths, so a
+    # stack running from the main checkout is left alone.
+    for target in nodes/triangulation_node.py nodes/live_monitor.py \
+                  nodes/evaluate_prediction_node.py launch_triangulation_node.sh \
+                  launch_live_monitor.sh; do
+        pkill -KILL -f "$SCRIPT_DIR/$target" 2>/dev/null || true
+    done
 
     if [ "$SCORE" = "1" ] && [ -d "$REC_DIR" ]; then
         echo "=== punteggio della corsa ==="
@@ -104,20 +118,18 @@ fi
 # ── The stack under test ─────────────────────────────────────────────────────
 # Sim time is not optional here: without it the node compares the bag's stamps
 # against the wallclock and discards nearly every observation as too old.
+#
+# Plain 'decentralized', not the configured 'decentralized_evaluation': the
+# evaluator node adds nothing here - the node publishes /target/predicted_trajectory
+# itself - while it burns CPU writing PNG and CSV, and it holds the launcher open
+# for seconds on shutdown, which is how runs kept leaking a live node.
 echo "nodo di triangolazione (sim time, profilo temesvar_A)"
-run_bg env USE_SIM_TIME=true BAG_PROFILE=temesvar_A "$SCRIPT_DIR/launch_triangulation_node.sh"
+run_bg env USE_SIM_TIME=true BAG_PROFILE=temesvar_A \
+    DRONE_RUN_MODE="${DRONE_RUN_MODE:-decentralized}" \
+    "$SCRIPT_DIR/launch_triangulation_node.sh"
 
 echo "live monitor"
 run_bg "$SCRIPT_DIR/launch_live_monitor.sh"
-
-if [ "$SHOW_IMAGES" = "1" ]; then
-    # The node's own ray overlay only draws on observer1 (uav11) and this bag has no
-    # uav11 colour image, so it would stay blank. These two are what the detectors
-    # actually saw in flight, boxes included.
-    for topic in /uav11/detection2/compressed /uav8/detection2/compressed; do
-        run_bg ros2 run rqt_image_view rqt_image_view "$topic"
-    done
-fi
 
 if [ "$SCORE" = "1" ]; then
     mkdir -p "$(dirname "$REC_DIR")"
@@ -131,12 +143,33 @@ echo "attendo che i nodi si registrino..."
 sleep 8
 
 # ── Playback ─────────────────────────────────────────────────────────────────
-# Drop the /target and /tracker topics the previous flight left in the bag: they
-# would sit on top of what the node is publishing right now and the monitor would
-# plot the old run instead of this one.
+# The bag carries the estimate the stack produced during the flight itself. Left
+# in, rosbag2_player becomes a second publisher on /target/odometry_estimate and
+# the monitor draws both streams at once - and since the recorded one is in the
+# unaligned datum, ~8 m higher, the trail jumps between the two every frame.
+#
+# Not -x: that flag is a regex matched against the WHOLE topic name, so the
+# obvious '^/target/' matches nothing at all and silently excludes nothing.
+# --exclude-topics takes plain names and cannot be misread.
 echo "riproduco $BAG da +${START_OFFSET}s  (Ctrl-C per fermare e vedere il punteggio)"
 ros2 bag play "$BAG" \
     --clock "$CLOCK_HZ" --start-offset "$START_OFFSET" --rate "$RATE" \
-    -x '^/target/|^/tracker/'
+    --exclude-topics \
+        /target/odometry_estimate /target/pose_estimate /target/position_estimate \
+        /target/position_error /target/predicted_trajectory /target/triangulation_raw \
+        /target/triangulation_evaluation /target/ground_truth_aligned \
+        /tracker/fusion_mode /uav11/triangulation_debug_annotated/compressed &
+PLAY_PID=$!
 
+if [ "$SHOW_IMAGES" = "1" ]; then
+    # rqt_image_view resolves the message type from the live graph when it starts.
+    # Started before the player, it finds no such topic, subscribes to nothing and
+    # shows an empty dropdown - which is what it did when it was started up front.
+    sleep 6
+    for topic in /uav11/detection2/compressed /uav8/detection2/compressed; do
+        run_bg ros2 run rqt_image_view rqt_image_view "$topic"
+    done
+fi
+
+wait "$PLAY_PID"
 echo "bag finito."
