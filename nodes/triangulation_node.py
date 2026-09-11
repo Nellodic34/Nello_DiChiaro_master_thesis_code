@@ -16,6 +16,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Vector3Stamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -4190,11 +4191,14 @@ def main() -> None:
     node = TriangulationNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # The launcher's SIGTERM already took the context down; calling shutdown
+        # again is what printed a traceback on every clean exit.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

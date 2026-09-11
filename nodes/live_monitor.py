@@ -238,7 +238,16 @@ def main():
     node = LiveMonitorNode()
 
     # ── Spin ROS in background thread ────────────────────────────────────
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    def _spin():
+        try:
+            rclpy.spin(node)
+        except Exception:
+            # Shutdown tears the context down from under this thread mid-wait.
+            # Anything raised while the context is still up is a real fault.
+            if rclpy.ok():
+                raise
+
+    spin_thread = threading.Thread(target=_spin, daemon=True)
     spin_thread.start()
 
     # ── Matplotlib setup ─────────────────────────────────────────────────
@@ -600,7 +609,8 @@ def main():
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
