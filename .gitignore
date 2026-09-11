@@ -12,3 +12,9 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code worktrees and session state. Never part of the deploy package:
+# a worktree lives under .claude/worktrees/<name>/ but is a separate checkout of
+# THIS repo, so its edits land on normal paths (config/, nodes/) and nothing under
+# .claude/ ever needs to be tracked.
+.claude/
