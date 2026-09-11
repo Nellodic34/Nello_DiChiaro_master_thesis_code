@@ -1862,13 +1862,12 @@ def main() -> None:
     rclpy.init()
     node = PredictionEvaluatorNode()
 
-    # Python has no default Python-level handler for SIGTERM, so the launcher's kill used to end
-    # the process outright and skip the finally below. Route it through the normal shutdown path.
-    def _on_sigterm(*_):
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        rclpy.try_shutdown()
-
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    # Do NOT install a Python-level SIGTERM handler here. rclpy.init() already
+    # installed a C one for both SIGINT and SIGTERM, and overriding it is what hung
+    # every replay: under sim time the player dies first, /clock stops, rcl_wait
+    # never returns, and a Python handler only runs between bytecodes - so the
+    # signal sat unhandled, finalize_report never ran and the run kept nothing but
+    # the JSON its 1 Hz timer had already written. The C handler wakes the wait set.
 
     try:
         rclpy.spin(node)

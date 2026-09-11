@@ -84,6 +84,14 @@ def report(uri):
     gain, matched = effective_gain(raw, est)
     span = (gt[-1, 0] - gt[0, 0]) / 1e9
 
+    # A run cut short - or two replays from this worktree running at once, whose
+    # cleanups kill each other's nodes - leaves too little to say anything about.
+    # Say that, instead of an IndexError out of np.percentile.
+    if span <= 0 or len(raw_err) == 0 or len(est_err) == 0:
+        print('%s   registrazione incompleta: %d misure, %d stime, %.0f s di GT'
+              % (uri, len(raw_err), len(est_err), span))
+        return
+
     print('%s   (%.0f s di GT)' % (uri, span))
     print('  misure   %5d   mediana %5.2f m   p90 %5.2f m' %
           (len(raw_err), np.median(raw_err), np.percentile(raw_err, 90)))
