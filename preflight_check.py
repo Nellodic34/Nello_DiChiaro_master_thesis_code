@@ -99,9 +99,12 @@ def check_config(c):
     ab = c.get('ekf', {}).get('anisotropic_bearing_noise', {})
     print(f"         anisotropic bearing noise: enabled={ab.get('enabled')} "
           f"az={ab.get('sigma_az_deg')} deg  el={ab.get('sigma_el_deg')} deg")
-    if 'normalize_crlb' in c.get('ekf', {}):
-        warn('ekf.normalize_crlb is present but is a NO-OP: triangulate_wls never reads it '
-             'and always returns the raw CRLB. Ignore the value.')
+    # triangulate_wls really does branch on this (the branch was deleted once and restored),
+    # so the value matters: it decides whether R keeps its raw CRLB scale.
+    if c.get('ekf', {}).get('normalize_crlb', True):
+        print('         ekf.normalize_crlb = true (legacy): R rescaled to trace = 3*kf_measurement_noise')
+    else:
+        print('         ekf.normalize_crlb = false (SOTA): R = inv(Lambda) raw, geometry-aware')
 
     df = c.get('depth_fusion', {})
     if not df.get('enabled'):

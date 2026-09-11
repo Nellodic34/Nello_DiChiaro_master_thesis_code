@@ -1,6 +1,5 @@
 launcher:
   drone_run_mode: "decentralized_evaluation"  # one of: simple_detection, decentralized, decentralized_evaluation
-  auto_start_node: triangulation  # one of: none, detection, triangulation
   use_sim_time: false  # REAL DRONES: no /clock, wall time only
 
 vision:
@@ -19,8 +18,8 @@ vision:
   observation_topic_name: "target_observation"  # per-observer frozen 3D measurement topic suffix, e.g. /uav1/target_observation
   allow_tf_fallback: true  # if true, observer publishes a measurement using latest TF when exact frame-time TF is unavailable
   max_tf_delta_ms: 40.0  # local image/TF skew budget in ms; observer drops stale ray-freeze TFs and triangulation rejects packets exceeding it
-  observer_image_topic: "/uav8/rgbd/color/image_raw/compressed"   # observer2 = uav8 (22-7 bag); camera_info derived as /uav8/rgbd/color/camera_info
-  main_image_topic: "/uav11/rgbd/color/image_raw/compressed"      # observer1 = uav81 (22-7 bag); camera_info derived as /uav81/rgbd/color/camera_info
+  observer_image_topic: "/uav8/rgbd/color/image_raw/compressed"   # observer2 = uav8; camera_info derived as /uav8/rgbd/color/camera_info
+  main_image_topic: "/uav11/rgbd/color/image_raw/compressed"      # observer1 = uav11; camera_info derived as /uav11/rgbd/color/camera_info
   observer_camera_info_topic: ""  # role-specific CameraInfo override for observer2; empty = derive from observer_image_topic
   main_camera_info_topic: ""  # role-specific CameraInfo override for observer1/main; empty = derive from main_image_topic
   # ROI logic: at margin=1.0 the node chooses a base crop whose resize to roi_reference_imgsz
@@ -28,7 +27,6 @@ vision:
   # and edge clamping, the node recomputes the actual YOLO imgsz from the real crop size.
   roi_crop_enabled: true    # use ROI mode when a valid predicted center exists; false = always full-frame
   roi_reference_imgsz: 256  # reference ROI-side imgsz used to define the base scale-preserving crop at margin=1; not the final per-frame YOLO imgsz
-  roi_crop_imgsz: 320       # legacy alias for older nodes; keep equal to roi_reference_imgsz until all nodes are migrated
   roi_margin_multiplier: 1.40  # expands search area around the predicted center; should change coverage, not nominal target scale
   roi_min_size_px: 200  # 1080 | 720: 133 | 480: 67. Reject ROI mode if the real crop becomes smaller
                             # than this in source-image pixels. The base crop is int(256*H/896)*1.40, i.e.
@@ -95,10 +93,12 @@ camera_tf:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
-    yaw_offset: 0.0 # [V2 CALIBRATION] Matches the 13.32 degree bias discovered in logs
+    yaw_offset: 0.0  # NO correction applied. An older note here claimed a "[V2 CALIBRATION] 13.32 deg bias",
+                     # but the value is and has always been 0.0. Measure an offset and write it here if you
+                     # need one; do not assume one is already in effect.
   child_frame: "rgbd_link"  # camera driver frame name (same on all drones)
 
-#ros2 run tf2_ros tf2_echo uav28/world_origin uav28/fcu
+# inspect the mount live:  ros2 run tf2_ros tf2_echo uav11/world_origin uav11/fcu
 
 # ---------------------------------------------------------------------------
 # PER-FLIGHT SURVEY CONSTANTS.  Empty on purpose in the DEPLOY tree.
@@ -181,7 +181,6 @@ ekf:
                                 # 7.8 m/s. With Q that small against R ~1.7 m² at 30 m the filter
                                 # moved 4% of the way toward each measurement (measured gain 0.04),
                                 # averaging over ~1.7 s and lagging fast motion by ~0.75 s.
-  imm_transition_prob: 0.90    # LEGACY — no longer used. Kept for backward compat only.
 
   # ---------------------------------------------------------------------------
   # IMM Markov Transition Matrix
@@ -209,24 +208,16 @@ ekf:
   #   Too low (<0.15): filter "locks on" to ghost acceleration after curves end
   imm_p_return_to_cv: 0.30
   # ---------------------------------------------------------------------------
-  kf_measurement_noise: 0.0019  # Visual angular variance seed (rad²) = sigma 2.5 deg.
-                                 # ERA 0.0002 (= sigma 0.81 deg), che non corrispondeva al
-                                 # commento qui accanto. Allineato al workspace insieme al
-                                 # triangulation_node: il nodo nuovo consuma questo valore
-                                 # come var_lateral = d² * questo, senza la divisione per il
-                                 # range che nel nodo vecchio si cancellava e fissava sigma
-                                 # laterale a ~4 cm a qualsiasi distanza.
-                                 # SOTA mode: V_vis = kf_measurement_noise * d² * I (bearing cone).
-                                 # MUST match tuning.yaml fixed_kf_measurement_noise.
-                                 # Was 0.00020 (sigma 0.81 deg), sized from the DETECTOR alone
-                                 # ("~22px YOLO jitter"). That is not the error budget: the camera is
-                                 # bolted to fcu with identity rotation, so attitude error enters the
-                                 # bearing 1:1 and dominates it at 1.5-3.9 deg measured on the 22-7
-                                 # bags. At 49 m the old value claimed sigma_range 3.8 m against a
-                                 # true 16.4 m -- a ~19x variance gap, which is the measured ANEES~64.
-                                 # NOTE: kf_process_noise_* and kf_mahalanobis_threshold below were
-                                 # CMA-ES-tuned against 0.00020. Re-run the tuner; until then the
-                                 # gate is effectively looser than it was tuned to be.
+  kf_measurement_noise: 0.0019  # Visual angular variance (rad^2) = sigma 2.5 deg, the TOTAL ray budget.
+                                # Used as V_vis = kf_measurement_noise * d^2 * I (isotropic bearing cone)
+                                # whenever anisotropic_bearing_noise.enabled is false; ignored when true.
+                                # MUST match tuning.yaml fixed_kf_measurement_noise.
+                                # Sized from the FULL budget, not the detector: the camera is bolted to fcu
+                                # with identity rotation, so attitude error enters the bearing 1:1 and
+                                # dominates it (1.5-3.9 deg measured). A detector-only 0.0002 claimed
+                                # sigma_range 3.8 m at 49 m against a true 16.4 m -> the measured ANEES ~64.
+                                # WARNING: kf_process_noise_* and kf_mahalanobis_threshold were CMA-ES-tuned
+                                # against the old 0.0002, so the gate is looser than it was tuned to be.
 
   # ---------------------------------------------------------------------------
   # Anisotropic Bearing Noise  (elliptical bearing cone)
@@ -300,30 +291,6 @@ ekf:
                                   # If this is too small, the filter will reject valid braking frames and coast 10m!
 
   # ---------------------------------------------------------------------------
-  # CRLB Normalisation Switch
-  # Controls whether the raw Cramér-Rao Lower Bound R = inv(Lambda) is rescaled
-  # before being passed to the IMM-KF measurement update.
-  #
-  # normalize_crlb: true  (CURRENT — legacy / pragmatic mode)
-  #   Preserves the ANISOTROPIC SHAPE of the CRLB (eigenvalue ratios encode
-  #   which axes are well-observed) but forces trace(R) = 3 * kf_measurement_noise.
-  #   Backward-compatible: existing kf_process_noise_* and kf_mahalanobis_threshold
-  #   values remain valid without re-tuning.
-  #   Reference: Ristic et al. (2004), "Beyond the Kalman Filter", Artech House.
-  #
-  # normalize_crlb: false  (SOTA — physically rigorous mode)
-  #   Returns R = inv(Lambda) unchanged.  The Kalman Gain automatically adapts
-  #   to real measurement uncertainty: large at long range, small when geometry
-  #   is favourable (near 90° intersection angle).
-  #   REQUIREMENT: CMA-ES must be re-run with:
-  #     1. kf_measurement_noise REMOVED from the optimised vector (fix it to the
-  #        true angular variance of the YOLO detector, e.g. 1e-4 rad²).
-  #     2. Wider Q bounds: kf_process_noise_vel in [1.0, 50.0],
-  #                        kf_process_noise_acc in [1.0, 100.0].
-  #     3. kf_mahalanobis_threshold re-tuned (likely wider, e.g. [9.0, 30.0]).
-  #   Reference: Bishop et al. (2010), Automatica 46(3); Bar-Shalom et al. (2001).
-  # ---------------------------------------------------------------------------
-  # ---------------------------------------------------------------------------
   # ML refinement (Gauss-Newton on the angular residual)
   # The WLS solve above is PSEUDOLINEAR: it minimises a metric residual, which is
   # what makes it closed-form, and also what makes it biased -- the bias does not
@@ -342,8 +309,15 @@ ekf:
   ml_refine: false        # master switch; false = exact previous WLS-only behaviour
   ml_refine_iters: 5      # max Gauss-Newton iterations (stops early at 0.1 mm step)
 
-  normalize_crlb: false   # SOTA: R = inv(Lambda), anisotropic geometry-aware CRLB.
-                           # Requires use_odom_uncertainty=false (match tuning config).
+  # normalize_crlb - how R from triangulate_wls reaches the IMM update.
+  #   false (ACTIVE, SOTA): R = inv(Lambda) raw. The Kalman gain adapts to real geometry:
+  #                         large at long range, small near a 90 deg intersection.
+  #   true  (legacy):       same anisotropic shape, but rescaled to trace(R) = 3*kf_measurement_noise.
+  # The flag IS honoured by triangulate_wls (the branch was once deleted and has been restored).
+  # Requires use_odom_uncertainty=false to match the tuning config.
+  # Re-running CMA-ES under false needs: kf_measurement_noise fixed (not optimised), wider Q bounds
+  # (vel [1.0, 50.0], acc [1.0, 100.0]) and kf_mahalanobis_threshold re-tuned.
+  normalize_crlb: false
 
 triangulation:
   max_pair_age_sec: 0.20  # maximum timestamp separation accepted for one observer1/observer2 pair
@@ -389,7 +363,9 @@ triangulation:
   pairing_weight_time: 4.0        # w_t: temporal synchronization weight
   pairing_weight_geom: 1.5          # w_g: ray mismatch penalty (geometry quality)
   pairing_weight_innov: 1.5         # w_i: 3D innovation consistency with IMM prediction
-  pairing_mahalanobis_chi2: 18.0    # chi² normalization for 3-DOF position innovation (MUST MATCH kf_mahalanobis_threshold)
+  pairing_mahalanobis_chi2: 18.0    # chi2 scale that NORMALISES the innovation term of the pairing cost J.
+                                    # It is NOT a gate and need not match ekf.kf_mahalanobis_threshold (34.0),
+                                    # which is the real rejection gate applied inside the IMM update.
   pairing_log_best_cost: false      # debug: log winning J, c_t, c_g, c_i at INFO throttle
 
   # ---------------------------------------------------------------------------
@@ -443,7 +419,6 @@ kalman_filter:
   kf_cam_aware_gating_enabled: true
 
 evaluation:
-  auto_start_with_launch_sim: true  # when false ./launch_sim.sh skips the prediction evaluator and keeps only the live monitor window pane
   odom_topic_suffix: "estimation_manager/odom_main"  # CORRECT for real drones: the 22-7 bags contain /uav28/estimation_manager/odom_main etc. The old comment calling this "simulation ground truth" and pointing at odometry/odom_main was wrong -- that topic does not exist on these drones. hw_api/ground_truth is the SIM-only one.
   world_frame_suffix: "world_origin"  # real drone RTK origin, V2 uses f9p_origin
 
