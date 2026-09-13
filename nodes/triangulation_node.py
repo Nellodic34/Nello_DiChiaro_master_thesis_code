@@ -1778,6 +1778,7 @@ class TriangulationNode(Node):
         _observer1_image_topic = ''
         _observer2_image_topic = ''
         _observer1_camera_info_topic = ''
+        _observer2_camera_info_topic = ''
         _default_observation_topic_name = 'target_observation'
         _default_max_tf_delta_ms = 30.0
         _default_process_noise_acc = 1.5
@@ -1829,7 +1830,6 @@ class TriangulationNode(Node):
         _default_ml_refine = False
         _default_ml_refine_iters = 5
         _default_odom_fallback_variance = 0.01   # m²: conservative fallback when P_odom not published
-        _default_min_bearing_distance = 0.5      # m:  kept for legacy; WLS bootstrap handles near-range
         _default_odom_max_age_sec = 0.5          # s:  stale odometry → fall back to pixel-only
         _default_distance_dependent_noise = True  # WLS: scale visual sigma by d^2
         _default_odom_max_variance = 1.0          # m²: diagonal clamp on P_odom (protects against sim baro Z~1286)
@@ -1878,6 +1878,7 @@ class TriangulationNode(Node):
                             _observer1_image_topic = _vision.get('main_image_topic', '') or ''
                             _observer2_image_topic = _vision.get('observer_image_topic', '') or ''
                             _observer1_camera_info_topic = _vision.get('main_camera_info_topic', '') or ''
+                            _observer2_camera_info_topic = _vision.get('observer_camera_info_topic', '') or ''
                             _default_observation_topic_name = (
                                 _vision.get('observation_topic_name', _default_observation_topic_name)
                                 or _default_observation_topic_name
@@ -2004,9 +2005,6 @@ class TriangulationNode(Node):
                             _default_odom_fallback_variance = float(
                                 _oou.get('odom_fallback_variance', _default_odom_fallback_variance)
                             )
-                            _default_min_bearing_distance = float(
-                                _oou.get('min_bearing_distance', _default_min_bearing_distance)
-                            )
                             _default_odom_max_age_sec = float(
                                 _oou.get('odom_max_age_sec', _default_odom_max_age_sec)
                             )
@@ -2062,7 +2060,6 @@ class TriangulationNode(Node):
         self.declare_parameter('shared_heading', _default_shared_heading)
         self.declare_parameter('use_odom_uncertainty', _default_use_odom_uncertainty)
         self.declare_parameter('odom_fallback_variance', _default_odom_fallback_variance)
-        self.declare_parameter('min_bearing_distance', _default_min_bearing_distance)
         self.declare_parameter('odom_max_age_sec', _default_odom_max_age_sec)
         self.declare_parameter('distance_dependent_noise', _default_distance_dependent_noise)
         self.declare_parameter('odom_max_variance', _default_odom_max_variance)
@@ -2099,6 +2096,7 @@ class TriangulationNode(Node):
         self.declare_parameter('observer1_image_topic', _observer1_image_topic)
         self.declare_parameter('observer2_image_topic', _observer2_image_topic)
         self.declare_parameter('observer1_camera_info_topic', _observer1_camera_info_topic)
+        self.declare_parameter('observer2_camera_info_topic', _observer2_camera_info_topic)
         self.declare_parameter('observation_topic_name', _default_observation_topic_name)
         self.declare_parameter('max_tf_delta_ms', _default_max_tf_delta_ms)
 
@@ -2171,7 +2169,6 @@ class TriangulationNode(Node):
         self.shared_heading = bool(self.get_parameter('shared_heading').value)
         self.use_odom_uncertainty = bool(self.get_parameter('use_odom_uncertainty').value)
         self.odom_fallback_variance = float(self.get_parameter('odom_fallback_variance').value)
-        self.min_bearing_distance = float(self.get_parameter('min_bearing_distance').value)
         self.odom_max_age_ns = int(float(self.get_parameter('odom_max_age_sec').value) * 1_000_000_000.0)
         self.distance_dependent_noise = bool(self.get_parameter('distance_dependent_noise').value)
         self.odom_max_variance = float(self.get_parameter('odom_max_variance').value)
@@ -2190,7 +2187,9 @@ class TriangulationNode(Node):
         self.observer1_observation_topic = f'/{self.observer1_name}/{self.observation_topic_name}'
         self.observer2_observation_topic = f'/{self.observer2_name}/{self.observation_topic_name}'
         self.observer1_world_frame = f'{self.observer1_name}/{self.world_frame_suffix}'
+        self.observer2_world_frame = f'{self.observer2_name}/{self.world_frame_suffix}'
         self._observer1_use_compressed = self.observer1_image_topic.endswith('/compressed')
+        self._observer2_use_compressed = self.observer2_image_topic.endswith('/compressed')
         self.observer1_camera_info_topic = (
             str(self.get_parameter('observer1_camera_info_topic').value).strip()
             or self._camera_info_topic_from_image_topic(
@@ -2198,6 +2197,23 @@ class TriangulationNode(Node):
                 self.observer1_name,
             )
         )
+        self.observer2_camera_info_topic = (
+            str(self.get_parameter('observer2_camera_info_topic').value).strip()
+            or self._camera_info_topic_from_image_topic(
+                self.observer2_image_topic,
+                self.observer2_name,
+            )
+        )
+        # The overlay is per source: each observer draws its own ray green and the other
+        # drone's ray red, so every lookup below needs that source's world frame and peer.
+        self.debug_world_frames = {
+            self.observer1_name: self.observer1_world_frame,
+            self.observer2_name: self.observer2_world_frame,
+        }
+        self.debug_peer_names = {
+            self.observer1_name: self.observer2_name,
+            self.observer2_name: self.observer1_name,
+        }
 
         buffer_maxlen = max(32, int(max(1.0, self.processing_rate_hz) * max(1.0, self.observation_buffer_ns / 1e9) * 4.0))
         self.observer1_observations: Deque[SpatialObservation] = collections.deque(maxlen=buffer_maxlen)
@@ -2213,10 +2229,12 @@ class TriangulationNode(Node):
         )
         self.debug_images: Dict[str, Deque[DebugImageFrame]] = {
             self.observer1_name: collections.deque(maxlen=buffer_maxlen),
+            self.observer2_name: collections.deque(maxlen=buffer_maxlen),
         }
         self.debug_matched_pairs: Deque[MatchedObservationPair] = collections.deque(maxlen=buffer_maxlen)
         self.last_debug_publish_key: Dict[str, Tuple[int, int]] = {
             self.observer1_name: (-1, -1),
+            self.observer2_name: (-1, -1),
         }
         self.debug_camera_info: Dict[str, CameraInfo] = {}
 
@@ -2328,13 +2346,14 @@ class TriangulationNode(Node):
         # miss (gap large even at dt~0) from a time-sync miss (gap grows with dt).
         self._probe = {}
         self._probe_reset()
-        self.observer1_debug_annotated_pub = None
+        self.debug_annotated_pubs: Dict[str, object] = {}
         if self.publish_debug_annotated_image:
-            self.observer1_debug_annotated_pub = self.create_publisher(
-                CompressedImage,
-                f'/{self.observer1_name}/triangulation_debug_annotated/compressed',
-                10,
-            )
+            for _obs_name in (self.observer1_name, self.observer2_name):
+                self.debug_annotated_pubs[_obs_name] = self.create_publisher(
+                    CompressedImage,
+                    f'/{_obs_name}/triangulation_debug_annotated/compressed',
+                    10,
+                )
 
         self.create_subscription(Odometry, self.target_gt_odom_topic, self.target_gt_odom_callback, 20)
 
@@ -2393,26 +2412,26 @@ class TriangulationNode(Node):
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 history=HistoryPolicy.KEEP_LAST,
             )
-            if self._observer1_use_compressed:
-                self.observer1_image_sub = self.create_subscription(
-                    CompressedImage,
-                    self.observer1_image_topic,
-                    lambda msg, source=self.observer1_name: self.debug_image_callback(source, msg),
+            self.debug_image_subs = []
+            self.debug_camera_info_subs = []
+            for _obs_name, _img_topic, _info_topic, _compressed in (
+                (self.observer1_name, self.observer1_image_topic,
+                 self.observer1_camera_info_topic, self._observer1_use_compressed),
+                (self.observer2_name, self.observer2_image_topic,
+                 self.observer2_camera_info_topic, self._observer2_use_compressed),
+            ):
+                self.debug_image_subs.append(self.create_subscription(
+                    CompressedImage if _compressed else Image,
+                    _img_topic,
+                    lambda msg, source=_obs_name: self.debug_image_callback(source, msg),
                     _sensor_qos,
-                )
-            else:
-                self.observer1_image_sub = self.create_subscription(
-                    Image,
-                    self.observer1_image_topic,
-                    lambda msg, source=self.observer1_name: self.debug_image_callback(source, msg),
-                    _sensor_qos,
-                )
-            self.observer1_camera_info_sub = self.create_subscription(
-                CameraInfo,
-                self.observer1_camera_info_topic,
-                lambda msg, source=self.observer1_name: self.debug_camera_info_callback(source, msg),
-                10,
-            )
+                ))
+                self.debug_camera_info_subs.append(self.create_subscription(
+                    CameraInfo,
+                    _info_topic,
+                    lambda msg, source=_obs_name: self.debug_camera_info_callback(source, msg),
+                    10,
+                ))
 
         self.create_timer(1.0 / self.processing_rate_hz, self.processing_timer_callback)
 
@@ -2447,10 +2466,11 @@ class TriangulationNode(Node):
                 f'(sigma={np.rad2deg(np.sqrt(self.kf_measurement_noise)):.2f} deg)'
             )
         if self.publish_debug_annotated_image:
-            self.get_logger().info(
-                f'Triangulation debug overlay topic: '
-                f'/{self.observer1_name}/triangulation_debug_annotated/compressed'
-            )
+            for _obs_name in (self.observer1_name, self.observer2_name):
+                self.get_logger().info(
+                    f'Triangulation debug overlay topic: '
+                    f'/{_obs_name}/triangulation_debug_annotated/compressed'
+                )
 
     def target_gt_odom_callback(self, msg: Odometry) -> None:
         self.target_gt_odom = msg
@@ -2565,9 +2585,6 @@ class TriangulationNode(Node):
         if self.bridge is None:
             return
 
-        if source_name != self.observer1_name:
-            return
-
         camera_info = self.debug_camera_info.get(source_name)
         if camera_info is None:
             return
@@ -2601,9 +2618,6 @@ class TriangulationNode(Node):
 
     def _try_publish_debug_image(self, source_name: str, stamp_ns: int) -> None:
         """Publish a debug overlay only when a local observation and a nearby image frame can be paired."""
-        if source_name != self.observer1_name:
-            return
-
         camera_info = self.debug_camera_info.get(source_name)
         if camera_info is None:
             return
@@ -2618,8 +2632,17 @@ class TriangulationNode(Node):
             self._diag['dbg_no_frame'] += 1
             return
 
-        matched_pair = self._find_closest_matched_pair(local_obs.stamp_ns, self.max_pair_age_ns)
-        remote_stamp_ns = matched_pair.remote_obs.stamp_ns if matched_pair is not None else -1
+        # A stored pair always has observer1 on the "local" side, so observer2 must be matched
+        # against — and report — the opposite end of the very same pair.
+        _is_observer1 = source_name == self.observer1_name
+        matched_pair = self._find_closest_matched_pair(
+            local_obs.stamp_ns, self.max_pair_age_ns, match_remote_side=not _is_observer1)
+        if matched_pair is None:
+            remote_stamp_ns = -1
+        elif _is_observer1:
+            remote_stamp_ns = matched_pair.remote_obs.stamp_ns
+        else:
+            remote_stamp_ns = matched_pair.local_obs.stamp_ns
         publish_key = (local_obs.stamp_ns, remote_stamp_ns)
         if self.last_debug_publish_key.get(source_name) == publish_key:
             self._diag['dbg_dedup'] += 1
@@ -2637,19 +2660,20 @@ class TriangulationNode(Node):
         local_obs: SpatialObservation,
         matched_pair: Optional[MatchedObservationPair],
     ) -> bool:
-        """Draw the local ray and, when available, the matched remote ray on observer1's image."""
-        if source_name != self.observer1_name:
-            return False
+        """Draw the local ray and, when available, the matched remote ray on the source's image."""
+        debug_pub = self.debug_annotated_pubs.get(source_name)
+        world_frame = self.debug_world_frames.get(source_name)
 
-        debug_pub = self.observer1_debug_annotated_pub
-        world_frame = self.observer1_world_frame
-
-        if debug_pub is None:
+        if debug_pub is None or world_frame is None:
             return False
 
         remote_obs = None
         if matched_pair is not None:
-            remote_obs = matched_pair.aligned_remote_obs
+            # aligned_local_obs is always observer1's ray; seen from observer2 that is the
+            # *other* drone, so the two sides of the pair swap roles.
+            remote_obs = (matched_pair.aligned_remote_obs
+                          if source_name == self.observer1_name
+                          else matched_pair.aligned_local_obs)
 
         camera_frame = self._resolve_camera_frame(source_name, camera_info.header.frame_id)
         try:
@@ -2707,7 +2731,7 @@ class TriangulationNode(Node):
             color_list=colors,
             length=150.0,
         )
-        self._draw_stereo_hud(debug_img, local_obs, matched_pair)
+        self._draw_stereo_hud(debug_img, source_name, local_obs, matched_pair)
 
         debug_msg = CompressedImage()
         debug_msg.header = debug_frame.header
@@ -2716,25 +2740,32 @@ class TriangulationNode(Node):
         debug_pub.publish(debug_msg)
         return True
 
-    def _draw_stereo_hud(self, img, local_obs, matched_pair) -> None:
+    def _draw_stereo_hud(self, img, source_name, local_obs, matched_pair) -> None:
         """Say in the frame why the red ray is or is not there, and how much to trust the fix.
 
         A missing red ray looks exactly like a broken overlay, but on this bag it just means
         the second observer had no detection at that instant. Spell it out, and flag the
         range/baseline dilution that turns a ~2 deg bearing error into a huge depth error.
         """
+        peer_name = self.debug_peer_names.get(source_name, self.observer2_name)
         if matched_pair is None:
-            line, color = 'MONO: no {} observation'.format(self.observer2_name), (0, 165, 255)
+            line, color = 'MONO: no {} observation'.format(peer_name), (0, 165, 255)
         else:
-            local_a = matched_pair.aligned_local_obs
-            remote_a = matched_pair.aligned_remote_obs
-            dt_ms = abs(matched_pair.remote_obs.stamp_ns - local_obs.stamp_ns) / 1e6
+            if source_name == self.observer1_name:
+                local_a = matched_pair.aligned_local_obs
+                remote_a = matched_pair.aligned_remote_obs
+                peer_stamp_ns = matched_pair.remote_obs.stamp_ns
+            else:
+                local_a = matched_pair.aligned_remote_obs
+                remote_a = matched_pair.aligned_local_obs
+                peer_stamp_ns = matched_pair.local_obs.stamp_ns
+            dt_ms = abs(peer_stamp_ns - local_obs.stamp_ns) / 1e6
             baseline = float(np.linalg.norm(remote_a.origin - local_a.origin))
             midpoint, gap = triangulate_midpoint(
                 local_a.origin, local_a.ray, remote_a.origin, remote_a.ray)
             rng = float(np.linalg.norm(midpoint - local_a.origin))
             line = 'STEREO {} dt={:.0f}ms base={:.1f}m range={:.1f}m gap={:.2f}m'.format(
-                self.observer2_name, dt_ms, baseline, rng, gap)
+                peer_name, dt_ms, baseline, rng, gap)
             color = (0, 255, 0)
             # Depth error ~ range^2 * bearing_sigma / baseline: past ~2 m of it the fix is a guess.
             # The ray gap does NOT catch this — a shared bearing bias slides the intersection
@@ -2773,6 +2804,7 @@ class TriangulationNode(Node):
         self,
         local_stamp_ns: int,
         max_age_ns: int,
+        match_remote_side: bool = False,
     ) -> Optional[MatchedObservationPair]:
         if not self.debug_matched_pairs:
             return None
@@ -2780,7 +2812,8 @@ class TriangulationNode(Node):
         best_pair = None
         best_diff = max_age_ns + 1
         for pair in self.debug_matched_pairs:
-            diff = abs(pair.local_obs.stamp_ns - local_stamp_ns)
+            pair_stamp_ns = pair.remote_obs.stamp_ns if match_remote_side else pair.local_obs.stamp_ns
+            diff = abs(pair_stamp_ns - local_stamp_ns)
             if diff < best_diff:
                 best_diff = diff
                 best_pair = pair
@@ -3529,6 +3562,7 @@ class TriangulationNode(Node):
                 )
             )
             self._try_publish_debug_image(self.observer1_name, best_obs1.stamp_ns)
+            self._try_publish_debug_image(self.observer2_name, best_obs2.stamp_ns)
             if accepted:
                 self.last_fusion_mode = "STEREO"
                 executed = True

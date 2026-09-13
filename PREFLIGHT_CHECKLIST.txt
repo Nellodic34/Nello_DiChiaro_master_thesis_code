@@ -71,11 +71,10 @@
 
     a) QUALI PESI STIAMO VOLANDO
        config/runtime_stack.yaml -> vision.model_path
-       Ora punta a:   dataset_tools/weights6/best_openvino_model
-       In dataset_tools/ ci sono anche weights7_ e weights8, e l'ultimo commit
-       si chiama "...weights7_/weights8". Il preflight verifica SOLO che il
-       path esista, non che sia quello giusto.
-       Il README parla ancora di weights2: il README e' vecchio, non seguirlo.
+       Ora punta a:   dataset_tools/weights8/best_openvino_model
+       In dataset_tools/ ci sono anche weights6 e weights7_. Il preflight
+       verifica SOLO che il path esista, non che sia quello giusto.
+       Il README e docs/config_rationale.md indicano gli stessi pesi (weights8).
        Pesi scelti consapevolmente per questo volo: ______________________
 
     b) odom_topic_suffix
