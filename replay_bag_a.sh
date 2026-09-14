@@ -54,12 +54,21 @@ unset AMENT_TRACE_SETUP_FILES COLCON_TRACE
 
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 set +eu; source "$ROS_SETUP"; set -eo pipefail
-# rqt is a system package and the venv is built with include-system-site-packages=false,
-# so it has no PyQt5: any Qt tool started after the activate below dies on import. Keep the
-# pre-venv PATH around to start those few tools outside it.
-SYS_PATH="$PATH"
 VENV_ACTIVATE="${VENV_ACTIVATE:-$SCRIPT_DIR/.venv/bin/activate}"
 [ -f "$VENV_ACTIVATE" ] && source "$VENV_ACTIVATE"
+
+# rqt is a system package and the venv is built with include-system-site-packages=false, so
+# it has no PyQt5: run under the venv's python it dies on import. Its shebang is
+# /usr/bin/env python3, so the only thing that decides is which python3 comes first on PATH.
+# Strip the venv's bin instead of saving PATH before the activate above - the caller may
+# already have activated the venv, and then there is no clean PATH left to save.
+VENV_BIN="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin}"
+if [ -n "$VENV_BIN" ]; then
+    SYS_PATH="${PATH//$VENV_BIN:/}"
+    SYS_PATH="${SYS_PATH//:$VENV_BIN/}"
+else
+    SYS_PATH="$PATH"
+fi
 
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-45}"   # own domain: don't disturb a live session
