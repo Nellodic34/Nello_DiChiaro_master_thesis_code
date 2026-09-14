@@ -299,8 +299,20 @@ always arrived and were fused normally. The inert knob cost diagnostics, not acc
 
 **Why it mattered.** This is why uav8's slow re-acquisition used to be hard to see: when
 uav8's image-space track sits in TENTATIVE it publishes no ray, and with no uav8 overlay a
-two-drone problem presented as a one-drone problem. Both overlays now exist, so subscribe
-to both.
+two-drone problem presented as a one-drone problem.
+
+**What the fix did not buy — measured 2026-09-14.** The publisher is symmetric now, but
+drawing a ray still needs a world→camera transform for the drone being drawn, and that
+comes from TF (`_resolve_camera_frame`, `triangulation_node.py:2576`). The triangulation
+node runs on uav11 only (`PREFLIGHT_CHECKLIST.txt`, step 7.3) and
+`uav8/rgbd_color_optical_frame` never reaches it: Zenoh does not propagate `/tf_static`
+between drones — the same fact `evaluation.shared_world_origin` exists to work around —
+and bag A carries `/tf_static` for `uav11/*` only. Every uav8 frame is therefore dropped
+at `:2632` and counted in `DBGIMG ... skip: no_frame=N`, so the topic is advertised and
+stays empty, in replay and in flight alike. Closing this means composing the observer's
+own odometry with `camera_tf.observer2` instead of looking TF up — note `camera_tf` is
+read by `observer_node.py` and never by the triangulation node. Deferred deliberately: it
+is a diagnostic, and it does not touch the measurement path.
 
 ### `observer_odom_uncertainty.min_bearing_distance` — removed 2026-09-12
 
@@ -315,6 +327,92 @@ Removed from the YAML and from the node. The `min_bearing_distance` argument of
 `triangulate_wls` itself is **kept**: it is a live clamp, used at `:1202` and `:1209`.
 
 ---
+
+## What the filter does to the measurements — measured 2026-09-14
+
+One replay of bag A (`DRONE_RUN_MODE=decentralized_evaluation ./replay_bag_a.sh`, 176.6 s
+of ground truth), scoring `/target/triangulation_raw` and `/target/odometry_estimate`
+against `/target/ground_truth_aligned` — the datum-corrected truth the scorer itself uses —
+and splitting the horizontal error along and across the target's direction of travel:
+
+| | n | RMSE 3D | median | p90 | max | along-track @ >3 m/s | cross-track @ >3 m/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `triangulation_raw` | 563 | 1.333 m | 0.464 m | 1.990 m | 8.315 m | −0.53 m | −0.03 m |
+| `odometry_estimate` | 1003 | 2.228 m | 0.625 m | 3.925 m | 9.712 m | −2.59 m | +0.06 m |
+
+The filter adds almost no lateral error: median absolute cross-track is 0.13 m raw against
+0.18 m filtered. The entire penalty is along-track, it has one sign — the estimate sits
+*behind* the target — and it is a function of target speed: +0.06 m below 0.5 m/s, −0.64 m
+at 1–2 m/s, −2.59 m above 3 m/s. Expressed as a delay that is 0.14 s for the raw
+measurements and 0.71 s for the filter. The excursion near t+40 s, where the RMSE gap comes
+from, is the stretch where the target is fastest; the filter is not noisier than the
+geometry, it is late.
+
+Two independent statistics agree. The run scorer reports an effective gain of 0.22 over 563
+paired measurements arriving at ~3.2 Hz, which predicts a time constant of
+1/(0.22 × 3.2) ≈ 1.4 s, the same order as the measured lag.
+
+This is **not** the coast path, which is the intuition worth discarding: RMSE while coasting
+is 1.696 m against 3.074 m while actively fusing, and ANEES is 3.36 against an expected 3.0,
+so the reported covariance is roughly honest on average. The estimator is under-weighting
+its own measurements — measurements whose median error, 0.464 m, is better than the filtered
+output's 0.625 m. Suspects, in order: `kf_process_noise_vel: 2.0` (CV acceleration std-dev)
+against a target that genuinely manoeuvres above 3 m/s; `imm_p_stay_cv: 0.75` holding the
+mixture on the constant-velocity model; and `normalize_crlb: false`, which leaves R at a raw
+CRLB scale that over-states how bad the measurements actually are.
+
+**Which of the three it is — measured, not argued, 2026-09-14.** Same bag, same everything,
+only `KF_PROCESS_NOISE_VEL=8.0` passed to the launcher instead of the configured 2.0:
+
+| | along-track @ >3 m/s | lag | RMSE 3D | median | p90 | max | effective gain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `kf_process_noise_vel: 2.0` | −2.59 m | 0.71 s | 2.228 m | 0.625 m | 3.925 m | 9.712 m | 0.22 |
+| `kf_process_noise_vel: 8.0` | −1.35 m | 0.37 s | 2.000 m | 0.864 m | 2.626 m | 8.409 m | 0.37 |
+
+Quadrupling the CV acceleration noise roughly halves the lag and cuts the tail, and costs
+0.24 m of median accuracy — a bias/variance trade. So the mechanism is the **process
+model**, not the measurement model: the filter's Q is too small for a target that genuinely
+manoeuvres, and R is at worst a second-order contributor.
+
+Control: the raw measurements are statistically identical across the two runs (RMSE 1.333
+vs 1.355 m, median 0.464 vs 0.462 m, 563 measurements in each), so nothing but the filter
+moved. Both cover the same scoring window. Worth knowing before you compare your own runs:
+the bag is 227 s long, the default `START_OFFSET=105` leaves ~102 s of it after the
+recorder starts, and that is the entire stretch in which an estimate exists — the first ray
+pair lands at +107 s. Starting earlier (`--start-offset 30`) records more *ground truth*,
+not more estimate, and the extra GT is what makes two runs look like different lengths.
+
+**Where the too-small Q comes from — and it was already written down.** The `ekf` notes
+below carry this warning:
+
+> WARNING: `kf_process_noise_*` and `kf_mahalanobis_threshold` were CMA-ES-tuned against
+> the old `0.0002`, so the gate is looser than it was tuned to be.
+
+`kf_measurement_noise` is now `0.0019`, sized from the *full* attitude budget — the camera
+is bolted to the FCU with identity rotation, so attitude error enters the bearing 1:1 and
+dominates it at 1.5–3.9° measured — instead of from the detector alone. That is a 9.5×
+increase in assumed angular **variance**, σ from 0.81° to 2.5°. Q was never re-optimised
+against it. R rose almost an order of magnitude, Q stayed where CMA-ES had put it, and the
+gain — P/(P+R) in spirit — fell with the ratio. An effective gain of 0.22 is that
+arithmetic, not a bug.
+
+This also predicts the repair. Restoring the old Q/R ratio needs the process-noise
+*variance* up 9.5×, so the std-dev up √9.5 ≈ 3.1×: `kf_process_noise_vel` ≈ 6.2 m/s²
+against the configured 2.0. The measured best region is ~8, and this document's own
+prescription for re-running CMA-ES already asks for `vel [1.0, 50.0]`. The arithmetic, the
+experiment and the pre-existing tuning note land in the same place.
+
+So the lag is not a regression in the filter. It dates from the day the measurement noise
+was corrected upward — correctly — and the process noise was left behind.
+
+Do not hand-tune this before the first flight: fly the configuration that was actually
+tuned, then re-run CMA-ES against this bag with the along-track lag as an explicit
+objective. `kf_process_noise_vel` around 8 is where that search should start.
+
+Fixing it means another CMA-ES pass re-scored on this bag, not a hand-tweak — it was not
+attempted before the first flight, and `PREFLIGHT_CHECKLIST.txt` already says to treat that
+flight as the filter's first hardware validation. The raw triangulation path is healthy and
+is what this measures; nothing here blocks flying.
 
 ## Every setting, in file order
 
@@ -636,8 +734,8 @@ staleness uses odom_max_age_sec and a stale frame falls back to uav11's own head
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 105 | `kf_process_noise_acc` | `13.28` | CA jerk std-dev (m/s^3) |
-| 106 | `kf_process_noise_vel` | `2.0` | CV acceleration std-dev (m/s^2) |
+| 106 | `kf_process_noise_acc` | `13.28` | CA jerk std-dev (m/s^3) |
+| 107 | `kf_process_noise_vel` | `2.0` | CV acceleration std-dev (m/s^2) |
 
 **acceleration a quadrotor can have: on bag A the target reached**
 
@@ -668,7 +766,7 @@ imm_p_stay_cv — P(CV→CV): probability of remaining in straight-flight mode.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 107 | `imm_p_stay_cv` | `0.75` | P(CV->CV). Range 0.60-0.95; lower = CA reacts sooner to braking |
+| 108 | `imm_p_stay_cv` | `0.75` | P(CV->CV). Range 0.60-0.95; lower = CA reacts sooner to braking |
 
 **imm_p_return_to_cv — P(CA→CV): probability that CA model decays back to CV.**
 
@@ -685,8 +783,8 @@ imm_p_return_to_cv — P(CA→CV): probability that CA model decays back to CV.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 108 | `imm_p_return_to_cv` | `0.30` | P(CA->CV). Range 0.15-0.50; higher = CA fades faster after a manoeuvre |
-| 109 | `kf_measurement_noise` | `0.0019` | visual angular variance (rad^2) = sigma 2.5 deg; MUST match tuning.yaml |
+| 109 | `imm_p_return_to_cv` | `0.30` | P(CA->CV). Range 0.15-0.50; higher = CA fades faster after a manoeuvre |
+| 110 | `kf_measurement_noise` | `0.0019` | visual angular variance (rad^2) = sigma 2.5 deg; MUST match tuning.yaml |
 
 **Used as V_vis = kf_measurement_noise * d^2 * I (isotropic bearing cone)**
 
@@ -769,9 +867,9 @@ it (BIASFIT) or augmenting the state; this block is the honest-R fallback.
 | 112 | &nbsp;&nbsp;`enabled` | `false` | master switch; false = exact previous isotropic behaviour. The true path is STILL NOT TESTED |
 | 113 | &nbsp;&nbsp;`sigma_az_deg` | `1.32` | total azimuth budget [deg] (RTK yaw + detector) |
 | 114 | &nbsp;&nbsp;`sigma_el_deg` | `2.63` | total elevation budget [deg] (boot tilt + detector) |
-| 115 | `kf_adaptive_cov_max_multiplier` | `50.0` | INERT: read but never used, see docs/config_rationale.md |
-| 116 | `kf_initial_covariance` | `2.0` | initial position variance (m^2) |
-| 117 | `kf_mahalanobis_threshold` | `34.0` | chi2(3, 0.999). Raised deliberately -- read the doc before changing |
+| 117 | `kf_adaptive_cov_max_multiplier` | `50.0` | INERT: read but never used, see docs/config_rationale.md |
+| 118 | `kf_initial_covariance` | `2.0` | initial position variance (m^2) |
+| 119 | `kf_mahalanobis_threshold` | `34.0` | chi2(3, 0.999). Raised deliberately -- read the doc before changing |
 
 **If this is too small, the filter will reject valid braking frames and coast 10m!**
 
@@ -798,8 +896,8 @@ refine_triangulation_gn() for why the median and not the mean.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 118 | `ml_refine` | `false` | master switch; false = exact previous WLS-only behaviour |
-| 119 | `ml_refine_iters` | `5` | max Gauss-Newton iterations (stops early at 0.1 mm step) |
+| 120 | `ml_refine` | `false` | master switch; false = exact previous WLS-only behaviour |
+| 121 | `ml_refine_iters` | `5` | max Gauss-Newton iterations (stops early at 0.1 mm step) |
 
 **normalize_crlb - how R from triangulate_wls reaches the IMM update.**
 
@@ -818,19 +916,19 @@ Re-running CMA-ES under false needs: kf_measurement_noise fixed (not optimised),
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 120 | `normalize_crlb` | `false` | false = R keeps its raw CRLB scale. NOT a no-op |
+| 122 | `normalize_crlb` | `false` | false = R keeps its raw CRLB scale. NOT a no-op |
 
 
 ### `triangulation`
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 124 | `max_pair_age_sec` | `0.20` | maximum timestamp separation accepted for one observer1/observer2 pair |
-| 125 | `observation_buffer_sec` | `1.0` | keep this much recent observation history available for pairing and debug overlays |
-| 126 | `triangulation_min_baseline_m` | `0.25` | reject pairs whose camera centers are too close for stable geometry |
-| 127 | `max_triangulation_error_m` | `2.0` | reject midpoint solutions when the two rays remain too far apart |
-| 128 | `processing_rate_hz` | `100.0` | node timer rate for pruning buffers, coast prediction, and debug housekeeping |
-| 129 | `coast_after_sec` | `0.15` | how long the filter may go unfed before the timer coasts (s) |
+| 126 | `max_pair_age_sec` | `0.20` | maximum timestamp separation accepted for one observer1/observer2 pair |
+| 127 | `observation_buffer_sec` | `1.0` | keep this much recent observation history available for pairing and debug overlays |
+| 128 | `triangulation_min_baseline_m` | `0.25` | reject pairs whose camera centers are too close for stable geometry |
+| 129 | `max_triangulation_error_m` | `2.0` | reject midpoint solutions when the two rays remain too far apart |
+| 130 | `processing_rate_hz` | `100.0` | node timer rate for pruning buffers, coast prediction, and debug housekeeping |
+| 131 | `coast_after_sec` | `0.15` | how long the filter may go unfed before the timer coasts (s) |
 
 **Measured against the WALLCLOCK of the last accepted update,**
 
@@ -848,7 +946,7 @@ COAST over a healthy STEREO track.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 130 | `max_coast_sec` | `1.0` | hard horizon for open-loop extrapolation (s) |
+| 132 | `max_coast_sec` | `1.0` | hard horizon for open-loop extrapolation (s) |
 
 **measurement. Past it the node stays silent instead of publishing a**
 
@@ -865,7 +963,7 @@ extrapolation, not the geometry, was the error.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 131 | `publish_evaluation_packets` | `true` | set to true to publish /target/triangulation_evaluation for CMA-ES |
+| 133 | `publish_evaluation_packets` | `true` | set to true to publish /target/triangulation_evaluation for CMA-ES |
 
 **Prediction-Guided Ray Pairing (Global Nearest Neighbor association)**
 
@@ -891,11 +989,11 @@ References: Bar-Shalom et al. (gating); Blackman & Popoli (GNN association).
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 133 | `pairing_prediction_enabled` | `true` | false = pair by closest timestamp only |
-| 134 | `pairing_weight_time` | `4.0` | w_t: temporal synchronization weight |
-| 135 | `pairing_weight_geom` | `1.5` | w_g: ray mismatch penalty (geometry quality) |
-| 136 | `pairing_weight_innov` | `1.5` | w_i: 3D innovation consistency with IMM prediction |
-| 137 | `pairing_mahalanobis_chi2` | `18.0` | NORMALISES the pairing cost; it is NOT a gate |
+| 135 | `pairing_prediction_enabled` | `true` | false = pair by closest timestamp only |
+| 136 | `pairing_weight_time` | `4.0` | w_t: temporal synchronization weight |
+| 137 | `pairing_weight_geom` | `1.5` | w_g: ray mismatch penalty (geometry quality) |
+| 138 | `pairing_weight_innov` | `1.5` | w_i: 3D innovation consistency with IMM prediction |
+| 139 | `pairing_mahalanobis_chi2` | `18.0` | NORMALISES the pairing cost; it is NOT a gate |
 
 **It is NOT a gate and need not match ekf.kf_mahalanobis_threshold (34.0),**
 
@@ -908,7 +1006,7 @@ which is the real rejection gate applied inside the IMM update.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 138 | `pairing_log_best_cost` | `false` | debug: log winning J, c_t, c_g, c_i at INFO throttle |
+| 140 | `pairing_log_best_cost` | `false` | debug: log winning J, c_t, c_g, c_i at INFO throttle |
 
 **Single-ray RGB-D Depth Fusion Fallback**
 
@@ -924,8 +1022,8 @@ but wider laterally (angular).
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 139 | `single_obs_max_age_sec` | `0.15` | max age for an unpaired observation to be fused |
-| 140 | `single_obs_min_confidence` | `0.60` | min YOLO confidence required to use single-sensor fallback |
+| 141 | `single_obs_max_age_sec` | `0.15` | max age for an unpaired observation to be fused |
+| 142 | `single_obs_min_confidence` | `0.60` | min YOLO confidence required to use single-sensor fallback |
 
 
 ### `kalman_filter`
@@ -940,8 +1038,8 @@ Image-space Kalman filter — false positive rejection layer inside each Observe
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 146 | `kf_enabled` | `true` | false = every raw detection becomes a ray, no false-positive layer |
-| 147 | `kf_sigma_a` | `300.0` | 1080 \| 720: 200.0 \| 480: 100.0 -- px/s^2, scales with k |
+| 148 | `kf_enabled` | `true` | false = every raw detection becomes a ray, no false-positive layer |
+| 149 | `kf_sigma_a` | `350.0` | 1080 \| 720: 200.0 \| 480: 100.0 -- px/s^2, scales with k |
 
 **one_drone e in tuning.yaml (locked_2d_params); il 400 della vecchia**
 
@@ -970,31 +1068,31 @@ generous is the intent -- but it is the one pixel constant this table does not r
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 148 | `kf_sigma_px` | `11.0` | 1080 \| 720: 7.3 \| 480: 3.7 |
-| 149 | `kf_conf_beta` | `1.0` | weight of YOLO confidence in the measurement noise |
-| 150 | `kf_conf_min` | `0.2` | minimum YOLO confidence accepted |
-| 151 | `kf_n_confirm` | `3.0` | consecutive detections needed before a ray is published |
-| 152 | `kf_max_age` | `5` | frames a track survives without a detection |
-| 153 | `kf_p_max` | `800.0` | 1080 \| 720: 356.0 \| 480: 89.0  -- varianza px^2, scala con k^2 |
-| 154 | `kf_nis_window` | `15` | samples averaged for the NIS health check |
-| 155 | `kf_nis_threshold` | `8.0` | per-detection NIS gate |
-| 156 | `kf_ghost_timeout_sec` | `0.5` | s before a lost track is treated as a ghost |
-| 157 | `kf_ghost_reentry_m` | `2` | M of N detections needed to revive a ghost track |
-| 158 | `kf_ghost_reentry_n` | `3` | ... out of the last N candidates |
-| 159 | `kf_ghost_reentry_conf_min` | `0.35` | minimum confidence for a ghost re-entry |
-| 160 | `kf_ghost_reentry_spread_px` | `100.0` | 1080 \| 720: 67.0 \| 480: 33.0 |
-| 161 | `kf_ego_motion_enabled` | `true` | compensate the observer own motion between frames |
-| 162 | `kf_bbox_area_ref` | `3600.0` | 1080 \| 720: 1600.0 \| 480: 400.0  -- area px^2, scala con k^2 |
-| 163 | `kf_dist_gamma` | `0.2` | distance exponent for the confidence model |
-| 164 | `kf_cam_aware_gating_enabled` | `true` | scale the 2D gate with apparent target size |
+| 150 | `kf_sigma_px` | `11.0` | 1080 \| 720: 7.3 \| 480: 3.7 |
+| 151 | `kf_conf_beta` | `1.0` | weight of YOLO confidence in the measurement noise |
+| 152 | `kf_conf_min` | `0.2` | minimum YOLO confidence accepted |
+| 153 | `kf_n_confirm` | `3.0` | consecutive detections needed before a ray is published |
+| 154 | `kf_max_age` | `5` | frames a track survives without a detection |
+| 155 | `kf_p_max` | `800.0` | 1080 \| 720: 356.0 \| 480: 89.0  -- varianza px^2, scala con k^2 |
+| 156 | `kf_nis_window` | `15` | samples averaged for the NIS health check |
+| 157 | `kf_nis_threshold` | `8.0` | per-detection NIS gate |
+| 158 | `kf_ghost_timeout_sec` | `0.5` | s before a lost track is treated as a ghost |
+| 159 | `kf_ghost_reentry_m` | `2` | M of N detections needed to revive a ghost track |
+| 160 | `kf_ghost_reentry_n` | `3` | ... out of the last N candidates |
+| 161 | `kf_ghost_reentry_conf_min` | `0.35` | minimum confidence for a ghost re-entry |
+| 162 | `kf_ghost_reentry_spread_px` | `100.0` | 1080 \| 720: 67.0 \| 480: 33.0 |
+| 163 | `kf_ego_motion_enabled` | `true` | compensate the observer own motion between frames |
+| 164 | `kf_bbox_area_ref` | `3600.0` | 1080 \| 720: 1600.0 \| 480: 400.0  -- area px^2, scala con k^2 |
+| 165 | `kf_dist_gamma` | `0.2` | distance exponent for the confidence model |
+| 166 | `kf_cam_aware_gating_enabled` | `true` | scale the 2D gate with apparent target size |
 
 
 ### `evaluation`
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 167 | `odom_topic_suffix` | `"estimation_manager/odom_main"` | CORRECT for real drones; hw_api/ground_truth is sim-only |
-| 168 | `world_frame_suffix` | `"world_origin"` | real drone RTK origin, V2 uses f9p_origin |
+| 169 | `odom_topic_suffix` | `"estimation_manager/odom_main"` | CORRECT for real drones; hw_api/ground_truth is sim-only |
+| 170 | `world_frame_suffix` | `"world_origin"` | real drone RTK origin, V2 uses f9p_origin |
 
 **Set true ONLY when every drone is configured with the same world origin (x, y AND z)**
 
@@ -1015,7 +1113,7 @@ on the same flat ground and compare the z of their estimation_manager/odom_main
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 169 | `shared_world_origin` | `true` | true = all drones share one world origin. VERIFY THE Z DATUM before trusting |
+| 171 | `shared_world_origin` | `true` | true = all drones share one world origin. VERIFY THE Z DATUM before trusting |
 
 **GT re-published by the triangulation node after the utm datum hop, in the same frame as**
 
@@ -1030,7 +1128,7 @@ estimate charts that constant gap as tracking error. Set to "" to go back to the
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 170 | `gt_aligned_topic` | `"/target/ground_truth_aligned"` | GT republished by the triangulation node; "" = use the raw topic |
+| 172 | `gt_aligned_topic` | `"/target/ground_truth_aligned"` | GT republished by the triangulation node; "" = use the raw topic |
 
 **Live Monitor Display Mode**
 
@@ -1060,8 +1158,8 @@ Modes:
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 171 | `live_monitor_mode` | `"classic"` | one of: classic \| full_3d \| minimal_3d |
-| 174 | `auto_start_with_launch_sim` | `true` |  |
+| 173 | `live_monitor_mode` | `"classic"` | one of: classic \| full_3d \| minimal_3d |
+| 176 | `auto_start_with_launch_sim` | `true` |  |
 
 
 ### `depth_fusion`
@@ -1093,7 +1191,7 @@ observer occluded the filter now only coasts -- there is no single-ray range upd
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 178 | `enabled` | `false` | false = no depth subscriber at all (USB 2.1 cannot carry the stream) |
+| 181 | `enabled` | `false` | false = no depth subscriber at all (USB 2.1 cannot carry the stream) |
 
 **Topic suffix relative to uav_name: full topic = /{uav_name}/{depth_topic_suffix}**
 
@@ -1106,7 +1204,7 @@ Supports sensor_msgs/Image with encoding 16UC1 (millimetres) or 32FC1 (metres).
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 179 | `depth_topic_suffix` | `"rgbd/aligned_depth_to_color/image_raw"` |  |
+| 182 | `depth_topic_suffix` | `"rgbd/aligned_depth_to_color/image_raw"` |  |
 
 **Maximum time skew between depth frame and RGB frame (milliseconds).**
 
@@ -1119,7 +1217,7 @@ Uses the same spirit as vision.max_tf_delta_ms.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 180 | `depth_max_align_ms` | `40.0` | max depth/RGB time skew (ms) |
+| 183 | `depth_max_align_ms` | `40.0` | max depth/RGB time skew (ms) |
 
 **Valid sensor range (metres). Tune from bag statistics for your hardware.**
 
@@ -1131,8 +1229,8 @@ Valid sensor range (metres). Tune from bag statistics for your hardware.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 181 | `min_range_m` | `0.3` | valid sensor range (m) |
-| 182 | `max_range_m` | `10.0` | valid sensor range (m) |
+| 184 | `min_range_m` | `0.3` | valid sensor range (m) |
+| 185 | `max_range_m` | `10.0` | valid sensor range (m) |
 
 **Depth sample extraction inside the YOLO bounding box (full-frame pixel coords).**
 
@@ -1146,10 +1244,10 @@ Methods: "median" (default, robust to holes & flying pixels — Khoshelham 2012)
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 183 | `sample_method` | `"median"` | one of: median \| center_pixel \| trimmed_mean |
-| 184 | `trimmed_mean_fraction` | `0.2` | for trimmed_mean: discard top/bottom fraction |
-| 185 | `min_valid_pixel_fraction` | `0.001` | reject depth if fewer valid pixels cover the bbox |
-| 186 | `depth_sample_stride` | `2` | stride for subsampling large bboxes (2 = halve CPU for area > 4000px²) |
+| 186 | `sample_method` | `"median"` | one of: median \| center_pixel \| trimmed_mean |
+| 187 | `trimmed_mean_fraction` | `0.2` | for trimmed_mean: discard top/bottom fraction |
+| 188 | `min_valid_pixel_fraction` | `0.001` | reject depth if fewer valid pixels cover the bbox |
+| 189 | `depth_sample_stride` | `2` | stride for subsampling large bboxes (2 = halve CPU for area > 4000px²) |
 
 **Depth consistency gate vs 3D odometry (collinear occluder rejection).**
 
@@ -1164,11 +1262,11 @@ Tracking and Navigation" (2001), Sec. 3.4 (scalar gating).
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 187 | `gating_enabled` | `false` | reject depth samples that disagree with the 3D estimate |
-| 188 | `gate_k` | `3.0` | gate width in sigmas |
-| 189 | `max_odom_age_sec` | `0.5` | same spirit as tight_coupling.max_3d_age_sec |
-| 190 | `max_odom_covariance_trace` | `100.0` | disable depth gate if 3D positional uncertainty is too large |
-| 191 | `gate_odom_topic` | `"/target/odometry_estimate"` | [L3-bug2] Dedicated IMM odom topic for the depth consistency |
+| 190 | `gating_enabled` | `false` | reject depth samples that disagree with the 3D estimate |
+| 191 | `gate_k` | `3.0` | gate width in sigmas |
+| 192 | `max_odom_age_sec` | `0.5` | same spirit as tight_coupling.max_3d_age_sec |
+| 193 | `max_odom_covariance_trace` | `100.0` | disable depth gate if 3D positional uncertainty is too large |
+| 194 | `gate_odom_topic` | `"/target/odometry_estimate"` | [L3-bug2] Dedicated IMM odom topic for the depth consistency |
 
 **gate, independent of tight_coupling.enabled.**
 
@@ -1182,8 +1280,8 @@ Depth measurement noise model (Khoshelham & Elberink 2012, Eq. 5):
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 192 | `sigma_z_base_m` | `0.02` | depth noise model: sigma_z = base + coeff * z (m) |
-| 193 | `sigma_z_range_coeff` | `0.01` |  |
+| 195 | `sigma_z_base_m` | `0.02` | depth noise model: sigma_z = base + coeff * z (m) |
+| 196 | `sigma_z_range_coeff` | `0.01` |  |
 
 **Triangulation fusion policy parameters (triangulation_node).**
 
@@ -1199,8 +1297,8 @@ measurement, following Bar-Shalom et al. sequential update.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 194 | `fusion_use_range_constraint` | `true` | apply an accepted depth sample as a 1-D range update |
-| 195 | `fusion_range_chi2` | `9.0` | chi² threshold for per-ray depth consistency check (1-DOF) |
+| 197 | `fusion_use_range_constraint` | `true` | apply an accepted depth sample as a 1-D range update |
+| 198 | `fusion_range_chi2` | `9.0` | chi² threshold for per-ray depth consistency check (1-DOF) |
 
 
 ### `observer_odom_uncertainty`
@@ -1241,7 +1339,7 @@ Zero-overhead policy:
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 199 | `use_odom_uncertainty` | `false` | MUST match tuning.yaml, or R differs between tuning and flight |
+| 202 | `use_odom_uncertainty` | `false` | MUST match tuning.yaml, or R differs between tuning and flight |
 
 **Bags have no P_odom → training with True gives wrong R scale.**
 
@@ -1253,10 +1351,10 @@ Bags have no P_odom → training with True gives wrong R scale.
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 200 | `odom_fallback_variance` | `0.01` | m²: isotropic P_odom used when driver publishes zero cov |
-| 201 | `odom_max_age_sec` | `0.5` | s:  reject stale odometry and fall back to pixel-only |
-| 202 | `distance_dependent_noise` | `true` | WLS: if true, visual sigma = var_px * d^2; false = constant width beam |
-| 203 | `odom_max_variance` | `1.0` | m²: diagonal clamp on P_odom diagonals; prevents barometric Z-blowup |
+| 203 | `odom_fallback_variance` | `0.01` | m²: isotropic P_odom used when driver publishes zero cov |
+| 204 | `odom_max_age_sec` | `0.5` | s:  reject stale odometry and fall back to pixel-only |
+| 205 | `distance_dependent_noise` | `true` | WLS: if true, visual sigma = var_px * d^2; false = constant width beam |
+| 206 | `odom_max_variance` | `1.0` | m²: diagonal clamp on P_odom diagonals; prevents barometric Z-blowup |
 
 
 ### `observer_self_rejection`
@@ -1283,8 +1381,8 @@ Reference: Blackman & Popoli (1999) — Design and Analysis of Modern
 
 | line | setting | value | note in the file |
 |---|---|---|---|
-| 207 | `enabled` | `true` | master switch; false = zero overhead (no subscriber created) |
-| 208 | `max_odom_age_sec` | `0.3` | s: reject only when other-observer odom is fresh |
-| 209 | `rejection_gate_radius_m` | `0.8` | m: physical drone body radius used to compute pixel gate |
-| 210 | `rejection_depth_margin_m` | `1.5` | m: unused while rejection_only_if_closer=false; kept for future re-enable |
-| 211 | `rejection_only_if_closer` | `false` | false = unconditional geometric exclusion (right for two observers flying together) |
+| 210 | `enabled` | `true` | master switch; false = zero overhead (no subscriber created) |
+| 211 | `max_odom_age_sec` | `0.3` | s: reject only when other-observer odom is fresh |
+| 212 | `rejection_gate_radius_m` | `0.8` | m: physical drone body radius used to compute pixel gate |
+| 213 | `rejection_depth_margin_m` | `1.5` | m: unused while rejection_only_if_closer=false; kept for future re-enable |
+| 214 | `rejection_only_if_closer` | `false` | false = unconditional geometric exclusion (right for two observers flying together) |

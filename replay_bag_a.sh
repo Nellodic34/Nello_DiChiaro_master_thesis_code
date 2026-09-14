@@ -54,6 +54,10 @@ unset AMENT_TRACE_SETUP_FILES COLCON_TRACE
 
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 set +eu; source "$ROS_SETUP"; set -eo pipefail
+# rqt is a system package and the venv is built with include-system-site-packages=false,
+# so it has no PyQt5: any Qt tool started after the activate below dies on import. Keep the
+# pre-venv PATH around to start those few tools outside it.
+SYS_PATH="$PATH"
 VENV_ACTIVATE="${VENV_ACTIVATE:-$SCRIPT_DIR/.venv/bin/activate}"
 [ -f "$VENV_ACTIVATE" ] && source "$VENV_ACTIVATE"
 
@@ -194,7 +198,8 @@ if [ "$SHOW_IMAGES" = "1" ]; then
     # shows an empty dropdown - which is what it did when it was started up front.
     sleep 6
     for topic in /uav11/detection2/compressed /uav8/detection2/compressed; do
-        run_bg ros2 run rqt_image_view rqt_image_view "$topic"
+        run_bg env -u VIRTUAL_ENV PATH="$SYS_PATH" \
+            ros2 run rqt_image_view rqt_image_view "$topic"
     done
 fi
 

@@ -44,9 +44,11 @@ New here and flying soon? This is the whole path; every step links to its own se
 | 5 | `uav_roles.target` naming the wrong drone | you will triangulate something, just not what you meant |
 
 To watch what the two drones actually see, `vision.publish_debug_annotated_image` is
-already `true`: each observer publishes its own image with its ray in green and the other
-drone's in red, on `/uav11/triangulation_debug_annotated/compressed` and
-`/uav8/triangulation_debug_annotated/compressed`.
+already `true`: the triangulation node draws its own ray in green and the other drone's in
+red, on `/uav11/triangulation_debug_annotated/compressed` and
+`/uav8/triangulation_debug_annotated/compressed`. Only the uav11 one actually renders —
+read "the uav8 overlay is advertised but always empty" in Troubleshooting before you go
+looking for the other.
 
 ---
 
@@ -473,10 +475,10 @@ fix deliberately deferred until after the next flight, because completing it nee
 datum measurement from the preflight. If you see uav8 reacquiring slowly, this is it —
 stop looking.
 
-You can now *watch* it happen: the debug overlay used to exist for uav11 only, which is why
-this presented as a one-drone problem. Both overlays are published as of 2026-09-12, so
-subscribe to `/uav8/triangulation_debug_annotated/compressed` as well and you will see
-uav8's ray missing for exactly as long as its image-space track sits in TENTATIVE.
+The debug overlay used to exist for uav11 only, which is why this presented as a one-drone
+problem. Since 2026-09-12 a publisher exists for both, but the uav8 one never emits a
+frame — see "the uav8 overlay is advertised but always empty" in Troubleshooting. Watch
+`/uav8/detection2/compressed` and the node's `DBGIMG` counters instead.
 
 ---
 
@@ -491,3 +493,5 @@ uav8's ray missing for exactly as long as its image-space track sits in TENTATIV
 | Estimate jumps between two trails | A node from a previous run is still alive and publishing on `/target/odometry_estimate` |
 | TF lookup fails | Check `vision.publish_camera_static_tf`. It must stay `true` on the drones: the RealSense driver publishes its chain un-namespaced with no link to `fcu`, so with it `false` the chain does not exist and the observer produces no rays |
 | No ROS found | Set `ROS_SETUP=/opt/ros/<distro>/setup.bash` |
+| the uav8 overlay is advertised but always empty | Not a regression, and not reachable from config. Drawing uav8's ray needs `uav8/rgbd_color_optical_frame`, which the node — running on uav11 only — never receives: Zenoh does not propagate `/tf_static` between drones, and bag A carries it for `uav11/*` only. Those frames are dropped at `triangulation_node.py:2632` and counted in the node's `DBGIMG ... skip: no_frame=N` line. Use `/uav8/detection2/compressed` instead; detail in [`docs/config_rationale.md`](docs/config_rationale.md) |
+| `replay_bag_a.sh` opens no rqt window, log shows an `ImportError` on PyQt5 | The script activates `.venv`, which is built with `include-system-site-packages = false` and has no PyQt5, while rqt is a system package. Fixed 2026-09-14 by starting rqt with the pre-venv `PATH`; if you meet it elsewhere, start the Qt tool outside the venv |

@@ -78,11 +78,11 @@
        Pesi scelti consapevolmente per questo volo: ______________________
 
     b) odom_topic_suffix
-       config/runtime_stack.yaml:361 -> "estimation_manager/odom_main"
+       config/runtime_stack.yaml:169 -> "estimation_manager/odom_main"
        Il commento inline dice che e' CORRETTO per questi droni (i bag 22-7
        contengono /uav28/estimation_manager/odom_main) e che hw_api/ground_truth
-       e' quello di simulazione. Il README dice il contrario ed e' SBAGLIATO:
-       il README va corretto, non lo YAML. Non toccare questa riga.
+       e' quello di simulazione. Il README concorda (riga 491, tabella di
+       troubleshooting): e' gia' stato corretto. Non toccare questa riga.
 
 [ ] Due impostazioni che costano CPU/banda su un detector che gira a ~10 fps
     su CPU. Confermale o mettile a false PRIMA di volare, non dopo:
@@ -90,6 +90,10 @@
         vision.publish_debug_annotated_image  attualmente: true
     Se ti servono le overlay per il debriefing lasciale; se ti serve il frame
     rate, spegnile.   Decisione: ______________________
+    NOTA: /uav8/triangulation_debug_annotated resta VUOTO anche da true. Il nodo
+    di triangolazione gira solo su uav11 e senza il tf_static di uav8 non puo'
+    proiettare: incrementa solo DBGIMG skip: no_frame. Non cercare quella
+    finestra in volo, guarda /uav8/detection2. Dettagli nel README.
 
 [ ] ekf.anisotropic_bearing_noise.enabled e' attualmente FALSE
     (sigma_az 1.32 deg, sigma_el 2.63 deg sono configurati ma non usati).
