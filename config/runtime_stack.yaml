@@ -101,6 +101,7 @@ uav_roles:
   target: uav2  # TARGET drone name edit to match your real drone
 shared_heading: false  # STATIC BENCH ONLY -- ALWAYS FALSE EXCEPT FOR TESTING
 
+#DONT TOUCH
 ekf:
   kf_process_noise_acc: 13.28  # CA jerk std-dev (m/s^3)
   kf_process_noise_vel: 2.0  # CV acceleration std-dev (m/s^2)
@@ -108,6 +109,7 @@ ekf:
   imm_p_return_to_cv: 0.30  # P(CA->CV). Range 0.15-0.50; higher = CA fades faster after a manoeuvre
   kf_measurement_noise: 0.0019  # visual angular variance (rad^2) = sigma 2.5 deg; MUST match tuning.yaml
 
+#DONT TOUCH
   anisotropic_bearing_noise:
     enabled: false  # master switch; false = exact previous isotropic behaviour. The true path is STILL NOT TESTED
     sigma_az_deg: 1.32  # total azimuth budget [deg] (RTK yaw + detector)
@@ -144,7 +146,7 @@ kalman_filter:
   # Image-space Kalman filter: the false-positive rejection layer inside each observer.
   # RESOLUTION-COUPLED: the _px / area values below are for 1920x1080.
   kf_enabled: true  # false = every raw detection becomes a ray, no false-positive layer
-  kf_sigma_a: 300.0  # 1080 | 720: 200.0 | 480: 100.0 -- px/s^2, scales with k
+  kf_sigma_a: 350.0  # 1080 | 720: 200.0 | 480: 100.0 -- px/s^2, scales with k
   kf_sigma_px: 11.0  # 1080 | 720: 7.3 | 480: 3.7
   kf_conf_beta: 1.0  # weight of YOLO confidence in the measurement noise
   kf_conf_min: 0.2  # minimum YOLO confidence accepted
@@ -173,6 +175,7 @@ evaluation:
   # false = that script opens the live monitor but skips the prediction evaluator.
   auto_start_with_launch_sim: true
 
+#DONT TOUCH
 depth_fusion:
   # Range from the RGB-D stream as an extra measurement. Off: the USB 2.1 link cannot carry it.
   enabled: false  # false = no depth subscriber at all (USB 2.1 cannot carry the stream)
