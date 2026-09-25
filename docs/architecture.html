@@ -200,7 +200,7 @@
       <code>observer2</code>) that picks the right image topic and camera extrinsics. Its job stops well short of "where is the target in 3D" —
       that question is deliberately left to the fusion node. What it must deliver, every frame, is a single honest measurement: a ray from the
       camera's known position, in a known direction, in the world frame, together with a confidence and a timestamp precise enough to be matched
-      against the other observer's ray later. Getting there takes eight stages, each building on the last.
+      against the other observer's ray later. Getting there takes seven stages, each building on the last.
     </p>
 
     <div class="mini-flow">
@@ -225,7 +225,7 @@
       already-smoothed track, late in the pipeline. They do not. Both are candidate filters that run <em>inside</em>
       <code>extract_best_detection()</code>, per raw YOLO box, <strong>before</strong> the pixel-space Kalman filter's own confirmed
       <code>update()</code> call happens in <code>process_image()</code>. The order per candidate, read directly off the source
-      (<code>nodes/observer_node.py</code>, lines ≈3224–3400), is: class filter → OSR veto → KF Mahalanobis pre-gate (or ghost gate) →
+      (<code>extract_best_detection()</code> in <code>nodes/observer_node.py</code>), is: class filter → OSR veto → KF Mahalanobis pre-gate (or ghost gate) →
       Tight-Coupling gate → depth consistency gate (only when <code>depth_fusion.gating_enabled=true</code>). Only detections surviving all
       of that are candidates for <code>choose_best_candidate()</code> to pick from.
     </div>
@@ -370,14 +370,6 @@
     <p class="fig-cap">Fig. 4 — the observation packet layout, sized by <code>struct.Struct('&lt;qIf3f3fqB')</code> (V1) and
       <code>struct.Struct('&lt;qIf3f3fqBBff')</code> (V2): <strong>49 bytes</strong> bearing-only, <strong>58 bytes</strong> with the optional
       depth fields — verified with Python's own <code>struct.calcsize</code>, not counted by eye.</p>
-    <div class="note note-warn">
-      <strong>Source-comment inconsistency found while writing this section:</strong> the block comment directly above
-      <code>OBSERVATION_PACKET_STRUCT</code> in <code>nodes/observer_node.py</code> labels the two formats “42 bytes” and “51 bytes”. Computing
-      <code>struct.calcsize()</code> on the exact same format strings used by the code gives 49 and 58 bytes instead — the comment undercounts
-      both sizes by exactly 7 bytes (likely the 8-byte <code>tf_delta_ns</code> field being left out of an earlier count and never corrected).
-      The struct definitions and the packing/unpacking code are internally consistent with each other; only the comment is wrong. This document
-      uses the measured sizes.
-    </div>
   </section>
 
   <section id="fusion">
@@ -429,20 +421,14 @@
       can (optionally, <code>observer_odom_uncertainty.use_odom_uncertainty</code>) be folded into the solution rather than assumed away. Because
       the closed-form WLS solution is a <em>pseudolinear</em> estimator — it minimizes a metric residual, not the true angular one — it carries a
       small asymptotic bias that does not vanish as more measurements accumulate. The optional <code>ekf.ml_refine</code> flag corrects for this
-      with 2–4 Gauss-Newton iterations on the true angular residual (<code>refine_triangulation_gn()</code>), started from the WLS answer and
+      with up to <code>ekf.ml_refine_iters</code> (5) Gauss-Newton iterations on the true angular residual (<code>refine_triangulation_gn()</code>), started from the WLS answer and
       falling back to it if a step ever diverges.
     </p>
     <div class="note note-warn">
-      <strong>Logical inconsistency found while cross-checking this section:</strong> <code>preflight_check.py</code> prints a warning that
-      <code>ekf.normalize_crlb</code> "is present but is a NO-OP: <code>triangulate_wls</code> never reads it and always returns the raw CRLB";
-      the same claim appears in <code>PREFLIGHT_CHECKLIST.txt</code> and in <code>README.md</code>. Reading <code>triangulate_wls()</code> itself
-      shows the opposite: it ends with <code>if normalize_crlb: trace_R = float(np.trace(R_out)); R_out = R_out * (3.0 * var_px / trace_R)</code>,
-      and the surrounding comment explains why — the rescaling branch "had been deleted while the flag, its <code>declare_parameter</code>
-      default (True) and this whole comment block survived", and was later restored. In other words: the preflight warning describes a bug that
-      has since been fixed in <code>triangulate_wls()</code> but not corrected in the checker or its accompanying docs. With the current code,
-      <code>ekf.normalize_crlb</code> (currently <code>false</code> in <code>config/runtime_stack.yaml</code>, i.e. the “SOTA”
-      <code>R_out = Λ⁻¹</code> branch) is very much read and does change the covariance handed to the IMM — do not “ignore the value” as the
-      stale warning suggests.
+      <strong><code>ekf.normalize_crlb</code> is not a no-op.</strong> Older docs called it one; the rescaling branch had been deleted once
+      and is now restored at the end of <code>triangulate_wls()</code>. <code>true</code> rescales <code>R</code> to
+      <code>trace = 3·kf_measurement_noise</code>; <code>false</code> (current) keeps the raw CRLB <code>R = Λ⁻¹</code>. Either way it changes
+      the covariance handed to the IMM, and <code>preflight_check.py</code> prints which branch is active.
     </div>
 
     <h3>3.3 &nbsp;Modeling how the target moves: the IMM estimator</h3>
@@ -469,7 +455,7 @@
       <tbody>
         <tr><td><code>imm_p_stay_cv</code></td><td>0.75</td><td>P(CV→CV): probability of remaining in smooth, straight-line flight</td></tr>
         <tr><td><code>imm_p_return_to_cv</code></td><td>0.30</td><td>P(CA→CV): how quickly the accelerated model decays back to CV after a maneuver ends</td></tr>
-        <tr><td><code>kf_process_noise_vel</code></td><td>0.05 m/s²</td><td>Process noise of the CV model</td></tr>
+        <tr><td><code>kf_process_noise_vel</code></td><td>10.0 m/s²</td><td>Process noise of the CV model (acceleration std-dev)</td></tr>
         <tr><td><code>kf_process_noise_acc</code></td><td>13.28 m/s³</td><td>Process noise (jerk) of the CA model</td></tr>
         <tr><td><code>kf_mahalanobis_threshold</code></td><td>34.0 (χ²₃, 99.9%)</td><td>Gating threshold for rejecting an inconsistent measurement</td></tr>
         <tr><td><code>coast_after_sec</code></td><td>0.15 s</td><td>Time without an accepted update before the filter starts coasting on prediction alone</td></tr>
@@ -481,8 +467,8 @@
     <p>
       Mutual occlusion happens: one observer may lose line of sight to the target while the other keeps tracking. When no valid pair exists but
       one observer's unpaired ray carries a valid depth measurement and a YOLO confidence of at least
-      <code>triangulation.single_obs_min_confidence</code> (0.60), the single-observation fallback in <code>nodes/triangulation_node.py</code>
-      (documented in the YAML directly above <code>depth_fusion:</code> as living around line&nbsp;3124) accepts a one-dimensional range update
+      <code>triangulation.single_obs_min_confidence</code> (0.60), the single-observation fallback (<code>execute_single_observation_fusion()</code> in
+      <code>nodes/triangulation_node.py</code>) accepts a one-dimensional range update
       along that single ray rather than coasting blind. This path <strong>requires</strong> <code>depth_valid</code> on the incoming packet —
       it is a graceful degradation that only exists at all because depth fusion (§2.5) can, when enabled, still supply a range even with one eye
       closed; with <code>depth_fusion.enabled=false</code> as on the current hardware, a single-eyed occlusion simply coasts (§3.5).
@@ -493,9 +479,10 @@
       The fused belief is published as a full <code>nav_msgs/Odometry</code> on <code>/target/odometry_estimate</code> — position, velocity, and
       covariance — alongside a lighter <code>PoseStamped</code>, a forward-looking <code>Path</code> on
       <code>/target/predicted_trajectory</code>, and RViz <code>MarkerArray</code>s built by <code>_publish_position_markers()</code>. A
-      <code>/tracker/fusion_mode</code> string, written by <code>_publish_fusion_mode()</code>, reports which IMM model currently dominates, or
-      whether <code>_coast_predict()</code> is currently extrapolating without a fresh update because no accepted measurement has arrived within
-      <code>coast_after_sec</code>. When ground truth is available, <code>publish_ground_truth_error()</code> additionally reports the live error
+      <code>/tracker/fusion_mode</code> string, written by <code>_publish_fusion_mode()</code>, reports how the latest estimate was produced:
+      <code>STEREO</code> (a triangulated ray pair), <code>SINGLE_DEPTH</code> (the one-ray fallback of §3.4) or <code>COAST</code>
+      (<code>_coast_predict()</code> extrapolating because no accepted measurement arrived within <code>coast_after_sec</code>). It does
+      not report which IMM model dominates. When ground truth is available, <code>publish_ground_truth_error()</code> additionally reports the live error
       against it. It is this same odometry topic that the observer's tight-coupling gate (§2.7) subscribes back to — the one true feedback edge
       from the fusion node back to the sensing stage.
     </p>
@@ -507,10 +494,14 @@
 
     <h3>4.1 &nbsp;Grading the prediction against the truth</h3>
     <p class="lead">
-      <code>evaluate_prediction_node.py</code> is run offline, after a flight, and compares the predicted trajectory against the RTK ground truth
+      <code>evaluate_prediction_node.py</code> is a ROS node that listens <em>during</em> the flight (or a bag replay) and compares the predicted trajectory against the RTK ground truth
       once both have been aligned into the same frame (the target's raw odometry lives in its own origin, whose z-datum can differ from the
-      observers' by several metres — comparing the two directly would just chart that gap as tracking error). For every run it writes a
-      timestamped report under <code>debug/evaluation/&lt;timestamp&gt;</code> containing:
+      observers' by several metres — comparing the two directly would just chart that gap as tracking error). It writes everything on
+      shutdown (Ctrl-C), into <code>debug/evaluation/&lt;timestamp&gt;/</code> with <code>debug/evaluation/latest</code> pointing at the newest
+      run: <code>prediction_eval.json</code>, a per-sample CSV, a markdown report and the plots (<code>*_plot.png</code>, <code>*_xy.png</code>,
+      <code>*_xyz.png</code>, <code>*_distance.png</code>, <code>*_est_vs_odom.png</code>). With <code>launcher.drone_run_mode:
+      decentralized_evaluation</code> the triangulation launcher starts it automatically on observer1, so the folder appears on that machine.
+      The report contains:
     </p>
     <ul>
       <li><strong>ADE</strong> — Average Displacement Error across the whole predicted horizon</li>
@@ -557,7 +548,7 @@
         <tr><td><code>launch_main_detection_node.sh</code></td><td><code>observer_node.py</code> with role <code>observer1</code></td></tr>
         <tr><td><code>launch_triangulation_node.sh</code></td><td><code>triangulation_node.py</code> (fusion + IMM)</td></tr>
         <tr><td><code>launch_live_monitor.sh</code></td><td>the 3D monitor, on the ground-station PC</td></tr>
-        <tr><td><code>run_prediction_evaluation.sh</code></td><td>the offline evaluator, output under <code>debug/evaluation/&lt;timestamp&gt;</code></td></tr>
+        <tr><td><code>run_prediction_evaluation.sh</code></td><td>the evaluator on its own (not needed in <code>decentralized_evaluation</code> mode); run it <em>during</em> the flight, Ctrl-C writes <code>debug/evaluation/&lt;timestamp&gt;</code></td></tr>
       </tbody>
     </table>
     </div>
@@ -566,6 +557,13 @@
       <code>triangulation_node.py</code> side by side, and <code>live_monitor.py</code> optionally joins from a PC on the same network. Full setup
       and troubleshooting details live in <a href="../README.md">README.md</a>.
     </p>
+    <div class="note note-warn">
+      <strong>Two facts of the network that shape the config.</strong> The drones talk over Zenoh, which does not carry <code>/tf_static</code>
+      between them. So (1) the fusion node cannot bridge the two drones' <code>world_origin</code> frames through <code>utm_origin</code>;
+      <code>evaluation.shared_world_origin: true</code> declares them identical instead, and that only holds if their Z datum really agrees
+      (see README, <em>Preflight</em>). (2) Anything that needs uav8's camera frames on uav11 cannot work: the uav8 debug overlay stays empty,
+      and uav8's ROI re-acquisition around the 3D estimate fails silently, so uav8 re-acquires the target more slowly than uav11 after a loss.
+    </div>
   </section>
 
 </main>

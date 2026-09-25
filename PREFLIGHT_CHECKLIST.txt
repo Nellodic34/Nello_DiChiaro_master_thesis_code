@@ -7,7 +7,8 @@
  Ruoli fissati in config/runtime_stack.yaml -> uav_roles:
      observer1 = uav11   (esegue anche il nodo di triangolazione)
      observer2 = uav8
-     target    = uav28
+     target    = vedi uav_roles.target (oggi uav2) -- CONTROLLA che sia
+                 il drone che vola davvero come target
 
  Legenda:  [ ] da spuntare     ___ da riempire a penna     STOP = non si vola
 
@@ -28,8 +29,9 @@
 
 [ ] Test offline, su GS o su uav11:
         python3 -m py_compile nodes/*.py
-        python3 nodes/test_coast_guard.py             -> deve stampare OK
-        python3 nodes/test_anisotropic_bearing_noise.py -> deve stampare OK
+        python3 nodes/test_coast_singer.py              -> finisce senza errori
+        python3 nodes/test_live_monitor_gt_fallback.py  -> finisce senza errori
+        python3 nodes/test_debug_overlay_sides.py       -> finisce senza errori
 
 [ ] Spazio disco per i bag su chi registra:
         df -h .
@@ -65,7 +67,8 @@
     I WARN non bloccano ma vanno letti. I tre che compaiono adesso sono noti:
       - publish_camera_static_tf: true -> lo verifichi al punto 5
       - allow_tf_fallback: true con max_tf_delta_ms 40 -> accettato
-      - normalize_crlb e' un NO-OP -> ignora il valore, non e' letto da nessuno
+      - normalize_crlb: stampa quale ramo e' attivo (false = R CRLB grezza).
+        NON e' un no-op: cambia la covarianza passata all'IMM.
 
 [ ] DUE CONTROLLI CHE IL PREFLIGHT NON PUO' FARE - vanno fatti a occhio:
 
@@ -79,10 +82,8 @@
 
     b) odom_topic_suffix
        config/runtime_stack.yaml:169 -> "estimation_manager/odom_main"
-       Il commento inline dice che e' CORRETTO per questi droni (i bag 22-7
-       contengono /uav28/estimation_manager/odom_main) e che hw_api/ground_truth
-       e' quello di simulazione. Il README concorda (riga 491, tabella di
-       troubleshooting): e' gia' stato corretto. Non toccare questa riga.
+       Il commento inline dice che e' CORRETTO per questi droni e che
+       hw_api/ground_truth e' quello di simulazione. Non toccare questa riga.
 
 [ ] Due impostazioni che costano CPU/banda su un detector che gira a ~10 fps
     su CPU. Confermale o mettile a false PRIMA di volare, non dopo:
@@ -312,7 +313,7 @@
  8. VERIFICA PRE-BAG   -- IL CANCELLO VERO, NON SALTARLO
 ===============================================================================
 
- Da fare a TERRA, con il target (uav28) fisicamente visibile da ENTRAMBE le
+ Da fare a TERRA, con il target (uav_roles.target) fisicamente visibile da ENTRAMBE le
  camere. Se non e' visibile da entrambe, mettilo in vista prima di misurare.
 
 [ ] Modalita' di fusione:
@@ -378,7 +379,7 @@
         /uav8/target_observation
         /uav11/estimation_manager/odom_main
         /uav8/estimation_manager/odom_main
-        /uav28/estimation_manager/odom_main
+        /<target>/estimation_manager/odom_main   (target = uav_roles.target)
         /tf   /tf_static
     Aggiungi le immagini compresse SOLO se ti servono davvero: raddoppiano la
     dimensione e possono far perdere frame alla registrazione.
@@ -416,10 +417,13 @@
  11. DOPO IL VOLO
 ===============================================================================
 
-[ ] Valutazione:
-        bash run_prediction_evaluation.sh
-    Artefatti in:  debug/evaluation/<timestamp>/
+[ ] Valutazione: con drone_run_mode = decentralized_evaluation parte DA SOLA
+    insieme alla triangolazione su uav11 e ascolta durante il volo. A fine volo
+    Ctrl-C sulla triangolazione e ASPETTA (fino a ~1 min) che scriva i plot.
+    Artefatti, su uav11:  debug/evaluation/<timestamp>/  (json, csv, report, png)
     Scorciatoia al piu' recente:  debug/evaluation/latest
+    (run_prediction_evaluation.sh serve solo se lo lanci a parte, DURANTE il
+    volo o un replay: dopo il volo non c'e' piu' niente da ascoltare.)
 
 [ ] Numeri da trascrivere subito, finche' ricordi il volo:
       offset del datum dal log "Datum alignment": ______________________
@@ -457,13 +461,10 @@
    punto 6 per completarlo).
    Se vedi uav8 lento a riagganciare: e' questo. Non cercare altro.
 
- * Il README di questo repo e' in parte obsoleto: parla di weights2 e definisce
-   odom_topic_suffix un "placeholder non risolto". Entrambe le affermazioni sono
-   superate dai commenti nello YAML, che sono piu' recenti. In caso di conflitto
-   fra README e config/runtime_stack.yaml, vince lo YAML.
+ * In caso di conflitto fra README e config/runtime_stack.yaml, vince lo YAML.
 
- * ekf.normalize_crlb e' presente nello YAML ma non e' letto da nessuna riga di
-   codice. Cambiarlo non ha alcun effetto.
+ * ekf.normalize_crlb E' letto (triangulate_wls): true riscala R a
+   trace = 3*kf_measurement_noise, false (attuale) lascia la CRLB grezza.
 
 ===============================================================================
 
@@ -474,7 +475,7 @@
 
  PRIMA DI USCIRE
  - [ ] git rev-parse --short HEAD  uguale su GS, uav11, uav8
- - [ ] python3 nodes/test_coast_guard.py           -> OK
+ - [ ] python3 nodes/test_coast_singer.py          -> OK
  - [ ] df -h .   spazio per i bag
 
  A TERRA, DRONI SPENTI
@@ -520,7 +521,7 @@
  - shared_world_origin: true ma la differenza in Z misurata supera 0.30 m
 
  DOPO
- - [ ] bash run_prediction_evaluation.sh   -> debug/evaluation/latest
+ - [ ] Ctrl-C triangolazione, aspetta i plot -> uav11:debug/evaluation/latest
  - [ ] annota: offset datum, % STEREO / SINGLE_DEPTH / COAST, RMSE
 
  GIA' NOTO, NON INDAGARE: uav8 riaggancia il target piu' lentamente di uav11

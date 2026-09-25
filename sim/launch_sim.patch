@@ -1,0 +1,13 @@
+--- a/launch_sim.sh
++++ b/launch_sim.sh
+@@ -196,7 +196,7 @@
+   local live_monitor_cmd
+   local evaluation_cmd=""
+
+-  observer_cmd="$(build_tmux_script_command "$SCRIPT_DIR/launch_observer_detection_node.sh")"
+-  main_cmd="$(build_tmux_script_command "$SCRIPT_DIR/launch_main_detection_node.sh")"
+-  triangulation_cmd="$(build_tmux_script_command "$SCRIPT_DIR/launch_triangulation_node.sh")"
++  observer_cmd="$(build_tmux_script_command "${OBSERVER_PANE_SCRIPT:-$SCRIPT_DIR/launch_observer_detection_node.sh}")"
++  main_cmd="$(build_tmux_script_command "${MAIN_PANE_SCRIPT:-$SCRIPT_DIR/launch_main_detection_node.sh}")"
++  triangulation_cmd="$(build_tmux_script_command "${TRIANGULATION_PANE_SCRIPT:-$SCRIPT_DIR/launch_triangulation_node.sh}")"
+   live_monitor_cmd="$(build_tmux_script_command "$LIVE_MONITOR_SCRIPT")"

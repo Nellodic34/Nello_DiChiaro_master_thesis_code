@@ -364,8 +364,8 @@ def normalize(vec: np.ndarray) -> np.ndarray:
 # V1 (bearing-only):   [stamp_ns q, obs_id I, conf f, origin 3f, ray 3f, tf_delta q, tf_status B]
 # V2 (bearing+range):  V1 fields + [depth_valid B, depth_m f, depth_sigma_m f]
 # Triangulation node distinguishes by packet size (len == V1.size → V1, len == V2.size → V2).
-OBSERVATION_PACKET_STRUCT = struct.Struct('<qIf3f3fqB')      # V1 — 42 bytes
-OBSERVATION_PACKET_V2_STRUCT = struct.Struct('<qIf3f3fqBBff')  # V2 — 51 bytes
+OBSERVATION_PACKET_STRUCT = struct.Struct('<qIf3f3fqB')      # V1 — 49 bytes
+OBSERVATION_PACKET_V2_STRUCT = struct.Struct('<qIf3f3fqBBff')  # V2 — 58 bytes
 TF_STATUS_EXACT = 0
 
 def unpack_observation_packet(msg: UInt8MultiArray) -> Optional[Tuple[int, int, float, np.ndarray, np.ndarray, int, int, bool, float, float]]:

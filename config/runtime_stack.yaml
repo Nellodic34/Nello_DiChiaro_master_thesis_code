@@ -104,7 +104,7 @@ shared_heading: false  # STATIC BENCH ONLY -- ALWAYS FALSE EXCEPT FOR TESTING
 #DONT TOUCH
 ekf:
   kf_process_noise_acc: 13.28  # CA jerk std-dev (m/s^3)
-  kf_process_noise_vel: 2.0  # CV acceleration std-dev (m/s^2)
+  kf_process_noise_vel: 10.0  # CV acceleration std-dev (m/s^2)
   imm_p_stay_cv: 0.75  # P(CV->CV). Range 0.60-0.95; lower = CA reacts sooner to braking
   imm_p_return_to_cv: 0.30  # P(CA->CV). Range 0.15-0.50; higher = CA fades faster after a manoeuvre
   kf_measurement_noise: 0.0019  # visual angular variance (rad^2) = sigma 2.5 deg; MUST match tuning.yaml

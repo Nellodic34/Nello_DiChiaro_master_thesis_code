@@ -27,7 +27,7 @@ else can be tuned later; this list is the pre-flight gate.
 | Setting | Must be | Why it bites |
 |---|---|---|
 | `evaluation.shared_world_origin` | `true` **only if** every drone was configured with the same world origin, **including z** | This is the single most common cause of "uav8's rays never arrive". Zenoh does not propagate `/tf_static` between drones, so nothing detects a mismatched datum at runtime — a wrong z becomes a silent constant bias on every ray. Verify physically: park the drones on the same flat ground and compare `z` from `estimation_manager/odom_main`; `preflight_check.py --live` prints exactly this. |
-| `uav_roles.shared_heading` | **`false` to fly** | Static-bench feature only. It rotates observer1's rays using observer2's yaw, which is valid only while both airframes sit parallel on the ground. Airborne, any real heading difference goes straight into observer1's bearing error. The node prints a warning at startup if it is left on. |
+| `shared_heading` (top level) | **`false` to fly** | Static-bench feature only. It rotates observer1's rays using observer2's yaw, which is valid only while both airframes sit parallel on the ground. Airborne, any real heading difference goes straight into observer1's bearing error. The node prints a warning at startup if it is left on. |
 | `uav_roles.observer1` / `observer2` / `target` | the actual drone names | Everything downstream — topic names, TF frames, role selection in the launchers — is derived from these. |
 | `launcher.use_sim_time` | `false` on real drones | Real drones publish no `/clock`. Set it true only for sim or bag replay, where a clock source exists. |
 | `vision.main_image_topic` / `observer_image_topic` | the real camera topics | `main_*` is observer1, `observer_*` is observer2. A typo here yields no detections at all from that drone. |
@@ -81,7 +81,7 @@ running quietly".
   world origin, so positions from different drones can be compared directly. `false`: they
   cannot be, and cross-drone triangulation is not possible. See the pre-flight table: this is
   an assumption about the *physical setup*, not a preference.
-- **`uav_roles.shared_heading`** *(now `false`, must stay so to fly)* — `true`: observer1's
+- **`shared_heading`** (top-level key) *(now `false`, must stay so to fly)* — `true`: observer1's
   rays are rotated using observer2's yaw. `false`: each drone uses its own. See the pre-flight
   table.
 - **`vision.allow_tf_fallback`** *(now `true`)* — `true`: when the exact frame-time transform
@@ -409,7 +409,12 @@ Do not hand-tune this before the first flight: fly the configuration that was ac
 tuned, then re-run CMA-ES against this bag with the along-track lag as an explicit
 objective. `kf_process_noise_vel` around 8 is where that search should start.
 
-Fixing it means another CMA-ES pass re-scored on this bag, not a hand-tweak — it was not
+**Update 2026-09-25:** `kf_process_noise_vel` is now **10.0** in the YAML, raised by hand
+past the ~8 that the table above measured. Everything in this section that says "the
+configured 2.0" describes the state before that change. 10.0 has not been scored on bag A
+here; the next `./replay_bag_a.sh` run should record it next to the two rows above.
+
+Fixing it properly means another CMA-ES pass re-scored on this bag, not a hand-tweak — it was not
 attempted before the first flight, and `PREFLIGHT_CHECKLIST.txt` already says to treat that
 flight as the filter's first hardware validation. The raw triangulation path is healthy and
 is what this measures; nothing here blocks flying.
@@ -735,7 +740,7 @@ staleness uses odom_max_age_sec and a stale frame falls back to uav11's own head
 | line | setting | value | note in the file |
 |---|---|---|---|
 | 106 | `kf_process_noise_acc` | `13.28` | CA jerk std-dev (m/s^3) |
-| 107 | `kf_process_noise_vel` | `2.0` | CV acceleration std-dev (m/s^2) |
+| 107 | `kf_process_noise_vel` | `10.0` | CV acceleration std-dev (m/s^2) |
 
 **acceleration a quadrotor can have: on bag A the target reached**
 
@@ -1185,7 +1190,7 @@ Master switch. false = no depth subscriber, no depth code path, identical to bea
 FALSE since the USB-C 3.0 cable was swapped for USB 2.1 (RTK interference): that link has no
 bandwidth for an aligned depth stream, so there is no /rgbd/aligned_depth_to_color to subscribe
 to. Leaving it true makes preflight_check.py FAIL and buys nothing. Cost of turning it off:
-triangulation_node's single-observation fallback (line ~3124) requires depth_valid, so with one
+triangulation_node's single-observation fallback (`execute_single_observation_fusion()`) requires depth_valid, so with one
 observer occluded the filter now only coasts -- there is no single-ray range update any more.
 ```
 
