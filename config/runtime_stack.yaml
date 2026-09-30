@@ -107,7 +107,7 @@ ekf:
   kf_process_noise_vel: 10.0  # CV acceleration std-dev (m/s^2)
   imm_p_stay_cv: 0.75  # P(CV->CV). Range 0.60-0.95; lower = CA reacts sooner to braking
   imm_p_return_to_cv: 0.30  # P(CA->CV). Range 0.15-0.50; higher = CA fades faster after a manoeuvre
-  kf_measurement_noise: 0.0019  # visual angular variance (rad^2) = sigma 2.5 deg; MUST match tuning.yaml
+  kf_measurement_noise: 0.0001  # SIM value (sigma ~0.57 deg, clean sim bearings). REAL FLIGHT MUST BE 0.0019 (sigma 2.5 deg). Visual angular variance (rad^2); MUST match tuning.yaml
 
 #DONT TOUCH
   anisotropic_bearing_noise:

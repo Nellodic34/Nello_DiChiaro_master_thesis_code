@@ -218,6 +218,7 @@ python3 nodes/test_debug_overlay_sides.py
 | `launch_*.sh` | One launcher per process (table above) |
 | `run_prediction_evaluation.sh` | Evaluator on its own |
 | `replay_bag_a.sh`, `dataset_tools/score_replay.py` | Offline replay and scoring |
+| `sim/` | Run these nodes in the FlightForge simulator — see [`sim/README.md`](sim/README.md) |
 | `preflight_check.py` | Preflight gate |
 | `PREFLIGHT_CHECKLIST.txt` | Printable field checklist (Italian) |
 | `docs/architecture.html` | Detailed architecture walkthrough |
