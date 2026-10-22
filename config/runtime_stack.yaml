@@ -116,7 +116,7 @@ ekf:
     sigma_el_deg: 2.63  # total elevation budget [deg] (boot tilt + detector)
   kf_adaptive_cov_max_multiplier: 50.0  # INERT: read but never used, see docs/config_rationale.md
   kf_initial_covariance: 2.0  # initial position variance (m^2)
-  kf_mahalanobis_threshold: 34.0  # chi2(3, 0.999). Raised deliberately -- read the doc before changing
+  kf_mahalanobis_threshold: 16.27  # chi2(3, 0.999) = 16.266; the September flights flew 34.0
   ml_refine: false  # master switch; false = exact previous WLS-only behaviour
   ml_refine_iters: 5  # max Gauss-Newton iterations (stops early at 0.1 mm step)
   normalize_crlb: false  # false = R keeps its raw CRLB scale. NOT a no-op
